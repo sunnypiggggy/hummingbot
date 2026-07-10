@@ -1,0 +1,2 @@
+grid_range,grid_levels,order_quote_pct,take_profit,move_threshold,stop_loss,weeks_used,first_week,last_week,realized_net_pnl_quote,realized_net_pnl_pct,mean_weekly_pnl_pct,max_drawdown_pct,win_rate,total_grid_moves,total_trades,liquidations,realized_score
+0.06,8,0.01,0.005,0.005,0.04,1,1,1,6.042693756917288,0.0006042693756918016,0.0006042693756917288,-0.0011821053391789138,1.0,4,160,0,-0.001168888633076642

@@ -1,0 +1,12 @@
+servers:
+  main:
+    host: hummingbot-api
+    port: 8000
+    username: admin
+    password: admin
+default_server: main
+admin_id: 918010832
+users: {}
+server_access: {}
+chat_defaults: {}
+audit_log: []

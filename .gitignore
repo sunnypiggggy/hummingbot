@@ -94,6 +94,9 @@ coverage.xml
 /**/.injective_cookie
 
 .env
+.env.grid
+.env.control
+.env.frp
 
 **/.claude/settings.local.json
 
@@ -105,3 +108,4 @@ coverage.xml
 
 # GRVT
 /grvt
+/backtest_results/

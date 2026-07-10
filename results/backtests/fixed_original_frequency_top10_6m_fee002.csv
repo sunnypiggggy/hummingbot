@@ -1,0 +1,2 @@
+initial_quote,final_equity,net_pnl_quote,net_pnl_pct,max_drawdown_pct,liquidated,liquidation_step,cooldown_hours,trades,completed_cycles,grid_moves,open_positions,portfolio_stop_loss,trading_pairs,grid_range,grid_levels,order_quote_pct,take_profit,move_threshold,min_grid_move_seconds
+10000.0,9424.60791926059,-575.3920807394097,-0.05753920807394097,-0.08408883833643792,True,6317,24.0,28124,13813,218,0,0.08,"BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,DOGE-USDT,ADA-USDT,LINK-USDT,AVAX-USDT,TRX-USDT",0.04,24,0.02,0.003,0.005,0.0

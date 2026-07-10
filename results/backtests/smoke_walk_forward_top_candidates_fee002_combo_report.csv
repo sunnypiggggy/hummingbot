@@ -1,0 +1,2 @@
+rank,grid_range,grid_levels,order_quote_pct,take_profit,move_threshold,stop_loss,windows_evaluated,avg_selection_score,median_selection_score,avg_net_pnl_pct,median_net_pnl_pct,compound_net_pnl_pct,avg_max_drawdown_pct,worst_max_drawdown_pct,win_rate,liquidation_count,avg_trades,avg_grid_moves
+1,0.06,8,0.01,0.005,0.005,0.04,3,-0.003979356455462378,-0.003979356455462378,0.01145147782306667,0.01145147782306667,0.034749344207135824,-0.0102872228523527,-0.0102872228523527,1.0,0,1457.0,44.0

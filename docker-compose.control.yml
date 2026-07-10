@@ -1,0 +1,144 @@
+services:
+  postgres:
+    container_name: hummingbot-api-postgres
+    image: postgres:15
+    restart: unless-stopped
+    env_file:
+      - .env.control
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hummingbot-api}
+      POSTGRES_DB: ${POSTGRES_DB:-hummingbot_api}
+    volumes:
+      - ./api-files/postgres:/var/lib/postgresql/data
+    networks:
+      - hummingbot-control
+
+  emqx:
+    container_name: hummingbot-broker
+    image: emqx:5
+    restart: unless-stopped
+    environment:
+      EMQX_NAME: emqx
+      EMQX_HOST: node1.emqx.local
+      EMQX_CLUSTER__DISCOVERY_STRATEGY: static
+      EMQX_CLUSTER__STATIC__SEEDS: "[emqx@node1.emqx.local]"
+      EMQX_LOADED_PLUGINS: "emqx_recon,emqx_retainer,emqx_management,emqx_dashboard"
+    expose:
+      - "1883"
+      - "18083"
+    volumes:
+      - ./api-files/emqx/data:/opt/emqx/data
+      - ./api-files/emqx/log:/opt/emqx/log
+    networks:
+      - hummingbot-control
+
+  hummingbot-api:
+    container_name: hummingbot-api
+    image: hummingbot/hummingbot-api:latest
+    restart: unless-stopped
+    env_file:
+      - .env.control
+    environment:
+      USERNAME: ${HUMMINGBOT_API_USERNAME:-admin}
+      PASSWORD: ${HUMMINGBOT_API_PASSWORD:-admin}
+      CONFIG_PASSWORD: ${HUMMINGBOT_API_CONFIG_PASSWORD:-admin}
+      BROKER_HOST: emqx
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hbot}:${POSTGRES_PASSWORD:-hummingbot-api}@postgres:5432/${POSTGRES_DB:-hummingbot_api}
+    expose:
+      - "8000"
+    volumes:
+      - ./api-files/bots:/hummingbot-api/bots
+      - ./api-files/conf:/hummingbot-api/conf
+      - ./api-files/logs:/hummingbot-api/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - postgres
+      - emqx
+    networks:
+      - hummingbot-control
+
+  hummingbot-mcp:
+    container_name: hummingbot-mcp
+    image: hummingbot/hummingbot-mcp:latest
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env.control
+    environment:
+      HUMMINGBOT_API_URL: http://hummingbot-api:8000
+      HUMMINGBOT_USERNAME: ${HUMMINGBOT_API_USERNAME:-admin}
+      HUMMINGBOT_PASSWORD: ${HUMMINGBOT_API_PASSWORD:-admin}
+    volumes:
+      - ./mcp-files:/root/.hummingbot_mcp
+    depends_on:
+      - hummingbot-api
+    networks:
+      - hummingbot-control
+
+  mcp-sse:
+    container_name: hummingbot-mcp-sse
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp-sse
+    restart: unless-stopped
+    env_file:
+      - .env.control
+    environment:
+      HUMMINGBOT_API_URL: http://hummingbot-api:8000
+      HUMMINGBOT_USERNAME: ${HUMMINGBOT_API_USERNAME:-admin}
+      HUMMINGBOT_PASSWORD: ${HUMMINGBOT_API_PASSWORD:-admin}
+    ports:
+      - "127.0.0.1:18000:18000"
+    volumes:
+      - ./mcp-files:/root/.hummingbot_mcp
+    depends_on:
+      - hummingbot-api
+    networks:
+      - hummingbot-control
+
+  frpc:
+    container_name: hummingbot-frpc
+    image: snowdreamtech/frpc:latest
+    restart: unless-stopped
+    profiles:
+      - frp
+    env_file:
+      - .env.frp
+    volumes:
+      - ./frp/frpc.toml:/etc/frp/frpc.toml:ro
+    command: ["-c", "/etc/frp/frpc.toml"]
+    depends_on:
+      - mcp-sse
+    networks:
+      - hummingbot-control
+
+  condor:
+    container_name: hummingbot-condor
+    build:
+      context: .
+      dockerfile: Dockerfile.condor
+    restart: unless-stopped
+    env_file:
+      - .env.control
+    environment:
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      ADMIN_USER_ID: ${ADMIN_USER_ID:-918010832}
+      HUMMINGBOT_API_USERNAME: ${HUMMINGBOT_API_USERNAME:-admin}
+      HUMMINGBOT_API_PASSWORD: ${HUMMINGBOT_API_PASSWORD:-admin}
+      CONDOR_API_HOST: hummingbot-api
+      CONDOR_API_PORT: 8000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - ./condor-files:/opt/condor/config
+      - ./condor-routines:/opt/condor/routines
+    depends_on:
+      - hummingbot-api
+    networks:
+      - hummingbot-control
+
+networks:
+  hummingbot-control:
+    name: hummingbot-control

@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-07-10T03:26:46.654400+00:00",
+  "rows": [
+    {
+      "pair": "BTC-USDT",
+      "last_price": 63877.12,
+      "change_pct": 0.03137,
+      "quote_volume": 1114808576.0213163,
+      "close_time": 1783654007007
+    },
+    {
+      "pair": "ETH-USDT",
+      "last_price": 1770.99,
+      "change_pct": 0.023889999999999998,
+      "quote_volume": 327784767.463998,
+      "close_time": 1783654008003
+    },
+    {
+      "pair": "SOL-USDT",
+      "last_price": 78.9,
+      "change_pct": 0.022949999999999998,
+      "quote_volume": 111496664.39579,
+      "close_time": 1783654006253
+    },
+    {
+      "pair": "BNB-USDT",
+      "last_price": 574.85,
+      "change_pct": 0.01376,
+      "quote_volume": 51813656.91645,
+      "close_time": 1783654006063
+    },
+    {
+      "pair": "XRP-USDT",
+      "last_price": 1.1055,
+      "change_pct": 0.016739999999999998,
+      "quote_volume": 50351788.02265,
+      "close_time": 1783654004648
+    },
+    {
+      "pair": "DOGE-USDT",
+      "last_price": 0.07392,
+      "change_pct": 0.023540000000000002,
+      "quote_volume": 25009731.9006,
+      "close_time": 1783654008359
+    },
+    {
+      "pair": "ADA-USDT",
+      "last_price": 0.1686,
+      "change_pct": 0.011399999999999999,
+      "quote_volume": 20327750.12274,
+      "close_time": 1783654004984
+    },
+    {
+      "pair": "LINK-USDT",
+      "last_price": 7.894,
+      "change_pct": 0.03746,
+      "quote_volume": 8161795.98921,
+      "close_time": 1783654009305
+    },
+    {
+      "pair": "AVAX-USDT",
+      "last_price": 6.75,
+      "change_pct": 0.045540000000000004,
+      "quote_volume": 11652949.14407,
+      "close_time": 1783654003722
+    },
+    {
+      "pair": "TRX-USDT",
+      "last_price": 0.3314,
+      "change_pct": 0.0076,
+      "quote_volume": 26918997.6517,
+      "close_time": 1783654006418
+    }
+  ]
+}

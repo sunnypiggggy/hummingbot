@@ -1,0 +1,6 @@
+FROM hummingbot/hummingbot-mcp:latest
+
+RUN pip install --no-cache-dir mcp-proxy
+
+ENTRYPOINT ["mcp-proxy"]
+CMD ["--sse-host", "0.0.0.0", "--sse-port", "18000", "--", "/app/.venv/bin/python", "/app/main.py"]

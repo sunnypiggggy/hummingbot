@@ -1,0 +1,12 @@
+serverAddr = "your.frps.server"
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "replace-me"
+
+[[proxies]]
+name = "hummingbot-mcp-sse"
+type = "tcp"
+localIP = "mcp-sse"
+localPort = 18000
+remotePort = 18000

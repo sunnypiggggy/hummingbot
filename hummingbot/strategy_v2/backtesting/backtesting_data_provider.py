@@ -1,9 +1,11 @@
 import logging
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
 
+from hummingbot import data_path
 from hummingbot.client.config.config_helpers import get_connector_class
 from hummingbot.client.settings import AllConnectorSettings, ConnectorType
 from hummingbot.connector.connector_base import ConnectorBase
@@ -24,6 +26,7 @@ class BacktestingDataProvider(MarketDataProvider):
     EXCLUDED_CONNECTORS = ["hyperliquid_perpetual", "dydx_perpetual", "cube", "vertex",
                            "coinbase_advanced_trade", "kraken", "dydx_v4_perpetual", "hitbtc",
                            "hyperliquid", "injective_v2_perpetual", "injective_v2"]
+    CANDLES_CACHE_DIR = Path(data_path()) / "backtesting_candles"
 
     def __init__(self, connectors: Dict[str, ConnectorBase]):
         super().__init__(connectors)
@@ -100,16 +103,145 @@ class BacktestingDataProvider(MarketDataProvider):
         # Create a new feed or restart the existing one with updated max_records
         candle_feed = CandlesFactory.get_candle(config)
         candles_buffer = config.max_records * CandlesBase.interval_to_seconds[config.interval]
-        candles_df = await candle_feed.get_historical_candles(config=HistoricalCandlesConfig(
-            connector_name=config.connector,
-            trading_pair=config.trading_pair,
-            interval=config.interval,
-            start_time=self.start_time - candles_buffer,
-            end_time=self.end_time,
-        ))
+        requested_start_time = self.start_time - candles_buffer
+        requested_end_time = self.end_time
+        cached_candles_df = self._load_cached_candles(config)
+        interval_seconds = CandlesBase.interval_to_seconds[config.interval]
+        cached_end_time = self._round_timestamp_to_interval(requested_end_time, interval_seconds)
+        if self._covers_time_range(cached_candles_df, requested_start_time, cached_end_time):
+            logger.info(f"Using cached candles for {key}")
+            candles_df = cached_candles_df[
+                (cached_candles_df["timestamp"] >= requested_start_time)
+                & (cached_candles_df["timestamp"] <= requested_end_time)
+            ].copy()
+            self.candles_feeds[key] = candles_df
+            return candles_df
+
+        candles_df = await self._fetch_missing_candles(
+            candle_feed=candle_feed,
+            config=config,
+            cached_candles_df=cached_candles_df,
+            requested_start_time=requested_start_time,
+            requested_end_time=requested_end_time,
+            interval_seconds=interval_seconds,
+        )
+        candles_df = self._merge_and_save_cached_candles(config, cached_candles_df, candles_df)
+        candles_df = candles_df[
+            (candles_df["timestamp"] >= requested_start_time)
+            & (candles_df["timestamp"] <= requested_end_time)
+        ].copy()
         # TODO: fix pandas-ta improper float index slicing to allow us to use float indexes
         # candles_df = self.ensure_epoch_index(candles_df)
         self.candles_feeds[key] = candles_df
+        return candles_df
+
+    @classmethod
+    def _cache_file_path(cls, config: CandlesConfig) -> Path:
+        safe_trading_pair = config.trading_pair.replace("/", "-").replace(":", "-")
+        file_name = f"{config.connector}_{safe_trading_pair}_{config.interval}.csv"
+        return cls.CANDLES_CACHE_DIR / file_name
+
+    @classmethod
+    def _load_cached_candles(cls, config: CandlesConfig) -> pd.DataFrame:
+        cache_file = cls._cache_file_path(config)
+        if not cache_file.exists():
+            return pd.DataFrame()
+        try:
+            candles_df = pd.read_csv(cache_file)
+            if candles_df.empty or "timestamp" not in candles_df.columns:
+                return pd.DataFrame()
+            candles_df.drop_duplicates(subset=["timestamp"], inplace=True)
+            candles_df.sort_values(by="timestamp", inplace=True)
+            candles_df.reset_index(drop=True, inplace=True)
+            return candles_df
+        except Exception as exception:
+            logger.warning(f"Unable to load backtesting candles cache {cache_file}: {exception}")
+            return pd.DataFrame()
+
+    @staticmethod
+    def _covers_time_range(candles_df: pd.DataFrame, start_time: int, end_time: int) -> bool:
+        if candles_df.empty or "timestamp" not in candles_df.columns:
+            return False
+        return candles_df["timestamp"].min() <= start_time and candles_df["timestamp"].max() >= end_time
+
+    @staticmethod
+    def _round_timestamp_to_interval(timestamp: int, interval_seconds: int) -> int:
+        return timestamp - (timestamp % interval_seconds)
+
+    async def _fetch_missing_candles(
+        self,
+        candle_feed: CandlesBase,
+        config: CandlesConfig,
+        cached_candles_df: pd.DataFrame,
+        requested_start_time: int,
+        requested_end_time: int,
+        interval_seconds: int,
+    ) -> pd.DataFrame:
+        if cached_candles_df.empty:
+            logger.info(
+                f"Fetching candles for {config.connector}_{config.trading_pair}_{config.interval}: "
+                f"{requested_start_time} -> {requested_end_time}"
+            )
+            return await self._fetch_candles_range(candle_feed, config, requested_start_time, requested_end_time)
+
+        fetched_dfs = []
+        cached_start_time = int(cached_candles_df["timestamp"].min())
+        cached_end_time = int(cached_candles_df["timestamp"].max())
+        if requested_start_time < cached_start_time:
+            logger.info(
+                f"Fetching missing leading candles for {config.connector}_{config.trading_pair}_{config.interval}: "
+                f"{requested_start_time} -> {cached_start_time - interval_seconds}"
+            )
+            fetched_dfs.append(
+                await self._fetch_candles_range(
+                    candle_feed, config, requested_start_time, cached_start_time - interval_seconds
+                )
+            )
+        if self._round_timestamp_to_interval(requested_end_time, interval_seconds) > cached_end_time:
+            logger.info(
+                f"Fetching missing trailing candles for {config.connector}_{config.trading_pair}_{config.interval}: "
+                f"{cached_end_time + interval_seconds} -> {requested_end_time}"
+            )
+            fetched_dfs.append(
+                await self._fetch_candles_range(
+                    candle_feed, config, cached_end_time + interval_seconds, requested_end_time
+                )
+            )
+        return pd.concat(fetched_dfs, ignore_index=True) if fetched_dfs else pd.DataFrame()
+
+    @staticmethod
+    async def _fetch_candles_range(
+        candle_feed: CandlesBase,
+        config: CandlesConfig,
+        start_time: int,
+        end_time: int,
+    ) -> pd.DataFrame:
+        if start_time > end_time:
+            return pd.DataFrame()
+        return await candle_feed.get_historical_candles(config=HistoricalCandlesConfig(
+            connector_name=config.connector,
+            trading_pair=config.trading_pair,
+            interval=config.interval,
+            start_time=start_time,
+            end_time=end_time,
+        ))
+
+    @classmethod
+    def _merge_and_save_cached_candles(
+        cls,
+        config: CandlesConfig,
+        cached_candles_df: pd.DataFrame,
+        fetched_candles_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if fetched_candles_df.empty:
+            return cached_candles_df
+        candles_df = pd.concat([cached_candles_df, fetched_candles_df], ignore_index=True)
+        candles_df.drop_duplicates(subset=["timestamp"], inplace=True)
+        candles_df.sort_values(by="timestamp", inplace=True)
+        candles_df.reset_index(drop=True, inplace=True)
+        cache_file = cls._cache_file_path(config)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        candles_df.to_csv(cache_file, index=False)
         return candles_df
 
     def get_candles_df(self, connector_name: str, trading_pair: str, interval: str, max_records: int = 500):
