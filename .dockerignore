@@ -1,5 +1,10 @@
 /data
 /logs
+/api-files
+/mcp-files
+/condor-files
+/dca-live-data
+/dca-macro-data
 /build
 /dist
 /.git

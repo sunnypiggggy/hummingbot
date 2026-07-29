@@ -600,6 +600,71 @@ class TestDCAExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertNotIn(tracked_order, executor._close_orders)
         self.assertEqual(executor._current_retries, 1)
 
+    def test_time_limit_can_start_from_first_fill(self):
+        config = DCAExecutorConfig(
+            id="first-fill-deadline",
+            timestamp=100,
+            side=TradeType.BUY,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amounts_quote=[Decimal("10")],
+            prices=[Decimal("100")],
+            time_limit=18000,
+            time_limit_from_first_fill=True,
+        )
+        executor = self.get_dca_executor_from_config(config)
+        self.assertIsNone(executor.end_time)
+        executor._first_fill_timestamp = 500
+        self.assertEqual(18500, executor.end_time)
+
+    @patch.object(DCAExecutor, "get_price", MagicMock(return_value=Decimal("90")))
+    async def test_partial_maker_fill_is_protected_by_stop_loss(self):
+        config = DCAExecutorConfig(
+            id="partial-stop-loss",
+            timestamp=100,
+            side=TradeType.BUY,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amounts_quote=[Decimal("10"), Decimal("20")],
+            prices=[Decimal("100"), Decimal("90")],
+            stop_loss=Decimal("0.05"),
+            stop_loss_on_partial_fills=True,
+        )
+        executor = self.get_dca_executor_from_config(config)
+        executor._status = RunnableStatus.RUNNING
+        await executor.control_task()
+        order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID-PARTIAL",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("0.1"),
+            price=Decimal("100"),
+            creation_timestamp=100,
+            initial_state=OrderState.COMPLETED,
+        )
+        order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="partial-fill",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID-PARTIAL",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("100"),
+                fill_base_amount=Decimal("0.1"),
+                fill_quote_amount=Decimal("10"),
+                fee=AddedToCostTradeFee(),
+                fill_timestamp=200,
+            )
+        )
+        executor.active_open_orders[0].order = order
+
+        executor.control_stop_loss()
+
+        self.assertFalse(executor.all_open_orders_executed)
+        self.assertEqual(CloseType.STOP_LOSS, executor.close_type)
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
+
     def test_is_within_activation_bounds_maker(self):
         # Assuming you have a setup method to initialize the executor with DCAMode.MAKER mode
         config = DCAExecutorConfig(id="test", timestamp=123, side=TradeType.BUY, connector_name="binance",

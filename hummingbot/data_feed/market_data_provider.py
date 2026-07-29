@@ -279,17 +279,21 @@ class MarketDataProvider:
         :param connector_name: str
         :return: ConnectorBase
         """
-        conn_setting = self.conn_settings.get(connector_name)
+        # Paper connectors are synthetic wrappers. Public price discovery must
+        # use their live parent connector, while order execution keeps using
+        # the already-created paper connector held by the strategy.
+        source_connector_name = connector_name.removesuffix("_paper_trade")
+        conn_setting = self.conn_settings.get(source_connector_name)
         if conn_setting is None:
-            self.logger().error(f"Connector {connector_name} not found")
-            raise ValueError(f"Connector {connector_name} not found")
+            self.logger().error(f"Connector {source_connector_name} not found")
+            raise ValueError(f"Connector {source_connector_name} not found")
 
         init_params = conn_setting.conn_init_parameters(
             trading_pairs=[],
             trading_required=False,
-            api_keys=self.get_connector_config_map(connector_name),
+            api_keys=self.get_connector_config_map(source_connector_name),
         )
-        connector_class = get_connector_class(connector_name)
+        connector_class = get_connector_class(source_connector_name)
         connector = connector_class(**init_params)
         return connector
 

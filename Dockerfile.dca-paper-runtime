@@ -1,0 +1,14 @@
+FROM hummingbot/hummingbot:latest
+
+# The official paper exchange is a Cython extension. Rebuild only that module
+# with the missing V2 executor trading-rules proxy; all other runtime code
+# remains the official Hummingbot image.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc g++ python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY hummingbot/connector/exchange/paper_trade/paper_trade_exchange.pyx /home/hummingbot/hummingbot/connector/exchange/paper_trade/paper_trade_exchange.pyx
+COPY hummingbot/strategy_v2/executors/executor_base.py /home/hummingbot/hummingbot/strategy_v2/executors/executor_base.py
+COPY hummingbot/data_feed/market_data_provider.py /home/hummingbot/hummingbot/data_feed/market_data_provider.py
+COPY hummingbot/core/cpp/LimitOrder.cpp hummingbot/core/cpp/OrderExpirationEntry.cpp hummingbot/core/cpp/Utils.cpp /home/hummingbot/hummingbot/core/cpp/
+RUN /bin/bash -lc 'conda activate hummingbot && cd /home/hummingbot && NUMPY_INCLUDE=$(python -c "import numpy; print(numpy.get_include())") && CFLAGS="-I${NUMPY_INCLUDE}" CXXFLAGS="-I${NUMPY_INCLUDE}" cythonize -i -3 hummingbot/connector/exchange/paper_trade/paper_trade_exchange.pyx'

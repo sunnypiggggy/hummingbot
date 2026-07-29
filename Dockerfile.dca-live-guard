@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY live_guard/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY scripts/dca_live_common.py /app/dca_live_common.py
+COPY scripts/deploy_dca_live.py /app/deploy_dca_live.py
+COPY controllers/market_making/dman_maker_v3_macro.py /app/dman_maker_v3_macro.py
+COPY live_guard/dca_live_guard.py /app/dca_live_guard.py
+COPY live_guard/dca_live_report.py /app/dca_live_report.py
+
+CMD ["python", "/app/dca_live_guard.py"]

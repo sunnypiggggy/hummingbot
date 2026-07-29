@@ -1,0 +1,36 @@
+{
+  "decision_id": "fomc-2026-07-negative-v1",
+  "event_id": "fomc-2026-07",
+  "event_kind": "fomc",
+  "event_at": "2026-07-29T18:00:00+00:00",
+  "event_source_url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+  "decision_at": "2026-07-28T18:00:00+00:00",
+  "market_impact": "negative",
+  "confidence": 0.85,
+  "effective_at": "2026-07-29T16:00:00+00:00",
+  "resume_at": "2026-07-29T18:30:00+00:00",
+  "reason": "Hermes-authored qualitative judgment.",
+  "evidence": [
+    {
+      "source_id": "source-one",
+      "source_url": "https://example.com/source-one",
+      "observed_at": "2026-07-28T17:30:00+00:00",
+      "summary": "First independent input.",
+      "kind": "decision"
+    },
+    {
+      "source_id": "source-two",
+      "source_url": "https://example.org/source-two",
+      "observed_at": "2026-07-28T17:45:00+00:00",
+      "summary": "Second independent input.",
+      "kind": "decision"
+    }
+  ],
+  "hermes": {
+    "agent_id": "hermes-macro",
+    "model": "replace-with-model",
+    "prompt_version": "v1",
+    "run_id": "replace-with-run-id"
+  },
+  "policy_version": "dca-macro-v3"
+}

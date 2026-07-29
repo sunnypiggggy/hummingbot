@@ -1,0 +1,50 @@
+services:
+  dca-macro-gateway:
+    container_name: dca-macro-gateway
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dca-macro-gateway
+    image: hummingbot/dca-macro-gateway:local
+    restart: unless-stopped
+    env_file:
+      - ../../.env.control
+    environment:
+      DCA_MACRO_BIND_HOST: 0.0.0.0
+      DCA_MACRO_BIND_PORT: "8791"
+      DCA_MACRO_ALLOW_CONTAINER_BIND: "true"
+      DCA_MACRO_STATE_DIR: /workspace/state
+      DCA_MACRO_TELEMETRY_INPUT: /workspace/telemetry/dca_macro_telemetry.json
+      DCA_MACRO_TRADING_REPORT_INPUT: /workspace/telemetry/dca_trade_report_v3.json
+      DCA_MACRO_TRADING_CHART_INPUT: /workspace/telemetry/dca_trade_chart_7d.png
+      DCA_MACRO_TRADING_REPORT_MAX_AGE: "900"
+      DCA_MACRO_BOT_TARGETS: >-
+        [{"bot_name":"dca-live-btcusdt-200","controller_name":"dca_btcusdt_live_200","trading_pair":"BTC-USDT"},{"bot_name":"dca-live-ethusdt-200","controller_name":"dca_ethusdt_live_200","trading_pair":"ETH-USDT"}]
+      HUMMINGBOT_API_URL: http://hummingbot-api:8000
+      HERMES_HMAC_SECRETS_FILE: /run/secrets/hermes_hmac_secrets
+    ports:
+      - "127.0.0.1:8791:8791"
+    volumes:
+      - ../../dca-macro-data:/workspace/state
+      - ../../dca-live-data:/workspace/telemetry:ro
+    secrets:
+      - hermes_hmac_secrets
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8791/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - hummingbot-control
+
+networks:
+  hummingbot-control:
+    external: true
+    name: hummingbot-control
+secrets:
+  hermes_hmac_secrets:
+    file: "${HERMES_HMAC_SECRETS_PATH:-/home/ubuntu/secrets/hermes_hmac_secrets.json}"

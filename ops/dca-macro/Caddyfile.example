@@ -1,0 +1,29 @@
+{$HERMES_DCA_DOMAIN}:8443 {
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+        client_auth {
+            mode require_and_verify
+            trust_pool file {
+                pem_file /etc/caddy/pki/hermes-client-ca.pem
+            }
+        }
+    }
+
+    # Only publish the authenticated V1 API. /healthz remains loopback-only.
+    @dca_api path /v1/*
+    handle @dca_api {
+        reverse_proxy 127.0.0.1:8791 {
+            # Never trust certificate-status headers supplied by the client.
+            header_up X-Client-Cert-Verified SUCCESS
+            header_up X-Client-Cert-Fingerprint {http.request.tls.client.fingerprint}
+            transport http {
+                dial_timeout 2s
+                response_header_timeout 35s
+            }
+        }
+    }
+
+    handle {
+        respond 404
+    }
+}

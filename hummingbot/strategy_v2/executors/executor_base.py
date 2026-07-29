@@ -271,7 +271,14 @@ class ExecutorBase(RunnableBase):
         :param order_id: The ID of the order.
         :return: The in-flight order.
         """
-        return self.connectors[connector_name]._order_tracker.fetch_order(client_order_id=order_id)
+        connector = self.connectors[connector_name]
+        order_tracker = getattr(connector, "_order_tracker", None)
+        # PaperTradeExchange publishes normal order events but does not own a
+        # live-connector InFlightOrder tracker. DCAExecutor already preserves
+        # filled amounts from those events when this returns None.
+        if order_tracker is None:
+            return None
+        return order_tracker.fetch_order(client_order_id=order_id)
 
     def register_events(self):
         """

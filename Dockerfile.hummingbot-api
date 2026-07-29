@@ -1,0 +1,125 @@
+FROM hummingbot/hummingbot-api:latest
+
+# The official deploy-v2-script endpoint copies SCRIPT_CONFIG but currently leaves
+# the bot container on Hummingbot's generic quickstart command. Keep the API
+# unchanged except for passing the documented V2 startup command to script bots.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path('/hummingbot-api/services/docker_service.py')
+source = path.read_text(encoding='utf-8')
+needle = '''                image=config.image,
+                name=instance_name,
+                volumes=volumes,
+                environment=environment,
+                network_mode="host",
+'''
+replacement = '''                image=config.image,
+                name=instance_name,
+                volumes=volumes,
+                environment=environment,
+                command=[
+                    "/bin/bash", "-lc",
+                    "conda activate hummingbot && ./bin/hummingbot_quickstart.py "
+                    "--config-password \\\"$CONFIG_PASSWORD\\\" --v2 \\\"$SCRIPT_CONFIG\\\" --headless true",
+                ] if config.script_config else None,
+                network_mode="host",
+'''
+if needle not in source:
+    raise SystemExit('DockerService create_hummingbot_instance signature changed; review this patch.')
+path.write_text(source.replace(needle, replacement, 1), encoding='utf-8')
+PY
+
+# Keep timestamped names as the API default, but allow callers that implement
+# their own replacement/reconciliation flow to request an exact instance name.
+# A fixed name is the idempotency key: a timed-out retry can no longer create a
+# second container with a different timestamp.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path('/hummingbot-api/routers/bot_orchestration.py')
+source = path.read_text(encoding='utf-8')
+signature = '''async def deploy_v2_script(
+    deployment: V2ScriptDeployment,
+    docker_manager: DockerService = Depends(get_docker_service),
+    bots_manager: BotsOrchestrator = Depends(get_bots_orchestrator)
+):'''
+patched_signature = '''async def deploy_v2_script(
+    deployment: V2ScriptDeployment,
+    use_timestamp: bool = True,
+    docker_manager: DockerService = Depends(get_docker_service),
+    bots_manager: BotsOrchestrator = Depends(get_bots_orchestrator)
+):'''
+name_block = '''        # Generate unique instance name with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        unique_instance_name = f"{deployment.instance_name}-{timestamp}"
+'''
+patched_name_block = '''        # Timestamping remains backward compatible. Callers that reconcile a
+        # stable singleton can opt out and use the exact name as an idempotency key.
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        unique_instance_name = (
+            f"{deployment.instance_name}-{timestamp}" if use_timestamp else deployment.instance_name
+        )
+'''
+if source.count(signature) != 1 or source.count(name_block) != 1:
+    raise SystemExit('deploy-v2-script source changed; review the exact-name patch.')
+source = source.replace(signature, patched_signature, 1)
+source = source.replace(name_block, patched_name_block, 1)
+path.write_text(source, encoding='utf-8')
+PY
+
+# Hummingbot's current DCA backtesting simulator writes every DCA stage using
+# the final stage's timestamp. With multi-level DCA this causes a Pandas shape
+# error and prevents API backtests from completing. Runtime executors are not
+# changed; this only corrects the simulator's per-stage result accounting.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path('/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py')
+source = path.read_text(encoding='utf-8')
+needle = "df_filtered.loc[entry_timestamp:, f'filled_amount_quote_{i}']"
+replacement = "df_filtered.loc[dca_stage['entry_timestamp']:, f'filled_amount_quote_{i}']"
+if source.count(needle) != 2:
+    raise SystemExit('DCA simulator source changed; review the staged backtesting patch.')
+path.write_text(source.replace(needle, replacement), encoding='utf-8')
+PY
+
+# A plain V2 script has no controller performance report. The upstream status
+# implementation therefore labels a healthy, recently-active script as
+# "stopped" even while its Docker container and MQTT heartbeat are live.
+# Recent MQTT activity is the runtime signal; performance is optional metadata.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path('/hummingbot-api/services/bots_orchestrator.py')
+source = path.read_text(encoding='utf-8')
+needle = '''            if len(performance) > 0 and recently_active:
+                status = "running"
+            elif len(performance) > 0 and not recently_active:
+                status = "idle"  # Has performance data but no recent activity
+            else:
+                status = "stopped"
+'''
+replacement = '''            if recently_active:
+                status = "running"
+            elif len(performance) > 0:
+                status = "idle"  # Has performance data but no recent activity
+            else:
+                status = "stopped"
+'''
+if source.count(needle) != 1:
+    raise SystemExit('BotsOrchestrator status logic changed; review the V2 script patch.')
+path.write_text(source.replace(needle, replacement, 1), encoding='utf-8')
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path('/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py')
+source = path.read_text(encoding='utf-8')
+needle = "df_filtered.loc[entry_timestamp:"
+replacement = "df_filtered.loc[dca_stage['entry_timestamp']:"
+if source.count(needle) != 4:
+    raise SystemExit('DCA simulator timestamp references changed; review the staged backtesting patch.')
+path.write_text(source.replace(needle, replacement), encoding='utf-8')
+PY

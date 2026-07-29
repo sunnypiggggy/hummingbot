@@ -62,6 +62,7 @@ class DCAExecutor(ExecutorBase):
         # used to track the total amount filled that is updated by the event in case that the InFlightOrder is
         # not available
         self._total_executed_amount_backup: Decimal = Decimal("0")
+        self._first_fill_timestamp: Optional[float] = None
 
     @property
     def active_open_orders(self) -> List[TrackedOrder]:
@@ -118,7 +119,34 @@ class DCAExecutor(ExecutorBase):
     def end_time(self):
         if not self.config.time_limit:
             return None
+        if self.config.time_limit_from_first_fill:
+            first_fill = self.first_fill_timestamp
+            if first_fill is None:
+                return None
+            return first_fill + self.config.time_limit
         return self.config.timestamp + self.config.time_limit
+
+    @property
+    def first_fill_timestamp(self) -> Optional[float]:
+        if self._first_fill_timestamp is not None:
+            return self._first_fill_timestamp
+        timestamps = []
+        for tracked_order in self._open_orders:
+            order = tracked_order.order
+            if order is None or tracked_order.executed_amount_base <= Decimal("0"):
+                continue
+            for fill in getattr(order, "order_fills", {}).values():
+                fill_timestamp = getattr(fill, "fill_timestamp", None)
+                if fill_timestamp is not None:
+                    timestamps.append(float(fill_timestamp))
+        if timestamps:
+            self._first_fill_timestamp = min(timestamps)
+        elif self.open_filled_amount > Decimal("0"):
+            # Conservative recovery fallback: never extend an already-open
+            # position beyond the original executor deadline when exact fill
+            # history is unavailable after a process restart.
+            self._first_fill_timestamp = float(self.config.timestamp)
+        return self._first_fill_timestamp
 
     @property
     def is_expired(self):
@@ -323,9 +351,13 @@ class DCAExecutor(ExecutorBase):
         triggered if the net pnl is lower than the stop loss and all the orders were executed, otherwise the stop loss
         will be triggered if the net pnl is lower than the stop loss.
         """
-        if self.config.stop_loss:
+        if self.config.stop_loss and self.open_filled_amount > Decimal("0"):
             if self.config.mode == DCAMode.MAKER:
-                if self.all_open_orders_executed and self.net_pnl_pct <= -self.config.stop_loss:
+                protected = (
+                    self.config.stop_loss_on_partial_fills
+                    or self.all_open_orders_executed
+                )
+                if protected and self.net_pnl_pct <= -self.config.stop_loss:
                     self.close_type = CloseType.STOP_LOSS
                     self.place_close_order_and_cancel_open_orders()
             else:
@@ -518,6 +550,15 @@ class DCAExecutor(ExecutorBase):
         is not available.
         """
         if event.order_id in [order.order_id for order in self._open_orders]:
+            event_timestamp = getattr(event, "timestamp", None)
+            if event_timestamp is not None:
+                timestamp = float(event_timestamp)
+                if self._first_fill_timestamp is None:
+                    self._first_fill_timestamp = timestamp
+                else:
+                    self._first_fill_timestamp = min(
+                        self._first_fill_timestamp, timestamp
+                    )
             self._total_executed_amount_backup += event.amount
         self.update_tracked_orders_with_order_id(event.order_id)
 
@@ -539,6 +580,7 @@ class DCAExecutor(ExecutorBase):
             "n_levels": self.n_levels,
             "trailing_stop_trigger_pct": self._trailing_stop_trigger_pct,
             "total_executed_amount_backup": self._total_executed_amount_backup,
+            "first_fill_timestamp": self.first_fill_timestamp,
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,
             "level_id": self.config.level_id,

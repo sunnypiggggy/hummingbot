@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY scheduler/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY scripts/portfolio_grid_core.py /app/portfolio_grid_core.py
+COPY scheduler/portfolio_grid_scheduler.py /app/portfolio_grid_scheduler.py
+COPY scripts/walk_forward_portfolio_grid.py /app/walk_forward_portfolio_grid.py
+COPY controllers/market_making/dman_maker_v2.py /app/dman_maker_v2.py
+COPY scripts/v2_with_controllers.py /app/v2_with_controllers.py
+COPY scripts/run_dca_api_backtest.py /app/run_dca_api_backtest.py
+COPY scripts/deploy_fdusd_portfolio_grid.py /app/deploy_fdusd_portfolio_grid.py
+CMD ["python", "/app/portfolio_grid_scheduler.py"]

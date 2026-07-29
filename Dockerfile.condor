@@ -14,6 +14,8 @@ WORKDIR /opt
 RUN git clone --depth 1 https://github.com/hummingbot/condor.git
 
 WORKDIR /opt/condor
+COPY docker/patch_condor_bot_callbacks.py /tmp/patch_condor_bot_callbacks.py
+RUN python /tmp/patch_condor_bot_callbacks.py
 RUN uv sync && \
     if [ -d frontend ]; then cd frontend && npm install && npm run build; fi
 

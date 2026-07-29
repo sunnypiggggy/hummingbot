@@ -15,6 +15,7 @@ from libcpp.vector cimport vector
 from hummingbot.connector.budget_checker import BudgetChecker
 from hummingbot.connector.connector_metrics_collector import DummyMetricsCollector
 from hummingbot.connector.exchange.paper_trade.trading_pair import TradingPair
+from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.core.clock cimport Clock
 from hummingbot.core.clock import Clock
@@ -208,6 +209,17 @@ cdef class PaperTradeExchange(ExchangeBase):
     @property
     def trading_pairs(self) -> List[str]:
         return [trading_pair for trading_pair in self._trading_pairs]
+
+    @property
+    def trading_rules(self):
+        """Expose the target exchange rules for V2 executor quantization.
+
+        The paper connector owns a target *class*, not a live connector
+        instance. Its own quantization functions remain authoritative; these
+        zero-minimum rules supply V2 executors with the required validation
+        surface for the already loaded paper pairs.
+        """
+        return {trading_pair: TradingRule(trading_pair) for trading_pair in self._trading_pairs}
 
     @property
     def name(self) -> str:
@@ -613,6 +625,10 @@ cdef class PaperTradeExchange(ExchangeBase):
             front_order = self._queued_orders[0]
             if front_order.create_timestamp <= self._current_timestamp - self.TRADE_EXECUTION_DELAY:
                 self._queued_orders.popleft()
+                # DCA can request a close after an unfilled executor expires.
+                # There is no simulated position to close in that case.
+                if front_order.amount <= s_decimal_0:
+                    continue
                 try:
                     if front_order.is_buy:
                         self.c_execute_buy(front_order.order_id, front_order.trading_pair, front_order.amount)

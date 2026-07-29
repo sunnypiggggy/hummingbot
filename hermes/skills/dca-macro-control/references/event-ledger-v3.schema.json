@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.hermes/schemas/hermes-dca-event-ledger-v3.json",
+  "title": "Hermes DCA Event Ledger V3 Record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "record_id",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "hermes-dca-event-ledger-v3"
+    },
+    "record_type": {
+      "enum": [
+        "event",
+        "proposal",
+        "approval",
+        "execution",
+        "revocation"
+      ]
+    },
+    "record_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "proposal_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "proposal_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "event": {
+      "$ref": "#/$defs/event"
+    },
+    "proposal": {
+      "$ref": "#/$defs/proposal"
+    },
+    "approval": {
+      "$ref": "#/$defs/approval"
+    },
+    "submitted_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "revoked_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "gateway_result": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "record_type": {
+            "const": "event"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "event",
+          "source_sha256"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record_type": {
+            "const": "proposal"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "proposal",
+          "proposal_sha256"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record_type": {
+            "enum": [
+              "approval",
+              "revocation"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "proposal_id",
+          "proposal_sha256",
+          "approval"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record_type": {
+            "const": "execution"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "proposal_id",
+          "proposal_sha256",
+          "submitted_at",
+          "snapshot_id",
+          "gateway_result"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record_type": {
+            "const": "revocation"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "revoked_at"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "event": {
+      "type": "object",
+      "required": [
+        "event_id",
+        "kind",
+        "starts_at",
+        "title",
+        "source_url"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "fomc",
+            "cpi",
+            "nfp"
+          ]
+        },
+        "starts_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "title": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://"
+        }
+      },
+      "additionalProperties": false
+    },
+    "proposal": {
+      "type": "object",
+      "required": [
+        "decision_id",
+        "event_id",
+        "event_kind",
+        "event_at",
+        "event_source_url",
+        "decision_at",
+        "market_impact",
+        "confidence",
+        "effective_at",
+        "resume_at",
+        "reason",
+        "evidence",
+        "hermes",
+        "policy_version"
+      ],
+      "properties": {
+        "decision_id": {
+          "type": "string"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "event_kind": {
+          "enum": [
+            "fomc",
+            "cpi",
+            "nfp"
+          ]
+        },
+        "event_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event_source_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "decision_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "market_impact": {
+          "enum": [
+            "negative",
+            "positive",
+            "neutral"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "effective_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "resume_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object"
+          }
+        },
+        "hermes": {
+          "type": "object"
+        },
+        "policy_version": {
+          "const": "dca-macro-v3"
+        }
+      },
+      "additionalProperties": false
+    },
+    "approval": {
+      "type": "object",
+      "required": [
+        "status",
+        "channel",
+        "action",
+        "approved_at",
+        "proposal_sha256"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "approved",
+            "rejected"
+          ]
+        },
+        "channel": {
+          "enum": [
+            "telegram",
+            "hermes_conversation"
+          ]
+        },
+        "action": {
+          "enum": [
+            "approve",
+            "revoke"
+          ]
+        },
+        "telegram_user_id": {
+          "type": "string"
+        },
+        "telegram_chat_id": {
+          "type": "string"
+        },
+        "telegram_update_id": {
+          "type": "string"
+        },
+        "telegram_callback_query_id": {
+          "type": "string"
+        },
+        "telegram_message_id": {
+          "type": "string"
+        },
+        "hermes_interaction_id": {
+          "type": "string"
+        },
+        "hermes_surface": {
+          "enum": [
+            "telegram",
+            "cli",
+            "dashboard"
+          ]
+        },
+        "hermes_approver_user_id": {
+          "type": "string"
+        },
+        "hermes_chat_id": {
+          "type": "string"
+        },
+        "hermes_response_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "approved_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "proposal_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "channel": {
+                "const": "telegram"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "telegram_user_id",
+              "telegram_chat_id",
+              "telegram_update_id",
+              "telegram_callback_query_id",
+              "telegram_message_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "channel": {
+                "const": "hermes_conversation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "hermes_interaction_id",
+              "hermes_surface",
+              "hermes_approver_user_id",
+              "hermes_chat_id",
+              "hermes_response_sha256"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

@@ -109,3 +109,9 @@ coverage.xml
 # GRVT
 /grvt
 /backtest_results/
+
+# Hermes DCA macro-control local state and private material
+#/dca-macro-data/
+#.env.hermes
+#ops/dca-macro/*_secrets.json
+/results/

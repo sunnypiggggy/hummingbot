@@ -24,6 +24,13 @@ class DCAExecutorConfig(ExecutorConfigBase):
     stop_loss: Optional[Decimal] = None
     trailing_stop: Optional[TrailingStop] = None
     time_limit: Optional[int] = None
+    # Optional safer semantics for long-lived maker ladders. When enabled, an
+    # unfilled ladder is refreshed by its controller, while the position time
+    # limit starts at the first fill instead of executor creation.
+    time_limit_from_first_fill: bool = False
+    # Preserve the legacy maker behavior by default. Live macro DCA enables
+    # this so a partially-filled ladder is protected by stop loss immediately.
+    stop_loss_on_partial_fills: bool = False
     mode: DCAMode = DCAMode.MAKER
     activation_bounds: Optional[List[Decimal]] = None
     level_id: Optional[str] = None

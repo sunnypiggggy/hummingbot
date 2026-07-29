@@ -1,0 +1,4 @@
+FROM hummingbot/hummingbot:latest
+COPY docker/portfolio-grid-entrypoint.sh /usr/local/bin/portfolio-grid-entrypoint.sh
+RUN chmod +x /usr/local/bin/portfolio-grid-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/portfolio-grid-entrypoint.sh"]
