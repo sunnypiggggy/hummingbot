@@ -282,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat = sub.add_parser("heartbeat")
     heartbeat.add_argument("--decision-id", default="")
     sub.add_parser("status")
+    sub.add_parser("bots")
     report = sub.add_parser("report")
     report.add_argument("--chart-output", type=Path)
     sub.add_parser("telemetry")
@@ -582,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
             ("status", "/v1/status"),
             ("telemetry", "/v1/telemetry"),
             ("trading_report", "/v1/trading-report"),
+            ("bot_overview", "/v1/bots"),
         ):
             try:
                 components[name] = signed_request(
@@ -636,6 +638,18 @@ def main(argv: list[str] | None = None) -> int:
             args.hmac_secret,
             "GET",
             "/v1/status",
+            key_id=args.key_id,
+            client_cert=args.client_cert,
+            client_key=args.client_key,
+            ca_file=args.ca_file,
+        )
+    elif args.command == "bots":
+        _require_gateway(args)
+        result = signed_request(
+            args.gateway_url,
+            args.hmac_secret,
+            "GET",
+            "/v1/bots",
             key_id=args.key_id,
             client_cert=args.client_cert,
             client_key=args.client_key,

@@ -17,6 +17,7 @@ services:
       DCA_MACRO_TRADING_REPORT_INPUT: /workspace/telemetry/dca_trade_report_v3.json
       DCA_MACRO_TRADING_CHART_INPUT: /workspace/telemetry/dca_trade_chart_7d.png
       DCA_MACRO_TRADING_REPORT_MAX_AGE: "900"
+      DCA_MACRO_GRID_GUARD_INPUT: /workspace/grid/guard_state.json
       DCA_MACRO_BOT_TARGETS: >-
         [{"bot_name":"dca-live-btcusdt-200","controller_name":"dca_btcusdt_live_200","trading_pair":"BTC-USDT"},{"bot_name":"dca-live-ethusdt-200","controller_name":"dca_ethusdt_live_200","trading_pair":"ETH-USDT"}]
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
@@ -26,6 +27,7 @@ services:
     volumes:
       - ../../dca-macro-data:/workspace/state
       - ../../dca-live-data:/workspace/telemetry:ro
+      - ../../grid-live-fdusd-data:/workspace/grid:ro
     secrets:
       - hermes_hmac_secrets
     healthcheck:

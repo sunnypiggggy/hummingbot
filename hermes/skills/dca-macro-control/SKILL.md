@@ -1,6 +1,6 @@
 ---
 name: dca-macro-control
-description: Inspect V3 BTC/ETH DCA status, gates, strategy-owned positions, profit, and seven-day BUY/SELL charts; prepare and conversationally approve macro risk windows. Use for DCA health, holdings, PnL, recent trades, FOMC, CPI, or NFP requests.
+description: Inspect every running Hummingbot strategy bot, V3 BTC/ETH DCA status, FDUSD Grid health and strategy-owned MTM profit, gates, positions, and seven-day DCA BUY/SELL charts; prepare and conversationally approve macro risk windows. Use for requests about all bots, running bots, Grid status or profit, DCA health, holdings, PnL, recent trades, FOMC, CPI, or NFP.
 ---
 
 # DCA Macro Control
@@ -14,10 +14,21 @@ requesting approval or revocation.
 
 ## Read-only report
 
+For all running bots, Grid status, or Grid profit requests, run:
+
+```bash
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py bots
+```
+
+List every item in `bots`, including status and error count. Summarize Grid
+`mtm_pnl_quote`, equity, peak equity, drawdown, per-pair PnL, Guard readiness,
+technical BUY gate, and `data_age_seconds`. Call this strategy-owned MTM in
+FDUSD, never realized profit or Binance account profit. Warn when `fresh=false`.
+
 For DCA status, position, profit, performance, or recent-trade requests, run:
 
 ```bash
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py report
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py report
 ```
 
 Summarize:
@@ -28,6 +39,7 @@ Summarize:
   a perpetual short position.
 - All-time and seven-day mark-to-market profit, recorded fees, and data age.
 - Report warnings, including stale or partial data.
+- All running strategy bots and the Grid MTM section from `bot_overview`.
 
 If `chart_path` is present, put that absolute PNG path on its own final line so
 Hermes sends it as an inline Telegram image. Do not put the path in a code
@@ -58,26 +70,27 @@ block. A report query is read-only and never requires approval.
 Run from the Hummingbot project root:
 
 ```bash
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py validate-dossier \
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py validate-dossier \
   --dossier /path/proposal.json
 
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py conversation-request \
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py conversation-request \
   --dossier /path/proposal.json \
   --output /path/approval-request.json
 
 # Call Hermes clarify with prompt + choices from approval-request.json, then:
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py conversation-resolve \
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py conversation-resolve \
   --request /path/approval-request.json \
   --response "<exact clarify user_response>" \
   --output /path/approved.json
 
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py submit-approved \
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py submit-approved \
   --dossier /path/approved.json
 
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py status
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py report
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py ledger-validate
-python hermes/skills/dca-macro-control/scripts/hermes_dca.py ledger-replay
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py status
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py bots
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py report
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py ledger-validate
+python3 hermes/skills/dca-macro-control/scripts/hermes_dca.py ledger-replay
 ```
 
 Set gateway, mTLS, HMAC, approver user ID, approver chat ID, and conversation
@@ -99,3 +112,5 @@ set `HUMMINGBOT_PROJECT_ROOT` to the checkout containing `macro_control`.
 - Keep live execution disabled until separately approved.
 - Never use a report query to create a proposal, lease, approval, or gate
   update.
+- Never omit a running Bot merely because it has no controller performance;
+  plain V2 scripts such as Grid legitimately have an empty controller list.

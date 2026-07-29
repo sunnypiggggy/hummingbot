@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from .executor import DecisionRejected, MacroExecutor
+from .bot_overview import BotOverviewProvider, BotOverviewUnavailable
 from .file_telemetry import JsonFileTelemetryProvider
 from .hummingbot_api import HummingbotAPI
 from .security import NonceCache, verify_request
@@ -46,6 +47,7 @@ def create_app(
     require_mtls_proxy: bool = True,
     reconcile_interval_seconds: float = 5,
     trading_report: JsonTradingReportProvider | None = None,
+    bot_overview: BotOverviewProvider | None = None,
 ) -> FastAPI:
     async def reconcile_loop() -> None:
         while True:
@@ -90,6 +92,7 @@ def create_app(
             "/v1/status",
             "/v1/trading-report",
             "/v1/trading-chart",
+            "/v1/bots",
         } and not request.url.path.startswith("/v1/decisions/"):
             return JSONResponse({"detail": "not found"}, status_code=404)
         if require_mtls_proxy and request.headers.get("x-client-cert-verified") != "SUCCESS":
@@ -186,6 +189,17 @@ def create_app(
             headers={"X-DCA-Report-Id": report_id},
         )
 
+    @app.get("/v1/bots")
+    async def get_bots():
+        if bot_overview is None:
+            raise HTTPException(
+                status_code=503, detail="bot overview is not configured"
+            )
+        try:
+            return bot_overview.snapshot()
+        except BotOverviewUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     @app.get("/healthz")
     async def healthz():
         return {
@@ -254,6 +268,12 @@ def app_from_environment() -> FastAPI:
         if report_input and chart_input
         else None
     )
+    grid_guard_input = os.environ.get("DCA_MACRO_GRID_GUARD_INPUT", "")
+    bot_overview = (
+        BotOverviewProvider(api, Path(grid_guard_input))
+        if grid_guard_input
+        else None
+    )
     targets = json.loads(os.environ.get("DCA_MACRO_BOT_TARGETS", "[]"))
     executor = MacroExecutor(
         api,
@@ -294,4 +314,5 @@ def app_from_environment() -> FastAPI:
             os.environ.get("DCA_MACRO_RECONCILE_INTERVAL", "5")
         ),
         trading_report=trading_report,
+        bot_overview=bot_overview,
     )

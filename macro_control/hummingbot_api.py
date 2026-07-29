@@ -43,6 +43,9 @@ class HummingbotAPI:
     def bot_status(self, bot_name: str) -> dict:
         return self._request("GET", f"/bot-runs/{bot_name}")
 
+    def all_bot_statuses(self) -> dict:
+        return self._request("GET", "/bot-orchestration/status")
+
     def update_controller(
         self, bot_name: str, controller_name: str, profile: dict
     ) -> dict:

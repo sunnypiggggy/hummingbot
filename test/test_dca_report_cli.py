@@ -35,6 +35,7 @@ class HermesReportCliTests(unittest.TestCase):
                     "/v1/status": {"execution_enabled": False},
                     "/v1/telemetry": {"telemetry_healthy": True},
                     "/v1/trading-report": {"report_id": "report"},
+                    "/v1/bots": {"running_count": 3},
                 }[path]
 
             stdout = io.StringIO()
@@ -54,6 +55,7 @@ class HermesReportCliTests(unittest.TestCase):
             self.assertFalse(value["status"]["execution_enabled"])
             self.assertTrue(value["telemetry"]["telemetry_healthy"])
             self.assertEqual("report", value["trading_report"]["report_id"])
+            self.assertEqual(3, value["bot_overview"]["running_count"])
             self.assertEqual(str(output.resolve()), value["chart_path"])
             self.assertEqual(PNG, output.read_bytes())
             self.assertTrue(value["read_only"])
@@ -80,7 +82,21 @@ class HermesReportCliTests(unittest.TestCase):
         self.assertIsNotNone(value["status"])
         self.assertIsNone(value["trading_report"])
         self.assertIsNone(value["chart_path"])
-        self.assertEqual(3, len(value["warnings"]))
+        self.assertEqual(4, len(value["warnings"]))
+
+    def test_bots_command_uses_read_only_overview_endpoint(self):
+        stdout = io.StringIO()
+        with (
+            patch(
+                "macro_control.hermes_cli.signed_request",
+                return_value={"running_count": 3, "read_only": True},
+            ) as request,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, main(self.gateway_args() + ["bots"]))
+        self.assertEqual(3, json.loads(stdout.getvalue())["running_count"])
+        self.assertEqual("GET", request.call_args.args[2])
+        self.assertEqual("/v1/bots", request.call_args.args[3])
 
     def test_chart_cache_removes_only_expired_matching_png(self):
         with tempfile.TemporaryDirectory() as directory:

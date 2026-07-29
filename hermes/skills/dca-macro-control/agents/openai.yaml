@@ -1,4 +1,4 @@
 interface:
   display_name: "DCA Macro Control"
-  short_description: "Inspect and approve V3 DCA risk controls"
-  default_prompt: "Use $dca-macro-control to show current DCA status, strategy positions, profit, and the seven-day trade chart."
+  short_description: "Inspect all bots, Grid/DCA profit, and approve V3 risk controls"
+  default_prompt: "Use $dca-macro-control to list all running bots and show current Grid and DCA health, strategy-owned profit, positions, gates, and recent trades."
