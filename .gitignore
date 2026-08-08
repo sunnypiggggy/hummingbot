@@ -115,3 +115,6 @@ coverage.xml
 #.env.hermes
 #ops/dca-macro/*_secrets.json
 /results/
+/.staging/
+.pytest_*
+

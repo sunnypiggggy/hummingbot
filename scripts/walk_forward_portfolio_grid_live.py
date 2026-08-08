@@ -50,9 +50,14 @@ from scripts.grid_live_common import (
     validate_active_selection,
 )
 from scripts.grid_macro_gate import load_runtime_macro_gate
-from scripts.grid_technical_gate import load_runtime_technical_gate
+from scripts.grid_xgboost_risk_gate import load_runtime_xgboost_gate
+from scripts.risk_recovery import (
+    ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
+    advance_recovery, active_state, mark_exit_complete, mark_reentry_complete,
+    normalize_state, trigger_state,
+)
 
-RUNTIME_STATE_SCHEMA_VERSION = 4
+RUNTIME_STATE_SCHEMA_VERSION = 8
 
 
 @dataclass
@@ -82,6 +87,17 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
     move_threshold: Decimal = Decimal("0.02")
     min_grid_move_seconds: int = 1800
     order_refresh_time: int = ORDER_REFRESH_SECONDS
+    pair_breakers_enabled: bool = True
+    pair_loss_breaker_enabled: bool = True
+    pair_drawdown_breaker_enabled: bool = True
+    portfolio_breakers_enabled: bool = True
+    portfolio_loss_breaker_enabled: bool = True
+    portfolio_drawdown_breaker_enabled: bool = True
+    cost_floor_enabled: bool = True
+    inventory_exit_enabled: bool = True
+    max_extra_inventory_quote: Decimal = Decimal("10")
+    profit_protection_seconds: int = 24 * 60 * 60
+    max_extra_inventory_hold_seconds: int = 48 * 60 * 60
     risk_state_persist_seconds: int = RISK_STATE_PERSIST_SECONDS
     portfolio_stop_loss_quote: Decimal = BOT_LOSS_LIMIT
     pair_stop_loss_quote: Decimal = PAIR_LOSS_LIMIT
@@ -103,10 +119,13 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
     macro_gate_max_age_seconds: int = 150
     macro_fail_closed: bool = True
     technical_buy_gate_enabled: bool = False
-    technical_buy_gate_file: str = "data/technical_buy_gate.json"
+    technical_buy_gate_file: str = "data/xgboost_risk_gate.json"
     technical_buy_gate_poll_seconds: int = 5
     technical_buy_gate_max_age_seconds: int = 150
     technical_buy_fail_closed: bool = True
+    technical_model_sha256: str = ""
+    technical_feature_sha256: str = ""
+    risk_auto_reentry_enabled: bool = False
 
     @field_validator("trading_pairs", mode="before")
     @classmethod
@@ -145,6 +164,13 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
             raise ValueError("Pair peak drawdown limit must be exactly 3%.")
         if self.order_refresh_time != ORDER_REFRESH_SECONDS:
             raise ValueError("Live Grid order refresh time must be exactly 2 hours.")
+        if self.inventory_exit_enabled:
+            if self.max_extra_inventory_quote != Decimal("10"):
+                raise ValueError("Extra inventory must be capped at exactly 10 quote units per pair.")
+            if self.profit_protection_seconds != 24 * 60 * 60:
+                raise ValueError("Inventory profit protection must last exactly 24 hours.")
+            if self.max_extra_inventory_hold_seconds != 48 * 60 * 60:
+                raise ValueError("Extra inventory maximum holding time must be exactly 48 hours.")
         if self.risk_state_persist_seconds != RISK_STATE_PERSIST_SECONDS:
             raise ValueError("Live Grid risk state must be persisted every 5 seconds.")
         if set(self.reserved_base_by_pair) != set(self.trading_pairs):
@@ -154,14 +180,23 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
         if self.trading_enabled and self.bootstrap_from_quote and not self.bootstrap_completed:
             raise ValueError("FDUSD inventory bootstrap must finish before live trading can be enabled.")
         if self.quote_asset == "FDUSD":
-            if not self.macro_gate_enabled or not self.macro_fail_closed:
+            if self.macro_gate_enabled and not self.macro_fail_closed:
                 raise ValueError("FDUSD live Grid requires a fail-closed FOMC macro gate.")
             if not 1 <= self.macro_gate_poll_seconds <= 30:
                 raise ValueError("FOMC macro gate polling must be between 1 and 30 seconds.")
             if not 30 <= self.macro_gate_max_age_seconds <= 180:
                 raise ValueError("FOMC macro gate freshness must be between 30 and 180 seconds.")
-            if not self.technical_buy_gate_enabled or not self.technical_buy_fail_closed:
-                raise ValueError("FDUSD live Grid requires a fail-closed ROC/SQZMOM BUY gate.")
+            if self.technical_buy_gate_enabled and not self.technical_buy_fail_closed:
+                raise ValueError("FDUSD live Grid requires a fail-closed XGBoost BUY gate.")
+            if Path(self.technical_buy_gate_file).name != "xgboost_risk_gate.json":
+                raise ValueError("FDUSD live Grid does not permit a Mechanism 1 technical-gate file.")
+            if self.trading_enabled and self.technical_buy_gate_enabled:
+                hashes = (self.technical_model_sha256, self.technical_feature_sha256)
+                if any(
+                    len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower())
+                    for value in hashes
+                ):
+                    raise ValueError("Enabled FDUSD Grid requires locked XGBoost model and feature hashes.")
             if not 1 <= self.technical_buy_gate_poll_seconds <= 30:
                 raise ValueError("Technical BUY gate polling must be between 1 and 30 seconds.")
             if not 30 <= self.technical_buy_gate_max_age_seconds <= 180:
@@ -188,14 +223,25 @@ class LivePortfolioGrid(StrategyV2Base):
         self.next_risk_persist = 0.0
         self.awaiting_cancellation = False
         self.portfolio_tripped = False
+        self.pair_recovery: Dict[str, Dict[str, Any]] = {
+            pair: active_state() for pair in config.trading_pairs
+        }
+        self.portfolio_recovery: Dict[str, Any] = active_state()
         self.pending_flatten: set[str] = set()
         self.flatten_order_ids: Dict[str, str] = {}
+        self.reentry_order_ids: Dict[str, str] = {}
+        self.pending_inventory_exit: set[str] = set()
+        self.inventory_exit_order_ids: Dict[str, str] = {}
+        self.excess_inventory_started_at: Dict[str, Optional[float]] = {
+            pair: None for pair in config.trading_pairs
+        }
         self.buy_order_ids: set[str] = set()
         self.sell_order_ids: set[str] = set()
         self.last_market_success = time.time()
         self.first_cycle_failure_at: Optional[float] = None
         self.disabled_logged = False
         self.peak_equity = config.capital_limit_quote
+        self.portfolio_episode_baseline = config.capital_limit_quote
         self.active_parameter_version = config.active_parameter_version
         self.pending_parameter_version: Optional[str] = None
         self.pending_parameters: Optional[Dict[str, Any]] = None
@@ -208,11 +254,26 @@ class LivePortfolioGrid(StrategyV2Base):
         self.macro_active_lease_ids: List[str] = []
         self.next_macro_poll = 0.0
         self.macro_transition_key: Optional[tuple] = None
-        self.technical_buy_enabled = not config.technical_buy_gate_enabled
-        self.technical_gate_healthy = not config.technical_buy_gate_enabled
-        self.technical_reason = (
-            "technical_gate_not_checked" if config.technical_buy_gate_enabled else "disabled"
-        )
+        initial_enabled = not config.technical_buy_gate_enabled
+        initial_healthy = not config.technical_buy_gate_enabled
+        initial_reason = "xgboost_gate_not_checked" if config.technical_buy_gate_enabled else "disabled"
+        self.technical_buy_enabled_by_pair = {
+            pair: initial_enabled for pair in config.trading_pairs
+        }
+        self.technical_gate_healthy_by_pair = {
+            pair: initial_healthy for pair in config.trading_pairs
+        }
+        self.technical_reason_by_pair = {
+            pair: initial_reason for pair in config.trading_pairs
+        }
+        self.technical_signal_by_pair: Dict[str, Dict[str, Any]] = {
+            pair: {} for pair in config.trading_pairs
+        }
+        # Aggregate compatibility fields are status-only. Order placement uses
+        # the independent per-pair mappings above.
+        self.technical_buy_enabled = all(self.technical_buy_enabled_by_pair.values())
+        self.technical_gate_healthy = all(self.technical_gate_healthy_by_pair.values())
+        self.technical_reason = initial_reason
         self.technical_signal: Dict[str, Any] = {}
         self.next_technical_poll = 0.0
         self.technical_transition_key: Optional[tuple] = None
@@ -259,11 +320,23 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.first_cycle_failure_at = None
                 return
 
+            # This timer-driven Taker action is independent of the XGBoost BUY
+            # gate.  It can only sell inventory above the startup baseline.
+            if self.config.inventory_exit_enabled and self._process_inventory_exit_policy(prices, active):
+                self._persist(prices)
+                self.first_cycle_failure_at = None
+                return
+
             self._poll_technical_buy_gate()
             self._poll_macro_gate()
             if self.macro_paused:
                 if self._owned_active_orders(active):
                     self.cancel_owned_orders()
+                self._persist(prices)
+                self.first_cycle_failure_at = None
+                return
+
+            if self._advance_risk_recovery(prices, active):
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
@@ -336,6 +409,8 @@ class LivePortfolioGrid(StrategyV2Base):
         self.macro_paused = paused
         self.macro_active_lease_ids = lease_ids
         self.macro_reason = reason
+        if not healthy:
+            self._latch_integrity_failure(f"FOMC contract unhealthy: {reason}")
         if previous_paused and not paused:
             self.next_refresh = 0.0
             self._record_runtime_event(
@@ -353,6 +428,11 @@ class LivePortfolioGrid(StrategyV2Base):
 
     def _poll_technical_buy_gate(self) -> None:
         if not self.config.technical_buy_gate_enabled:
+            for pair in self.config.trading_pairs:
+                self.technical_buy_enabled_by_pair[pair] = True
+                self.technical_gate_healthy_by_pair[pair] = True
+                self.technical_reason_by_pair[pair] = "disabled"
+                self.technical_signal_by_pair[pair] = {}
             self.technical_buy_enabled = True
             self.technical_gate_healthy = True
             self.technical_reason = "disabled"
@@ -362,42 +442,101 @@ class LivePortfolioGrid(StrategyV2Base):
         self.next_technical_poll = (
             self.current_timestamp + self.config.technical_buy_gate_poll_seconds
         )
-        gate = load_runtime_technical_gate(
+        gate = load_runtime_xgboost_gate(
             Path(self.config.technical_buy_gate_file),
             now=datetime.now(timezone.utc),
             max_age_seconds=self.config.technical_buy_gate_max_age_seconds,
+            expected_model_sha256=self.config.technical_model_sha256 or None,
+            expected_feature_sha256=self.config.technical_feature_sha256 or None,
         )
         healthy = bool(gate.get("runtime_gate_healthy"))
-        enabled = bool(gate.get("buy_enabled"))
-        if not healthy and not self.config.technical_buy_fail_closed:
-            enabled = True
         reason = str(gate.get("reason", "unknown"))
-        transition = (healthy, enabled, reason)
-        previous_enabled = self.technical_buy_enabled
-        self.technical_gate_healthy = healthy
-        self.technical_buy_enabled = enabled
-        self.technical_reason = reason
-        self.technical_signal = dict(gate.get("signal", {}))
-        if not enabled:
-            unknown_side_state = self.cancel_owned_buy_orders()
-            if unknown_side_state:
+        gate_pairs = gate.get("pairs", {})
+        transitions = []
+        for pair in self.config.trading_pairs:
+            pair_signal = dict(gate_pairs.get(pair, {}))
+            pair_healthy = bool(healthy and pair_signal)
+            enabled = bool(pair_signal.get("buy_enabled")) if pair_healthy else False
+            if not pair_healthy and not self.config.technical_buy_fail_closed:
+                enabled = True
+            pair_reason = str(pair_signal.get("reason", reason))
+            previous_enabled = self.technical_buy_enabled_by_pair[pair]
+            self.technical_gate_healthy_by_pair[pair] = pair_healthy
+            self.technical_buy_enabled_by_pair[pair] = enabled
+            self.technical_reason_by_pair[pair] = pair_reason
+            self.technical_signal_by_pair[pair] = pair_signal
+            transitions.append((pair, pair_healthy, enabled, pair_reason))
+            forced_exit = bool(
+                pair_healthy
+                and gate.get("execution_policy_version") == "v22-risk-off-forced-exit-v2"
+                and pair_signal.get("force_exit")
+            )
+            if (
+                forced_exit
+                and self.pair_recovery[pair].get("phase") == ACTIVE
+            ):
+                self.ledgers[pair].halted = True
+                self.pending_flatten.add(pair)
+                self.pair_recovery[pair] = trigger_state(
+                    mechanism="v22_weekly_buy_gate", scope="technical",
+                    now=self.current_timestamp,
+                    trigger_value=pair_signal.get("probability"),
+                    signal_price="", reason=pair_reason,
+                )
+                self.cancel_owned_orders()
+                self._record_runtime_event(
+                    "v22_forced_exit_triggered", pair=pair,
+                    event_id=pair_signal.get("event_id"), reason=pair_reason,
+                )
+            elif not enabled:
+                unknown_side_state = self.cancel_owned_buy_orders(pair)
+                if unknown_side_state:
+                    self.next_refresh = 0.0
+                    self._record_runtime_event(
+                        "xgboost_risk_off_unknown_sides_sell_rebuild_scheduled",
+                        pair=pair, reason=pair_reason,
+                    )
+            elif not previous_enabled:
                 self.next_refresh = 0.0
                 self._record_runtime_event(
-                    "technical_risk_off_unknown_sides_sell_rebuild_scheduled",
-                    reason=reason,
+                    "xgboost_buy_gate_recovered_immediate_refresh",
+                    pair=pair, reason=pair_reason,
                 )
-        elif not previous_enabled:
-            self.next_refresh = 0.0
-            self._record_runtime_event(
-                "technical_buy_gate_recovered_immediate_refresh",
-                reason=reason,
-            )
+        self.technical_buy_enabled = all(self.technical_buy_enabled_by_pair.values())
+        self.technical_gate_healthy = all(self.technical_gate_healthy_by_pair.values())
+        self.technical_reason = reason
+        self.technical_signal = {
+            pair: dict(value) for pair, value in self.technical_signal_by_pair.items()
+        }
+        if not healthy:
+            self._latch_integrity_failure(f"technical contract unhealthy: {reason}")
+        transition = tuple(transitions)
         if transition != self.technical_transition_key:
             self.technical_transition_key = transition
-            self.notify(
-                f"ROC/SQZMOM BUY GATE {'ACTIVE' if enabled else 'RISK-OFF'}: "
-                f"healthy={healthy} reason={reason}"
+            state = ",".join(
+                f"{pair}:{'ACTIVE' if enabled else 'RISK-OFF'}"
+                for pair, _, enabled, _ in transitions
             )
+            self.notify(
+                f"XGBOOST BUY GATE {state}: healthy={healthy} reason={reason}"
+            )
+
+    def _latch_integrity_failure(self, reason: str) -> None:
+        if not hasattr(self, "portfolio_recovery"):
+            self.portfolio_recovery = active_state()
+        if self.portfolio_recovery.get("phase") == LATCHED:
+            return
+        self.portfolio_recovery = trigger_state(
+            mechanism="infrastructure_integrity_breaker", scope="infrastructure",
+            now=self.current_timestamp, trigger_value=reason, signal_price="",
+            reason=reason, latch_after_exit=True,
+        )
+        self.portfolio_tripped = True
+        for ledger in self.ledgers.values():
+            ledger.halted = True
+        self.pending_flatten.update(self.config.trading_pairs)
+        self._record_runtime_event("integrity_failure_latched", reason=reason)
+        self.notify(f"GRID INTEGRITY FAILURE LATCHED: {reason}")
 
     def _poll_parameter_update(self) -> None:
         if self.current_timestamp < self.next_parameter_poll:
@@ -456,8 +595,16 @@ class LivePortfolioGrid(StrategyV2Base):
                     self.grid_states[pair] = state
             lower_levels = [level for level in state.levels if level < price]
             upper_levels = [level for level in state.levels if level > price]
-            buy_budget = min(max(ledger.quote, Decimal("0")), self.config.side_budget_quote)
-            if lower_levels and self.technical_buy_enabled:
+            buy_limits = [max(ledger.quote, Decimal("0")), self.config.side_budget_quote]
+            if self.config.inventory_exit_enabled:
+                extra_quote = max(ledger.inventory_delta(), Decimal("0")) * price
+                baseline_deficit_quote = max(-ledger.inventory_delta(), Decimal("0")) * price
+                buy_limits.append(max(
+                    baseline_deficit_quote + self.config.max_extra_inventory_quote - extra_quote,
+                    Decimal("0"),
+                ))
+            buy_budget = min(buy_limits)
+            if lower_levels and self.technical_buy_enabled_by_pair.get(pair, False):
                 order_quote = buy_budget / Decimal(len(lower_levels))
                 if order_quote >= self.config.min_order_quote:
                     for level in lower_levels:
@@ -468,62 +615,179 @@ class LivePortfolioGrid(StrategyV2Base):
             sell_budget = min(max(ledger.base, Decimal("0")), ledger.initial_base)
             if upper_levels and sell_budget > 0:
                 amount = sell_budget / Decimal(len(upper_levels))
+                cost_floor = (
+                    ledger.minimum_profitable_sell_price(
+                        self._inventory_profit_floor_rate(pair)
+                    )
+                    if self.config.cost_floor_enabled
+                    else Decimal("0")
+                )
                 for level in upper_levels:
-                    sell_price = max(level, price * (Decimal("1") + self.config.take_profit))
+                    sell_price = max(
+                        level,
+                        price * (Decimal("1") + self.config.take_profit),
+                        cost_floor,
+                    )
                     if amount * sell_price >= self.config.min_order_quote:
                         order_id = self.sell(self.config.exchange, pair, amount,
                                              OrderType.LIMIT_MAKER, sell_price)
                         ledger.open_order_ids.add(order_id)
                         self.sell_order_ids.add(order_id)
 
+    def _inventory_profit_floor_rate(self, pair: str) -> Decimal:
+        started = self.excess_inventory_started_at.get(pair)
+        if started is None:
+            return self.config.take_profit
+        age = max(0.0, self.current_timestamp - float(started))
+        return (
+            self.config.take_profit
+            if age < self.config.profit_protection_seconds else Decimal("0")
+        )
+
+    def _process_inventory_exit_policy(
+        self, prices: Dict[str, Decimal], active_orders: list,
+    ) -> bool:
+        """Maintain extra-inventory timers and execute only the 48h excess exit."""
+        active_ids = {order.client_order_id for order in active_orders}
+        owned = self._owned_active_orders(active_orders)
+        action_pending = False
+        for pair, ledger in self.ledgers.items():
+            extra = max(ledger.inventory_delta(), Decimal("0"))
+            if extra <= 0:
+                self.excess_inventory_started_at[pair] = None
+                self.pending_inventory_exit.discard(pair)
+                order_id = self.inventory_exit_order_ids.get(pair)
+                if order_id is not None and order_id not in active_ids:
+                    self.inventory_exit_order_ids.pop(pair, None)
+                    ledger.open_order_ids.discard(order_id)
+                continue
+            if self.excess_inventory_started_at.get(pair) is None:
+                self.excess_inventory_started_at[pair] = self.current_timestamp
+            age = self.current_timestamp - float(self.excess_inventory_started_at[pair])
+            if age < self.config.max_extra_inventory_hold_seconds:
+                continue
+            self.pending_inventory_exit.add(pair)
+            order_id = self.inventory_exit_order_ids.get(pair)
+            if order_id is not None and order_id in active_ids:
+                action_pending = True
+                continue
+            if order_id is not None:
+                self.inventory_exit_order_ids.pop(pair, None)
+                ledger.open_order_ids.discard(order_id)
+            pair_orders = [order for order in owned if order.trading_pair == pair]
+            if pair_orders:
+                for order in pair_orders:
+                    self.cancel(self.config.exchange, pair, order.client_order_id)
+                action_pending = True
+                continue
+            price = prices[pair]
+            if extra * price < self.config.min_order_quote:
+                self._record_runtime_event(
+                    "inventory_48h_exit_below_exchange_minimum",
+                    pair=pair, excess_quote=str(extra * price),
+                )
+                continue
+            order_id = self.sell(self.config.exchange, pair, extra, OrderType.MARKET)
+            ledger.open_order_ids.add(order_id)
+            self.inventory_exit_order_ids[pair] = order_id
+            self.sell_order_ids.add(order_id)
+            self._record_runtime_event(
+                "inventory_48h_excess_taker_exit",
+                pair=pair, amount=str(extra), excess_quote=str(extra * price),
+            )
+            action_pending = True
+        return action_pending
+
     def _control_risk(self, prices: Dict[str, Decimal]) -> None:
+        # Compatibility for restored schema-7 states and lightweight test
+        # fixtures constructed without __init__.
+        if not hasattr(self, "pair_recovery"):
+            self.pair_recovery = {pair: active_state() for pair in self.config.trading_pairs}
+        if not hasattr(self, "portfolio_recovery"):
+            self.portfolio_recovery = active_state()
+        if not hasattr(self, "reentry_order_ids"):
+            self.reentry_order_ids = {}
+        if not hasattr(self, "portfolio_episode_baseline"):
+            self.portfolio_episode_baseline = self.config.capital_limit_quote
         total = self.config.reserve_quote
         for pair, ledger in self.ledgers.items():
             pair_equity = ledger.equity(prices[pair])
             total += pair_equity
-            pair_pnl = pair_equity - self.config.pair_budget_quote
+            pair_baseline = (
+                ledger.episode_equity_baseline
+                if ledger.episode_equity_baseline > 0 else self.config.pair_budget_quote
+            )
+            pair_pnl = pair_equity - pair_baseline
             ledger.peak_equity = max(ledger.peak_equity, pair_equity)
             pair_drawdown = (
                 (ledger.peak_equity - pair_equity) / ledger.peak_equity
                 if ledger.peak_equity > 0
                 else Decimal("0")
             )
-            pair_loss_tripped = pair_pnl <= -self.config.pair_stop_loss_quote
-            pair_drawdown_tripped = pair_drawdown >= self.config.pair_drawdown_limit_pct
+            pair_loss_tripped = (
+                self.config.pair_breakers_enabled
+                and getattr(self.config, "pair_loss_breaker_enabled", True)
+                and pair_pnl <= -self.config.pair_stop_loss_quote
+            )
+            pair_drawdown_tripped = (
+                self.config.pair_breakers_enabled
+                and getattr(self.config, "pair_drawdown_breaker_enabled", True)
+                and pair_drawdown >= self.config.pair_drawdown_limit_pct
+            )
             if not ledger.halted and (pair_loss_tripped or pair_drawdown_tripped):
-                ledger.halted = True
-                self.pending_flatten.add(pair)
                 reason = (
                     f"pnl={pair_pnl:.2f} <= -{self.config.pair_stop_loss_quote:.2f}"
                     if pair_loss_tripped
                     else f"drawdown={pair_drawdown:.2%}"
+                )
+                ledger.halted = True
+                self.pending_flatten.add(pair)
+                self.pair_recovery[pair] = trigger_state(
+                    mechanism=("strategy_loss_breaker" if pair_loss_tripped
+                               else "strategy_drawdown_breaker"),
+                    scope="strategy", now=self.current_timestamp,
+                    trigger_value=(pair_pnl if pair_loss_tripped else pair_drawdown),
+                    signal_price=prices[pair], reason=reason,
                 )
                 self.notify(
                     f"PAIR BREAKER {pair}: equity={pair_equity:.2f} "
                     f"peak={ledger.peak_equity:.2f} {reason}"
                 )
         self.peak_equity = max(self.peak_equity, total)
-        portfolio_pnl = total - self.config.capital_limit_quote
+        portfolio_pnl = total - self.portfolio_episode_baseline
         portfolio_drawdown = (
             (self.peak_equity - total) / self.peak_equity
             if self.peak_equity > 0
             else Decimal("0")
         )
-        portfolio_loss_tripped = portfolio_pnl <= -self.config.portfolio_stop_loss_quote
+        portfolio_loss_tripped = (
+            getattr(self.config, "portfolio_loss_breaker_enabled", True)
+            and portfolio_pnl <= -self.config.portfolio_stop_loss_quote
+        )
         portfolio_drawdown_tripped = (
+            getattr(self.config, "portfolio_drawdown_breaker_enabled", True)
+            and
             portfolio_drawdown >= self.config.portfolio_drawdown_limit_pct
         )
-        if not self.portfolio_tripped and (
+        if self.config.portfolio_breakers_enabled and not self.portfolio_tripped and (
             portfolio_loss_tripped or portfolio_drawdown_tripped
         ):
-            self.portfolio_tripped = True
-            for ledger in self.ledgers.values():
-                ledger.halted = True
-            self.pending_flatten.update(self.config.trading_pairs)
             reason = (
                 f"pnl={portfolio_pnl:.2f} <= -{self.config.portfolio_stop_loss_quote:.2f}"
                 if portfolio_loss_tripped
                 else f"drawdown={portfolio_drawdown:.2%}"
+            )
+            self.portfolio_tripped = True
+            for ledger in self.ledgers.values():
+                ledger.halted = True
+            self.pending_flatten.update(self.config.trading_pairs)
+            self.portfolio_recovery = trigger_state(
+                mechanism=("portfolio_loss_breaker" if portfolio_loss_tripped
+                           else "portfolio_drawdown_breaker"),
+                scope="portfolio", now=self.current_timestamp,
+                trigger_value=(portfolio_pnl if portfolio_loss_tripped else portfolio_drawdown),
+                signal_price={pair: str(prices[pair]) for pair in self.config.trading_pairs},
+                reason=reason,
             )
             self.notify(
                 f"PORTFOLIO BREAKER: equity={total:.2f} "
@@ -537,17 +801,131 @@ class LivePortfolioGrid(StrategyV2Base):
             previous_flatten = self.flatten_order_ids.pop(pair, None)
             if previous_flatten:
                 ledger.open_order_ids.discard(previous_flatten)
-            delta = ledger.inventory_delta()
-            if abs(delta) * prices[pair] < self.config.min_order_quote:
+            # A stop is quote-only: liquidate all strategy-owned base rather
+            # than returning to the startup inventory that can keep losing.
+            delta = max(ledger.base, Decimal("0"))
+            if delta * prices[pair] < self.config.min_order_quote:
                 completed.add(pair)
+                state = self.pair_recovery[pair]
+                if self.portfolio_recovery.get("phase") == EXITING:
+                    state = self.portfolio_recovery
+                completed_state = mark_exit_complete(
+                    state, now=self.current_timestamp,
+                    remaining_base={pair: delta},
+                    execution={
+                        "target": "quote_only", "order_id": previous_flatten or "dust",
+                        "attempts": int(state.get("exit_attempts", 0)),
+                        "last_fill": state.get("last_exit_fill", {}),
+                    },
+                )
+                if state is self.portfolio_recovery:
+                    if all(
+                        max(self.ledgers[item].base, Decimal("0")) * prices[item]
+                        < self.config.min_order_quote
+                        for item in self.config.trading_pairs
+                    ):
+                        self.portfolio_recovery = completed_state
+                else:
+                    self.pair_recovery[pair] = completed_state
                 continue
-            if delta > 0:
-                order_id = self.sell(self.config.exchange, pair, delta, OrderType.MARKET)
-            else:
-                order_id = self.buy(self.config.exchange, pair, abs(delta), OrderType.MARKET)
+            state = (
+                self.portfolio_recovery
+                if self.portfolio_recovery.get("phase") == EXITING
+                else self.pair_recovery[pair]
+            )
+            state["first_exit_order_at"] = state.get("first_exit_order_at") or self.current_timestamp
+            state["exit_attempts"] = int(state.get("exit_attempts", 0)) + 1
+            order_id = self.sell(self.config.exchange, pair, delta, OrderType.MARKET)
             ledger.open_order_ids.add(order_id)
             self.flatten_order_ids[pair] = order_id
         self.pending_flatten.difference_update(completed)
+
+    def _advance_risk_recovery(self, prices: Dict[str, Decimal], active_orders: list) -> bool:
+        """Advance recoverable breakers; return True while normal grids must stay blocked."""
+        active_owned = bool(self._owned_active_orders(active_orders))
+        gates_healthy = bool(
+            self.macro_gate_healthy
+            and all(self.technical_gate_healthy_by_pair.values())
+        )
+        any_blocked = False
+        for pair in self.config.trading_pairs:
+            state = self.pair_recovery[pair]
+            if state.get("phase") == ACTIVE:
+                continue
+            any_blocked = True
+            gates_allow = bool(
+                not self.macro_paused
+                and self.technical_buy_enabled_by_pair.get(pair, False)
+                and getattr(self.config, "risk_auto_reentry_enabled", False)
+            )
+            state = advance_recovery(
+                state, now=self.current_timestamp,
+                healthy=gates_healthy and not active_owned,
+                gates_allow_reentry=gates_allow,
+            )
+            self.pair_recovery[pair] = state
+            if state.get("reentry_allowed"):
+                if self._reenter_pair(pair, prices[pair]):
+                    self.pair_recovery[pair] = mark_reentry_complete(
+                        state, now=self.current_timestamp,
+                        baseline={"equity": self.ledgers[pair].equity(prices[pair])},
+                    )
+                    self.ledgers[pair].halted = False
+                    self.ledgers[pair].episode_equity_baseline = self.ledgers[pair].equity(prices[pair])
+        portfolio = self.portfolio_recovery
+        if portfolio.get("phase") != ACTIVE:
+            any_blocked = True
+            gates_allow = bool(
+                not self.macro_paused
+                and all(self.technical_buy_enabled_by_pair.values())
+                and getattr(self.config, "risk_auto_reentry_enabled", False)
+            )
+            portfolio = advance_recovery(
+                portfolio, now=self.current_timestamp,
+                healthy=gates_healthy and not active_owned,
+                gates_allow_reentry=gates_allow,
+            )
+            self.portfolio_recovery = portfolio
+            if portfolio.get("reentry_allowed"):
+                completed = all(self._reenter_pair(pair, prices[pair]) for pair in self.config.trading_pairs)
+                if completed:
+                    equity = self.config.reserve_quote + sum(
+                        ledger.equity(prices[pair]) for pair, ledger in self.ledgers.items()
+                    )
+                    self.portfolio_recovery = mark_reentry_complete(
+                        portfolio, now=self.current_timestamp, baseline={"equity": equity},
+                    )
+                    self.portfolio_tripped = False
+                    self.peak_equity = equity
+                    self.portfolio_episode_baseline = equity
+                    for pair, ledger in self.ledgers.items():
+                        ledger.halted = False
+                        ledger.peak_equity = ledger.equity(prices[pair])
+                        ledger.episode_equity_baseline = ledger.equity(prices[pair])
+                        self.pair_recovery[pair] = active_state()
+        return any_blocked
+
+    def _reenter_pair(self, pair: str, price: Decimal) -> bool:
+        ledger = self.ledgers[pair]
+        # Rebuild the configured quote-sized base inventory at the current
+        # market price. The actual fill becomes the new owned risk baseline;
+        # cumulative realised PnL is deliberately not reset.
+        target = self.config.side_budget_quote / price
+        missing = max(target - ledger.base, Decimal("0"))
+        if missing * price < self.config.min_order_quote:
+            ledger.peak_equity = ledger.equity(price)
+            return True
+        order_id = self.reentry_order_ids.get(pair)
+        if order_id and order_id in self._owned_order_ids():
+            return False
+        order_id = self.buy(self.config.exchange, pair, missing, OrderType.MARKET)
+        ledger.open_order_ids.add(order_id)
+        self.reentry_order_ids[pair] = order_id
+        self.buy_order_ids.add(order_id)
+        self._record_runtime_event(
+            "risk_reentry_market_buy", pair=pair, amount=str(missing), target_quote=str(self.config.side_budget_quote),
+        )
+        return False
 
     def cancel_owned_orders(self, exclude: set[str] | None = None):
         exclude = exclude or set()
@@ -555,8 +933,11 @@ class LivePortfolioGrid(StrategyV2Base):
             if order.client_order_id not in exclude:
                 self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
 
-    def cancel_owned_buy_orders(self) -> bool:
-        active = self._owned_active_orders()
+    def cancel_owned_buy_orders(self, pair: str | None = None) -> bool:
+        active = [
+            order for order in self._owned_active_orders()
+            if pair is None or order.trading_pair == pair
+        ]
         # Old runtime-state schemas did not persist order sides. Cancelling all
         # owned orders once is safer than leaving an unknown BUY live; SELL is
         # rebuilt immediately at the next refresh.
@@ -599,6 +980,9 @@ class LivePortfolioGrid(StrategyV2Base):
     def _forget_order(self, order_id: str) -> None:
         self.buy_order_ids.discard(order_id)
         self.sell_order_ids.discard(order_id)
+        for pair, value in list(self.inventory_exit_order_ids.items()):
+            if value == order_id:
+                self.inventory_exit_order_ids.pop(pair, None)
         for ledger in self.ledgers.values():
             ledger.open_order_ids.discard(order_id)
 
@@ -613,6 +997,30 @@ class LivePortfolioGrid(StrategyV2Base):
         except Exception:
             fee = event.price * event.amount * self.config.fee_rate
         ledger.apply_fill(event.trade_type.name, event.price, event.amount, fee)
+        flatten_pair = next(
+            (pair for pair, order_id in self.flatten_order_ids.items() if order_id == event.order_id),
+            None,
+        )
+        if flatten_pair is not None:
+            state = (
+                self.portfolio_recovery
+                if self.portfolio_recovery.get("phase") == EXITING
+                else self.pair_recovery[flatten_pair]
+            )
+            try:
+                signal_price = Decimal(str(state.get("signal_price", event.price)))
+            except Exception:
+                signal_price = event.price
+            slippage_bps = (
+                (signal_price - event.price) / signal_price * Decimal("10000")
+                if signal_price > 0 and event.trade_type == TradeType.SELL else Decimal("0")
+            )
+            state["last_exit_fill"] = {
+                "filled_at": self.current_timestamp, "price": str(event.price),
+                "amount": str(event.amount), "fee_quote": str(fee),
+                "slippage_bps": str(slippage_bps),
+                "signal_to_fill_seconds": self.current_timestamp - float(state.get("triggered_at") or self.current_timestamp),
+            }
         if event.trade_type == TradeType.BUY:
             base_asset = event.trading_pair.split("-")[0]
             ledger.base -= sum(
@@ -656,7 +1064,7 @@ class LivePortfolioGrid(StrategyV2Base):
         try:
             state = json.loads(target.read_text(encoding="utf-8"))
             schema_version = int(state.get("schema_version", -1))
-            if schema_version not in {2, 3, RUNTIME_STATE_SCHEMA_VERSION}:
+            if schema_version not in {2, 3, 4, 5, 6, 7, RUNTIME_STATE_SCHEMA_VERSION}:
                 raise ValueError("runtime state schema version mismatch")
             if tuple(state.get("trading_pairs", ())) != tuple(self.config.trading_pairs):
                 raise ValueError("runtime state trading pairs mismatch")
@@ -687,6 +1095,11 @@ class LivePortfolioGrid(StrategyV2Base):
             self.ledgers = restored
             self.grid_states = grid_states
             self.portfolio_tripped = bool(state.get("portfolio_tripped", False))
+            self.pair_recovery = {
+                pair: normalize_state(state.get("pair_recovery", {}).get(pair))
+                for pair in restored
+            }
+            self.portfolio_recovery = normalize_state(state.get("portfolio_recovery"))
             self.pending_flatten = {
                 pair for pair in state.get("pending_flatten", []) if pair in restored
             }
@@ -695,11 +1108,33 @@ class LivePortfolioGrid(StrategyV2Base):
                 for pair, order_id in state.get("flatten_order_ids", {}).items()
                 if pair in restored
             }
+            self.reentry_order_ids = {
+                pair: str(order_id)
+                for pair, order_id in state.get("reentry_order_ids", {}).items()
+                if pair in restored
+            }
+            self.pending_inventory_exit = {
+                pair for pair in state.get("pending_inventory_exit", []) if pair in restored
+            }
+            self.inventory_exit_order_ids = {
+                pair: str(order_id)
+                for pair, order_id in state.get("inventory_exit_order_ids", {}).items()
+                if pair in restored
+            }
+            saved_timers = state.get("excess_inventory_started_at", {})
+            self.excess_inventory_started_at = {
+                pair: (
+                    float(saved_timers[pair]) if saved_timers.get(pair) is not None else None
+                ) for pair in restored
+            }
             self.buy_order_ids = {str(value) for value in state.get("buy_order_ids", [])}
             self.sell_order_ids = {str(value) for value in state.get("sell_order_ids", [])}
             self.peak_equity = Decimal(
                 str(state.get("peak_equity", self.config.capital_limit_quote))
             )
+            self.portfolio_episode_baseline = Decimal(str(
+                state.get("portfolio_episode_baseline", self.config.capital_limit_quote)
+            ))
             self.active_parameter_version = str(
                 state.get("active_parameter_version", self.active_parameter_version)
             )
@@ -707,6 +1142,17 @@ class LivePortfolioGrid(StrategyV2Base):
                 value for value in state.get("runtime_events", [])
                 if isinstance(value, dict)
             ][-100:]
+            saved_gate = state.get("technical_buy_gate", {})
+            saved_pairs = saved_gate.get("pairs", {}) if isinstance(saved_gate, dict) else {}
+            if schema_version == RUNTIME_STATE_SCHEMA_VERSION and set(saved_pairs) == set(restored):
+                for pair in restored:
+                    raw = saved_pairs[pair]
+                    self.technical_buy_enabled_by_pair[pair] = bool(raw.get("buy_enabled", False))
+                    self.technical_gate_healthy_by_pair[pair] = bool(raw.get("healthy", False))
+                    self.technical_reason_by_pair[pair] = str(raw.get("reason", "restored_fail_closed"))
+                    self.technical_signal_by_pair[pair] = dict(raw.get("signal", {}))
+                self.technical_buy_enabled = all(self.technical_buy_enabled_by_pair.values())
+                self.technical_gate_healthy = all(self.technical_gate_healthy_by_pair.values())
             saved_parameters = state.get("active_parameters", {})
             if saved_parameters:
                 self.config.grid_range = Decimal(str(saved_parameters["grid_range"]))
@@ -723,12 +1169,28 @@ class LivePortfolioGrid(StrategyV2Base):
             "trading_pairs": list(self.config.trading_pairs),
             "updated_at": self.current_timestamp,
             "portfolio_tripped": self.portfolio_tripped,
+            "pair_recovery": self.pair_recovery,
+            "portfolio_recovery": self.portfolio_recovery,
             "pending_flatten": sorted(self.pending_flatten),
             "flatten_order_ids": self.flatten_order_ids,
+            "reentry_order_ids": self.reentry_order_ids,
+            "pending_inventory_exit": sorted(self.pending_inventory_exit),
+            "inventory_exit_order_ids": self.inventory_exit_order_ids,
+            "excess_inventory_started_at": self.excess_inventory_started_at,
             "buy_order_ids": sorted(self.buy_order_ids),
             "sell_order_ids": sorted(self.sell_order_ids),
             "peak_equity": str(self.peak_equity),
+            "portfolio_episode_baseline": str(self.portfolio_episode_baseline),
             "active_parameter_version": self.active_parameter_version,
+            "cost_floor_enabled": self.config.cost_floor_enabled,
+            "pair_breakers_enabled": self.config.pair_breakers_enabled,
+            "portfolio_breakers_enabled": self.config.portfolio_breakers_enabled,
+            "inventory_exit_enabled": self.config.inventory_exit_enabled,
+            "inventory_exit_policy": {
+                "max_extra_inventory_quote": str(self.config.max_extra_inventory_quote),
+                "profit_protection_seconds": self.config.profit_protection_seconds,
+                "max_hold_seconds": self.config.max_extra_inventory_hold_seconds,
+            },
             "runtime_events": self.runtime_events,
             "macro_gate": {
                 "enabled": self.config.macro_gate_enabled,
@@ -743,6 +1205,14 @@ class LivePortfolioGrid(StrategyV2Base):
                 "buy_enabled": self.technical_buy_enabled,
                 "reason": self.technical_reason,
                 "signal": self.technical_signal,
+                "pairs": {
+                    pair: {
+                        "healthy": self.technical_gate_healthy_by_pair[pair],
+                        "buy_enabled": self.technical_buy_enabled_by_pair[pair],
+                        "reason": self.technical_reason_by_pair[pair],
+                        "signal": self.technical_signal_by_pair[pair],
+                    } for pair in self.config.trading_pairs
+                },
             },
             "active_parameters": {
                 "grid_range": str(self.config.grid_range),

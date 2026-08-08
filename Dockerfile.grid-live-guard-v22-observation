@@ -1,0 +1,6 @@
+FROM hummingbot/grid-live-guard:local
+
+COPY live_guard/grid_live_guard_legacy.py /app/grid_live_guard_legacy.py
+COPY scripts/run_guard_with_v22_observation.py /app/run_guard_with_v22_observation.py
+
+CMD ["python", "/app/run_guard_with_v22_observation.py", "--role", "grid", "--guard", "/app/grid_live_guard_legacy.py"]

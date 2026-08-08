@@ -29,7 +29,10 @@ class JsonFileTelemetryProvider:
             observed_at=observed_at,
         )
         with self._lock:
-            self._cache[snapshot["snapshot_id"]] = snapshot
+            # A snapshot id identifies immutable source data.  Keep the first
+            # sanitized representation so generated-at jitter cannot rewrite
+            # an audit record that callers may already have referenced.
+            self._cache.setdefault(snapshot["snapshot_id"], snapshot)
             if len(self._cache) > 32:
                 for key in list(self._cache)[:-32]:
                     del self._cache[key]

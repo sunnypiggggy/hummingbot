@@ -1,0 +1,27 @@
+services:
+  grid-live-guard:
+    image: hummingbot/grid-live-guard:observe
+    build:
+      dockerfile: Dockerfile.grid-live-guard-v22-observation
+    environment:
+      GRID_V22_PACKAGE_PATH: /workspace/v22-package
+      GRID_V22_CANDLE_PATH: /workspace/technical-candles
+      GRID_V22_SEED_CANDLE_PATH: /workspace/research-candles
+    healthcheck:
+      test: ["CMD", "python", "-c", "import datetime,json,time; s=json.load(open('/workspace/state/guard_state.json')); o=json.load(open('/workspace/state/ethbtc_forced_exit_observer_status.json')); assert time.time()-s.get('last_success_at',0)<90; assert o.get('release_sha256') and time.time()-o.get('last_seen_at',0)<90; assert o.get('execution_authorized') is False"]
+    volumes:
+      - ./release_packages/ethbtc-forced-exit/current:/workspace/v22-package:ro
+      - ./results/ethbtc_forced_exit_weekly/candles:/workspace/research-candles:ro
+      - grid-live-guard-technical-candles:/workspace/technical-candles
+
+  dca-live-guard:
+    image: hummingbot/dca-live-guard:observe
+    build:
+      dockerfile: Dockerfile.dca-live-guard-v22-observation
+    environment:
+      DCA_V22_OBSERVATION_GATE_PATH: /workspace/technical/ethbtc_forced_exit_observation.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,time; s=json.load(open('/workspace/state/guard_state.json')); o=json.load(open('/workspace/state/ethbtc_forced_exit_observer_status.json')); assert time.time()-s.get('last_success_at',0)<90; assert o.get('release_sha256') and time.time()-o.get('last_seen_at',0)<90; assert o.get('execution_authorized') is False"]
+    volumes:
+      - ./grid-live-fdusd-data:/workspace/technical:ro
+

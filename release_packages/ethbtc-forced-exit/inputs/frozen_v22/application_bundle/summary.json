@@ -1,0 +1,35 @@
+{
+  "schema": "xgboost-v22-weekly-application-replay-v1",
+  "model_version": "xgboost-grid-long-risk-gate-v22-weekly-250d",
+  "model_sha256": "3a0eea362858830757db5bf3de3892b88923e5cbce52b5f3e72c8cdabbecc338",
+  "strategy_schema_sha256": "5de7c72a35911bbaad43fe342a068cb80a276c2b145ded8bfce79bd5eb1f29cb",
+  "probability_semantics": "weekly_walk_forward_model_with_fold_local_calibration_threshold",
+  "grid_metrics": {
+    "oos_pnl_fdusd": -4.10205176515791,
+    "positive_folds": 21,
+    "worst_fold_pnl": -24.891297770175015,
+    "worst_drawdown_pct": -6.182956079720342,
+    "pair_stop_events": 25,
+    "pair_stop_hours": 2357.75,
+    "portfolio_stop_events": 1,
+    "portfolio_stop_hours": 86.58333333333333,
+    "forced_exits": 7,
+    "trades": 2291,
+    "fees_fdusd": 0.295005412696928,
+    "btc_pnl_fdusd": 3.566830609864212,
+    "eth_pnl_fdusd": -7.668882375022065,
+    "stitched_max_drawdown_pct": -15.452621089548902,
+    "risk_off_pair_hours": 1777.9166666666667
+  },
+  "old_walk_forward_parity": {
+    "risk_state_mismatches": 0,
+    "transition_mismatches": 0,
+    "maximum_probability_absolute_error": 2.501754758910124e-08,
+    "maximum_threshold_absolute_delta": 3.725290395606429e-09
+  },
+  "weeks_per_pair": 36,
+  "deployment_allowed": false,
+  "promotion_authorized": false,
+  "historical_verdict": "NO-GO",
+  "plotly": "results/backtests/xgboost_grid_long_risk_gate_v22_weekly_250d/xgboost-grid-long-risk-gate-v22-weekly-250d_plotly.html"
+}

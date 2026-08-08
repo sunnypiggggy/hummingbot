@@ -28,13 +28,8 @@ from grid_live_common import (
     effective_take_profit,
 )
 from grid_macro_gate import build_grid_macro_gate
-from grid_technical_gate import (
-    COMBINED_RECOVERY_RULE_VERSION,
-    DEFAULT_ROC_RECOVERY_PCT,
-    DEFAULT_ROC_RISK_OFF_PCT,
-    DEFAULT_SQZMOM_RECOVERY_PCT,
-    DEFAULT_SQZMOM_RISK_OFF_PCT,
-)
+from ethbtc_forced_exit_contract import MODEL_VERSION as XGBOOST_MODEL_VERSION
+from ethbtc_forced_exit_contract import SCHEMA as XGBOOST_GATE_SCHEMA
 from validate_grid_live import INTERVAL_SECONDS, load_candles
 
 
@@ -198,7 +193,7 @@ class Scheduler:
     def ensure_fixed_selection(self) -> dict:
         selection = {
             "schema_version": ACTIVE_SELECTION_SCHEMA_VERSION,
-            "parameter_version": "fixed-grid-6pct-roc5-sqz1-recovery-roc1-sqz3-v2",
+            "parameter_version": "fixed-grid-6pct-ethbtc-forced-exit-v22",
             "generated_at": "2026-07-28T00:00:00+00:00",
             "valid_from": 0,
             "training_window": {
@@ -217,16 +212,12 @@ class Scheduler:
                 "min_grid_move_seconds": 1800,
             },
             "technical_buy_gate": {
-                "risk_off": {
-                    "roc_pct": DEFAULT_ROC_RISK_OFF_PCT,
-                    "sqzmom_pct": DEFAULT_SQZMOM_RISK_OFF_PCT,
-                },
-                "recovery": {
-                    "roc_pct": DEFAULT_ROC_RECOVERY_PCT,
-                    "sqzmom_pct": DEFAULT_SQZMOM_RECOVERY_PCT,
-                    "requires_sqzmom_improving": True,
-                },
-                "rule_version": COMBINED_RECOVERY_RULE_VERSION,
+                "schema": XGBOOST_GATE_SCHEMA,
+                "model_version": XGBOOST_MODEL_VERSION,
+                "execution_policy_version": "v22-risk-off-forced-exit-v2",
+                "combination": "long_only_per_pair",
+                "short_spike_enabled": False,
+                "mechanism1_runtime_fallback": False,
             },
         }
         current = self.read_json(self.canonical_selection, None)
@@ -277,7 +268,7 @@ class Scheduler:
         shutil.copy2("/app/walk_forward_portfolio_grid_live.py", scripts / "walk_forward_portfolio_grid_live.py")
         shutil.copy2("/app/grid_live_common.py", scripts / "grid_live_common.py")
         shutil.copy2("/app/grid_macro_gate.py", scripts / "grid_macro_gate.py")
-        shutil.copy2("/app/grid_technical_gate.py", scripts / "grid_technical_gate.py")
+        shutil.copy2("/app/grid_xgboost_risk_gate.py", scripts / "grid_xgboost_risk_gate.py")
 
     def publish_macro_gate(self) -> int:
         macro_state = self.read_json(self.macro_source, None)

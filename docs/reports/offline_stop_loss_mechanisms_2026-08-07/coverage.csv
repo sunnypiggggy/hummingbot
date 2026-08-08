@@ -1,0 +1,8 @@
+code,mechanism,implemented_strategies,total_strategies,status
+V22,v22 Risk-Off,2,2,Grid+DCA 已执行
+POS,持仓保护,1,2,仅 DCA 执行器止损
+FOMC,FOMC,0,2,无可信数据
+S-L,单策略绝对亏损,0,2,未接线
+S-DD,单策略峰值回撤,0,2,未接线
+P-L,组合绝对亏损,0,2,未接线
+P-DD,组合峰值回撤,0,2,未接线

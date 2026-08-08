@@ -56,11 +56,12 @@ class GridMacroSchedulerTest(unittest.TestCase):
                 (state_root / "active_selection.json").read_text(encoding="utf-8")
             )
             self.assertEqual(
-                "fixed-grid-6pct-roc5-sqz1-recovery-roc1-sqz3-v2",
+                "fixed-grid-6pct-xgboost-long-risk-gate-v21",
                 selection["parameter_version"],
             )
-            self.assertEqual(1.0, selection["technical_buy_gate"]["recovery"]["roc_pct"])
-            self.assertEqual(-3.0, selection["technical_buy_gate"]["recovery"]["sqzmom_pct"])
+            self.assertEqual("grid-xgboost-long-risk-gate-v1", selection["technical_buy_gate"]["schema"])
+            self.assertFalse(selection["technical_buy_gate"]["short_spike_enabled"])
+            self.assertFalse(selection["technical_buy_gate"]["mechanism1_runtime_fallback"])
             self.assertEqual(0.03, selection["parameters"]["half_range"])
             self.assertEqual(10, selection["parameters"]["levels"])
 

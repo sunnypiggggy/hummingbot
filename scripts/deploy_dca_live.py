@@ -246,6 +246,23 @@ def main() -> int:
     state_dir = Path(args.state_path)
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "latest_preflight.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    ownership_path = state_dir / "managed_inventory.json"
+    ownership = (
+        json.loads(ownership_path.read_text(encoding="utf-8"))
+        if ownership_path.exists() else {"schema_version": 1, "account": ACCOUNT_NAME, "pairs": {}}
+    )
+    if ownership.get("account") != ACCOUNT_NAME:
+        raise RuntimeError("managed inventory account mismatch")
+    for pair in pairs:
+        asset = LIVE_PAIRS[pair].base_asset
+        ownership["pairs"][pair] = {
+            "base_asset": asset,
+            "managed_base": report["requirements"][asset],
+            "verified_at": report["checked_at"],
+        }
+    temporary = ownership_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(ownership, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(ownership_path)
     LOG.info("Live preflight passed: %s", json.dumps(report, ensure_ascii=False))
     if not args.arm:
         LOG.info("Dry-run complete. No live bot was deployed.")

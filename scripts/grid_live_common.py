@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+import os
+from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
 
 CONNECTOR = "binance"
+
+
+def _risk_enabled(name: str) -> bool:
+    return os.getenv(name, "true").lower() == "true"
 
 
 @dataclass(frozen=True)
@@ -114,12 +120,14 @@ class PairLedger:
     initial_base: Decimal
     quote: Decimal
     base: Decimal
+    base_cost_quote: Decimal
     fees_quote: Decimal = Decimal("0")
     buys: int = 0
     sells: int = 0
     halted: bool = False
     open_order_ids: set[str] = field(default_factory=set)
     peak_equity: Decimal = Decimal("0")
+    episode_equity_baseline: Decimal = Decimal("0")
 
     @classmethod
     def create(cls, trading_pair: str, initial_base: Decimal) -> "PairLedger":
@@ -131,17 +139,31 @@ class PairLedger:
             initial_base,
             side_budget,
             initial_base,
+            side_budget,
             peak_equity=pair_budget,
+            episode_equity_baseline=pair_budget,
         )
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "PairLedger":
+        initial_quote = Decimal(str(payload["initial_quote"]))
+        initial_base = Decimal(str(payload["initial_base"]))
+        base = Decimal(str(payload["base"]))
+        # Schema <= 4 did not persist inventory cost. Preserve compatibility by
+        # valuing the restored inventory at the bootstrap unit cost. New fills
+        # then maintain the exact moving-average cost from this migration point.
+        migrated_cost = (
+            initial_quote / initial_base * max(base, Decimal("0"))
+            if initial_base > 0
+            else Decimal("0")
+        )
         return cls(
             trading_pair=str(payload["trading_pair"]),
-            initial_quote=Decimal(str(payload["initial_quote"])),
-            initial_base=Decimal(str(payload["initial_base"])),
+            initial_quote=initial_quote,
+            initial_base=initial_base,
             quote=Decimal(str(payload["quote"])),
-            base=Decimal(str(payload["base"])),
+            base=base,
+            base_cost_quote=Decimal(str(payload.get("base_cost_quote", migrated_cost))),
             fees_quote=Decimal(str(payload.get("fees_quote", "0"))),
             buys=int(payload.get("buys", 0)),
             sells=int(payload.get("sells", 0)),
@@ -150,6 +172,10 @@ class PairLedger:
             peak_equity=Decimal(
                 str(payload.get("peak_equity", budget_for_pair(str(payload["trading_pair"])).pair_budget))
             ),
+            episode_equity_baseline=Decimal(str(payload.get(
+                "episode_equity_baseline",
+                budget_for_pair(str(payload["trading_pair"])).pair_budget,
+            ))),
         )
 
     def equity(self, price: Decimal) -> Decimal:
@@ -163,8 +189,12 @@ class PairLedger:
         if side.upper() == "BUY":
             self.quote -= notional + fee_quote
             self.base += amount
+            self.base_cost_quote += notional + fee_quote
             self.buys += 1
         elif side.upper() == "SELL":
+            if self.base > 0:
+                remaining = max(self.base - amount, Decimal("0"))
+                self.base_cost_quote *= remaining / self.base
             self.quote += notional - fee_quote
             self.base -= amount
             self.sells += 1
@@ -174,6 +204,16 @@ class PairLedger:
 
     def inventory_delta(self) -> Decimal:
         return self.base - self.initial_base
+
+    def average_base_cost(self) -> Decimal:
+        if self.base <= 0:
+            return Decimal("0")
+        return max(self.base_cost_quote, Decimal("0")) / self.base
+
+    def minimum_profitable_sell_price(self, minimum_profit_rate: Decimal) -> Decimal:
+        if minimum_profit_rate < 0:
+            raise ValueError("minimum_profit_rate must be non-negative")
+        return self.average_base_cost() * (Decimal("1") + minimum_profit_rate)
 
 
 def effective_take_profit(maker_rate: Decimal, configured: Decimal = Decimal("0.008")) -> Decimal:
@@ -301,6 +341,17 @@ def build_live_config(portfolio: GridPortfolio, prices: Mapping[str, Decimal], m
         "move_threshold": 0.02,
         "min_grid_move_seconds": 1800,
         "order_refresh_time": ORDER_REFRESH_SECONDS,
+        "pair_breakers_enabled": True,
+        "pair_loss_breaker_enabled": _risk_enabled("GRID_RISK_STRATEGY_LOSS_BREAKER_ENABLED"),
+        "pair_drawdown_breaker_enabled": _risk_enabled("GRID_RISK_STRATEGY_DRAWDOWN_BREAKER_ENABLED"),
+        "portfolio_breakers_enabled": True,
+        "portfolio_loss_breaker_enabled": _risk_enabled("GRID_RISK_PORTFOLIO_LOSS_BREAKER_ENABLED"),
+        "portfolio_drawdown_breaker_enabled": _risk_enabled("GRID_RISK_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED"),
+        "cost_floor_enabled": _risk_enabled("GRID_RISK_POSITION_PROTECTION_ENABLED"),
+        "inventory_exit_enabled": _risk_enabled("GRID_RISK_POSITION_PROTECTION_ENABLED"),
+        "max_extra_inventory_quote": 10,
+        "profit_protection_seconds": 86400,
+        "max_extra_inventory_hold_seconds": 172800,
         "risk_state_persist_seconds": RISK_STATE_PERSIST_SECONDS,
         "portfolio_stop_loss_quote": float(budget.portfolio_loss_limit),
         "pair_stop_loss_quote": float(budget.pair_loss_limit),
@@ -316,16 +367,18 @@ def build_live_config(portfolio: GridPortfolio, prices: Mapping[str, Decimal], m
         "runtime_state_file": "data/live_grid_runtime_state.json",
         "parameter_poll_seconds": 60,
         "active_parameter_version": "bootstrap-static-v1",
-        "macro_gate_enabled": portfolio.quote_asset == "FDUSD",
+        "macro_gate_enabled": portfolio.quote_asset == "FDUSD" and _risk_enabled("GRID_RISK_FOMC_GATE_ENABLED"),
         "macro_gate_file": "data/macro_gate.json",
         "macro_gate_poll_seconds": 5,
         "macro_gate_max_age_seconds": 150,
         "macro_fail_closed": True,
-        "technical_buy_gate_enabled": portfolio.quote_asset == "FDUSD",
-        "technical_buy_gate_file": "data/technical_buy_gate.json",
+        "technical_buy_gate_enabled": portfolio.quote_asset == "FDUSD" and _risk_enabled("GRID_RISK_V22_WEEKLY_GATE_ENABLED"),
+        "technical_buy_gate_file": "data/xgboost_risk_gate.json",
         "technical_buy_gate_poll_seconds": 5,
         "technical_buy_gate_max_age_seconds": 150,
         "technical_buy_fail_closed": True,
+        "technical_model_sha256": "",
+        "technical_feature_sha256": "",
     }
 
 
@@ -358,6 +411,13 @@ def validate_live_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Pair peak drawdown limit must be exactly 3%.")
     if int(config.get("order_refresh_time", 0)) != ORDER_REFRESH_SECONDS:
         raise ValueError("Live Grid order refresh time must be exactly 2 hours.")
+    if bool(config.get("inventory_exit_enabled", True)):
+        if Decimal(str(config.get("max_extra_inventory_quote"))) != Decimal("10"):
+            raise ValueError("Live Grid extra inventory cap must be exactly 10 quote units.")
+        if int(config.get("profit_protection_seconds", 0)) != 86400:
+            raise ValueError("Live Grid profit protection must last exactly 24 hours.")
+        if int(config.get("max_extra_inventory_hold_seconds", 0)) != 172800:
+            raise ValueError("Live Grid extra inventory must Taker-exit after exactly 48 hours.")
     if int(config.get("risk_state_persist_seconds", 0)) != RISK_STATE_PERSIST_SECONDS:
         raise ValueError("Live Grid risk state must be persisted every 5 seconds.")
     reservations = config.get("reserved_base_by_pair", {})
@@ -369,18 +429,27 @@ def validate_live_config(config: Mapping[str, Any]) -> None:
         if not bool(config.get("bootstrap_completed")):
             raise ValueError("Quote-only bootstrap must complete before live trading is enabled.")
     if quote == "FDUSD":
-        if not bool(config.get("macro_gate_enabled")):
-            raise ValueError("FDUSD live Grid requires the FOMC macro gate.")
-        if not bool(config.get("macro_fail_closed")):
+        if bool(config.get("macro_gate_enabled")) and not bool(config.get("macro_fail_closed")):
             raise ValueError("FDUSD FOMC macro gate must fail closed.")
         if not 30 <= int(config.get("macro_gate_max_age_seconds", 0)) <= 180:
             raise ValueError("FDUSD FOMC macro gate freshness must be between 30 and 180 seconds.")
         if not 1 <= int(config.get("macro_gate_poll_seconds", 0)) <= 30:
             raise ValueError("FDUSD FOMC macro gate polling must be between 1 and 30 seconds.")
-        if not bool(config.get("technical_buy_gate_enabled")):
-            raise ValueError("FDUSD live Grid requires the ROC/SQZMOM BUY gate.")
-        if not bool(config.get("technical_buy_fail_closed")):
-            raise ValueError("FDUSD ROC/SQZMOM BUY gate must fail closed.")
+        if bool(config.get("technical_buy_gate_enabled")) and Path(str(config.get("technical_buy_gate_file", ""))).name != "xgboost_risk_gate.json":
+            raise ValueError("FDUSD live Grid does not permit a Mechanism 1 technical-gate file.")
+        if bool(config.get("trading_enabled")) and bool(config.get("technical_buy_gate_enabled")):
+            hashes = (
+                str(config.get("technical_model_sha256", "")),
+                str(config.get("technical_feature_sha256", "")),
+            )
+            if any(
+                len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value.lower())
+                for value in hashes
+            ):
+                raise ValueError("Enabled FDUSD Grid requires locked XGBoost model and feature hashes.")
+        if bool(config.get("technical_buy_gate_enabled")) and not bool(config.get("technical_buy_fail_closed")):
+            raise ValueError("FDUSD XGBoost BUY gate must fail closed.")
         if not 30 <= int(config.get("technical_buy_gate_max_age_seconds", 0)) <= 180:
             raise ValueError("FDUSD technical BUY gate freshness must be between 30 and 180 seconds.")
         if not 1 <= int(config.get("technical_buy_gate_poll_seconds", 0)) <= 30:

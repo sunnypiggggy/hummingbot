@@ -53,6 +53,13 @@ def main() -> int:
             "tripped": False,
             "action_complete": False,
             "started_at": now,
+            "recovery": {
+                "phase": "ACTIVE", "mechanism": "", "scope": "",
+                "triggered_at": None, "exit_target": "quote_only",
+                "remaining_base": {}, "exit_completed_at": None,
+                "cooldown_until": None, "healthy_cycles": 0,
+                "reentry": {}, "episode_baseline": {},
+            },
         })
         for key in (
             "trip_reason", "tripped_at", "last_action_error",

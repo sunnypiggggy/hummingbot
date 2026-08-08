@@ -13,6 +13,9 @@ services:
       DCA_MACRO_BIND_PORT: "8791"
       DCA_MACRO_ALLOW_CONTAINER_BIND: "true"
       DCA_MACRO_STATE_DIR: /workspace/state
+      # The gateway owns approvals and publishes desired gates. The existing
+      # dca-live-guard is the sole controller-gate writer.
+      DCA_MACRO_EXECUTION_ENABLED: "false"
       DCA_MACRO_TELEMETRY_INPUT: /workspace/telemetry/dca_macro_telemetry.json
       DCA_MACRO_TRADING_REPORT_INPUT: /workspace/telemetry/dca_trade_report_v3.json
       DCA_MACRO_TRADING_CHART_INPUT: /workspace/telemetry/dca_trade_chart_7d.png

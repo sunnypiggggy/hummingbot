@@ -1,0 +1,78 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "title": "当前离线止损与退出机制审计",
+    "blocks": [
+      {"id":"title","type":"markdown","body":"# 当前离线止损与退出机制审计"},
+      {"id":"technical_summary","type":"markdown","body":"## 技术摘要\n\n- **当前 forced-exit-v2 不是七类机制组合回放。** 实际贯穿 Grid 与 DCA 连续权益的是 v22 Risk-Off 强制退出；生成记录包含 Grid 15 次、DCA 13 次技术退出。\n- **DCA 另有执行器级退出。** 5% 止损属于真正的持仓止损；2% 止盈、5 小时时间退出和空执行器刷新属于交易生命周期，不应与风险熔断混为一谈。\n- **四类亏损/回撤熔断目前只有阈值、旧回放或统一恢复接口，尚未接入 forced-exit-v2 权益。** Grid 库存保护也未进入该回放。Plotly 中存在开关不代表机制已经参与权益计算。\n- **FOMC 没有可信历史事件。** 当前离线报告不推测窗口，也不将其计入结果。v21、ROC 与 SQZMOM 不作为 v22 的回退门。"},
+      {"id":"coverage_visual_note","type":"markdown","body":"## 当前回放覆盖集中在 v22\n\n下图统计每项统一机制在 forced-exit-v2 中实际参与权益计算的策略数，分母是 Grid 与 DCA 两种策略。v22 覆盖两种策略；持仓保护只有 DCA 的执行器级 5% 止损参与，其他机制为 0。这里衡量的是接线覆盖，不是机制优劣或触发频率。"},
+      {"id":"coverage_chart_block","type":"chart","chartId":"coverage_chart"},
+      {"id":"coverage_heading","type":"markdown","body":"## 七类统一风控的实际覆盖状态\n\n下表按当前代码而不是目标设计描述。‘未接线’表示相关阈值或模块确实存在，但当前 forced-exit-v2 权益线没有消费其状态，因此不能从该权益线评价机制效果。"},
+      {"id":"mechanism_table_block","type":"table","tableId":"mechanism_table"},
+      {"id":"exit_heading","type":"markdown","body":"## 哪些是止损，哪些只是正常退出\n\n判断标准是：是否因为风险越界而被动降低敞口。止盈、到期退出、空订单刷新和样本结束结算都会产生 SELL 或关闭记录，但它们不是止损。这个区分决定了 Plotly 阴影、事件统计和恢复状态是否应该出现。"},
+      {"id":"exit_table_block","type":"table","tableId":"exit_table"},
+      {"id":"execution_semantics","type":"markdown","body":"## 强制退出的共同执行语义\n\n风险退出的目标状态机是 `ACTIVE → EXITING → COOLDOWN → REENTRY → ACTIVE`。触发后先禁止新单和取消挂单，再按机器人资金边界清空基础币；数量按交易所步长向下取整，低于最小成交额的残余记为 dust。\n\n恢复冷却按作用域区分：技术门 0 分钟、持仓保护 30 分钟、单策略熔断 6 小时、组合熔断 12 小时。冷却结束并不等于立即恢复；还必须连续 3 个健康周期，且 v22、FOMC 和其他仍启用的门全部允许。基础设施、哈希、合同过期和授权故障进入 `LATCHED`，不自动恢复。\n\n**当前实现差异：** 这套恢复状态接口已经支持上述作用域，但 forced-exit-v2 只把 technical/v22 路径真正串入连续回放。DCA 5% 止损在回放中只关闭对应执行器，没有同时驱动统一的 30 分钟机器人恢复状态。"},
+      {"id":"grid_details","type":"markdown","body":"## Grid：三种不同层次不能混用\n\n1. **v22 技术退出**卖出策略账本内全部基础币，目标是纯 FDUSD；它已在 forced-exit-v2 执行。\n2. **额外库存保护**只处理高于启动库存的部分：额外库存名义上限 10 FDUSD，前 24 小时维持利润底线，48 小时后以 Taker 方式退出额外库存。它并不会清空启动库存。\n3. **旧 pair/portfolio breaker**把库存恢复到启动基准，或者直接停止回放。由于仍保留启动基础币，它不能解决 Risk-Off 后权益继续随币价下跌的问题，也不能当作新版纯现金退出的验证证据。\n\nGrid 的离线阈值为单对亏损 6 FDUSD、单对回撤 3%、组合亏损 24 FDUSD、组合回撤 6%。这些阈值目前没有进入 forced-exit-v2 的最终权益路径。"},
+      {"id":"dca_details","type":"markdown","body":"## DCA：执行器止损与机器人熔断是两个层级\n\nDCA 单执行器按净收益率判断：亏损达到 5% 时 `STOP_LOSS`，盈利超过 2% 时 `TAKE_PROFIT`，首次成交 5 小时后 `TIME_LIMIT`。forced-exit-v2 的 DCA 权益包含这些执行器结果。\n\n机器人级阈值另行计算：单机器人绝对亏损 16 USDT、峰值回撤 8%；BTC+ETH 组合绝对亏损 32 USDT、组合回撤 8%。旧离线审计能够找到首次触发点并形成持续 cutoff，但没有实现 6/12 小时自动恢复。新版 forced-exit-v2 则尚未消费这些 cutoff。\n\n因此当前 DCA 曲线可用于评价“v22 强制退出 + 执行器止损/止盈/时间退出”，不能用于评价七类风控全部组合后的结果。"},
+      {"id":"methodology","type":"markdown","body":"## 审计范围与方法\n\n本报告审计 2026-08-07 当前工作区的离线代码和最新 `v22_grid_dca_forced_exit_v2` 产物，不判断 OCI 实际状态。方法包括：静态核对触发谓词、资金边界和冷却常量；核对回放调用链是否真正消费机制状态；按执行动作文件统计 v22 退出；按风险区间文件检查 Plotly 阴影来源。\n\n当前风险区间文件只包含 `v22_weekly_buy_gate`：Grid 15 个 EXITING、15 个 COOLDOWN、15 个 REENTRY；DCA 15 个 EXITING、15 个 COOLDOWN、13 个 REENTRY。DCA 少两个重入是因为其可用 USDT 数据窗口短于 Grid 签名窗口。"},
+      {"id":"limitations","type":"markdown","body":"## 关键限制与稳健性检查\n\n- Plotly 复选框只是显示控制；没有对应 `risk_intervals` 事件时，不能证明机制运行。\n- forced-exit-v2 没有保存 DCA 每一笔 executor close 明细到最终执行审计，因此可以确认引擎调用了 5% 止损逻辑，但当前产物不足以逐笔复核所有止损成交。\n- Grid 旧熔断模拟使用“恢复启动库存”口径，与纯现金强制退出不同，两个结果不能直接横向归因。\n- FOMC 缺少可信历史事件；任何 FOMC 阴影都会是推测，当前正确处理是无数据。\n- 本报告不把 v22 历史收益视为上线授权；当前仍为 NO-GO、offline_only=true、deployment_allowed=false。"},
+      {"id":"next_steps","type":"markdown","body":"## 建议的下一步\n\n1. 将四类亏损/回撤熔断接入同一个连续离线执行器，而不是从曲线事后截断。\n2. 让 DCA 5% STOP_LOSS 触发统一 `position` 恢复状态，并验证 30 分钟冷却和机器人库存边界。\n3. 将 Grid 额外库存保护作为独立执行层接入 forced-exit-v2，同时保持它与“全量纯现金退出”的语义区别。\n4. 在每次报告中输出 `mechanism_coverage`：明确 `executed`、`no_event`、`not_wired`、`no_data`，Plotly 只为 executed/no_event 机制提供可验证状态。\n5. 保存 DCA executor 逐笔关闭审计，补充触发价、成交价、手续费、滑点和止损后追加亏损。"},
+      {"id":"questions","type":"markdown","body":"## 仍需决策的问题\n\n- DCA 单执行器 5% 止损后，是只重建该执行器，还是把机器人全部管理库存清空并进入 30 分钟冷却？当前目标设计偏向后者，但离线回放仍是前者。\n- Grid 48 小时额外库存退出是否继续保留，还是在 v22 Risk-Off 环境下完全由全量清仓覆盖？两者可以共存，但必须明确优先级。\n- 组合熔断恢复时是否严格要求 BTC、ETH 同一根 5 分钟 K 原子重建，还是允许下单失败后保持部分现金并继续 REENTRY？"}
+    ],
+    "charts": [
+      {"id":"coverage_chart","title":"forced-exit-v2 机制接线覆盖","subtitle":"每项机制实际参与权益计算的策略数，0–2；缩写释义见下方机制矩阵","type":"bar","dataset":"coverage","sourceId":"coverage","valueFormat":"number","encodings":{"x":{"field":"code","type":"nominal","label":"机制缩写"},"y":{"field":"implemented_strategies","type":"quantitative","label":"已接线策略数"},"tooltip":[{"field":"mechanism","type":"nominal","label":"机制"},{"field":"status","type":"nominal","label":"状态"},{"field":"total_strategies","type":"quantitative","label":"策略总数"}]}}
+    ],
+    "tables": [
+      {"id":"mechanism_table","title":"七类风控机制矩阵","subtitle":"forced-exit-v2 实际接线状态；作用域、阈值、执行和恢复语义见相邻说明与数据源","dataset":"mechanisms","sourceId":"mechanism_inventory","density":"dense","defaultSort":{"field":"mechanism","direction":"asc"},"columns":[{"field":"mechanism","label":"机制"},{"field":"current_forced_exit_v2_status","label":"当前覆盖"}]},
+      {"id":"exit_table","title":"退出动作分类","subtitle":"区分风险止损、技术退出和普通交易生命周期动作；完整触发与行为保留在数据源","dataset":"exits","sourceId":"exit_classification","density":"dense","defaultSort":{"field":"exit_type","direction":"asc"},"columns":[{"field":"exit_type","label":"事件"},{"field":"category","label":"类别"}]}
+    ],
+    "sources": [
+      {"id":"mechanism_inventory","label":"离线机制审计矩阵","path":"mechanism_inventory.csv"},
+      {"id":"exit_classification","label":"退出事件分类","path":"exit_classification.csv"},
+      {"id":"coverage","label":"forced-exit-v2 机制覆盖统计","path":"coverage.csv"}
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-07T00:00:00Z",
+    "status": "ready",
+    "datasets": {
+      "mechanisms": [
+        {"mechanism":"v22_weekly_buy_gate","scope":"单交易对","Grid_trigger":"冻结 v22 周模型进入 Risk-Off","DCA_trigger":"FDUSD 信号映射对应 USDT 机器人","execution_action":"下一根 5 分钟 K 取消订单并清空机器人基础币","recovery":"模型恢复 + 其他门放行 + 3 个健康周期；0 固定冷却","current_forced_exit_v2_status":"已执行：Grid 15 次；DCA 13 次"},
+        {"mechanism":"fomc_gate","scope":"方向门","Grid_trigger":"审批窗口","DCA_trigger":"审批窗口","execution_action":"限制 BUY、SELL 或双侧","recovery":"租约结束","current_forced_exit_v2_status":"无可信数据；未执行"},
+        {"mechanism":"strategy_loss_breaker","scope":"单策略","Grid_trigger":"-6 FDUSD","DCA_trigger":"-16 USDT","execution_action":"取消订单并清空该机器人","recovery":"6 小时 + 3 个健康周期","current_forced_exit_v2_status":"阈值存在；未接线"},
+        {"mechanism":"strategy_drawdown_breaker","scope":"单策略","Grid_trigger":"回撤 3%","DCA_trigger":"回撤 8%","execution_action":"取消订单并清空该机器人","recovery":"6 小时 + 3 个健康周期","current_forced_exit_v2_status":"阈值存在；未接线"},
+        {"mechanism":"portfolio_loss_breaker","scope":"组合","Grid_trigger":"-24 FDUSD","DCA_trigger":"-32 USDT","execution_action":"同时清空 BTC/ETH","recovery":"12 小时 + 原子重建 + 3 个健康周期","current_forced_exit_v2_status":"阈值存在；未接线"},
+        {"mechanism":"portfolio_drawdown_breaker","scope":"组合","Grid_trigger":"回撤 6%","DCA_trigger":"回撤 8%","execution_action":"同时清空 BTC/ETH","recovery":"12 小时 + 原子重建 + 3 个健康周期","current_forced_exit_v2_status":"阈值存在；未接线"},
+        {"mechanism":"position_protection","scope":"单持仓/额外库存","Grid_trigger":"10 FDUSD 上限；24h 利润保护；48h 退出","DCA_trigger":"执行器净亏损 5%","execution_action":"Grid 退出额外库存；DCA 关闭执行器","recovery":"目标：30 分钟 + 3 个健康周期","current_forced_exit_v2_status":"DCA 止损生效；Grid 库存保护未接线"}
+      ],
+      "coverage": [
+        {"code":"V22","mechanism":"v22 Risk-Off","implemented_strategies":2,"total_strategies":2,"status":"Grid+DCA 已执行"},
+        {"code":"POS","mechanism":"持仓保护","implemented_strategies":1,"total_strategies":2,"status":"仅 DCA 执行器止损"},
+        {"code":"FOMC","mechanism":"FOMC","implemented_strategies":0,"total_strategies":2,"status":"无可信数据"},
+        {"code":"S-L","mechanism":"单策略绝对亏损","implemented_strategies":0,"total_strategies":2,"status":"未接线"},
+        {"code":"S-DD","mechanism":"单策略峰值回撤","implemented_strategies":0,"total_strategies":2,"status":"未接线"},
+        {"code":"P-L","mechanism":"组合绝对亏损","implemented_strategies":0,"total_strategies":2,"status":"未接线"},
+        {"code":"P-DD","mechanism":"组合峰值回撤","implemented_strategies":0,"total_strategies":2,"status":"未接线"}
+      ],
+      "exits": [
+        {"exit_type":"STOP_LOSS","strategy":"DCA","trigger":"净收益率 <= -5%","category":"持仓止损","is_stop_loss":"是","current_offline_behavior":"关闭对应执行器"},
+        {"exit_type":"RISK_FLATTEN","strategy":"DCA","trigger":"技术门转为禁止","category":"技术强制退出","is_stop_loss":"是","current_offline_behavior":"按不利滑点关闭受控执行器"},
+        {"exit_type":"TAKE_PROFIT","strategy":"DCA","trigger":"净收益率 > 2%","category":"止盈","is_stop_loss":"否","current_offline_behavior":"正常获利退出"},
+        {"exit_type":"TIME_LIMIT","strategy":"DCA","trigger":"首次成交后 5 小时","category":"时间退出","is_stop_loss":"否","current_offline_behavior":"正常生命周期退出"},
+        {"exit_type":"REFRESH","strategy":"DCA","trigger":"空执行器 5 小时","category":"订单刷新","is_stop_loss":"否","current_offline_behavior":"更换报价"},
+        {"exit_type":"max_hold_exit","strategy":"Grid","trigger":"额外库存 48 小时","category":"库存风险退出","is_stop_loss":"是","current_offline_behavior":"只卖额外库存；forced-exit-v2 未复现"},
+        {"exit_type":"cost_floor","strategy":"Grid","trigger":"SELL 低于成本利润底线","category":"成交约束","is_stop_loss":"否","current_offline_behavior":"抬高 SELL 报价"},
+        {"exit_type":"pair_breaker_flatten","strategy":"Grid","trigger":"单对亏损/回撤越界","category":"单策略熔断","is_stop_loss":"是","current_offline_behavior":"旧模拟器恢复启动库存，不是纯现金"},
+        {"exit_type":"portfolio_breaker","strategy":"Grid","trigger":"组合亏损/回撤越界","category":"组合熔断","is_stop_loss":"是","current_offline_behavior":"旧模拟器默认停止回放"},
+        {"exit_type":"END_OF_BACKTEST","strategy":"DCA","trigger":"样本结束","category":"记账收尾","is_stop_loss":"否","current_offline_behavior":"回测结算"}
+      ]
+    }
+  },
+  "sources": [
+    {"id":"mechanism_inventory","label":"离线机制审计矩阵","path":"mechanism_inventory.csv","query":{"engine":"duckdb","language":"sql","sql":"SELECT * FROM read_csv_auto('mechanism_inventory.csv', header=true)","description":"读取经代码审计确认的七类机制矩阵。","tables_used":["mechanism_inventory.csv"]}},
+    {"id":"exit_classification","label":"退出事件分类","path":"exit_classification.csv","query":{"engine":"duckdb","language":"sql","sql":"SELECT * FROM read_csv_auto('exit_classification.csv', header=true)","description":"读取经代码审计确认的退出动作分类。","tables_used":["exit_classification.csv"]}},
+    {"id":"coverage","label":"forced-exit-v2 机制覆盖统计","path":"coverage.csv","query":{"engine":"duckdb","language":"sql","sql":"SELECT * FROM read_csv_auto('coverage.csv', header=true)","description":"读取 forced-exit-v2 的 Grid/DCA 机制接线覆盖。","tables_used":["coverage.csv"]}}
+  ]
+}

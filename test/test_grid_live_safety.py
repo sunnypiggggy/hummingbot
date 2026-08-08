@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
 
@@ -34,7 +35,12 @@ from grid_live_common import (  # noqa: E402
     validate_active_selection,
     validate_live_config,
 )
-from validate_grid_live import Candidate, simulate  # noqa: E402
+from validate_grid_live import (  # noqa: E402
+    Candidate,
+    InventoryExitPolicy,
+    inventory_profit_floor_rate,
+    simulate,
+)
 from fdusd_live_grid_optimizer import (  # noqa: E402
     rolling_validation_windows,
     weekly_cutoff,
@@ -91,6 +97,9 @@ class GridLiveSafetyTest(unittest.TestCase):
             self.assertEqual(Decimal(str(config["portfolio_drawdown_limit_pct"])), Decimal("0.06"))
             self.assertEqual(config["order_refresh_time"], 7200)
             self.assertEqual(config["risk_state_persist_seconds"], 5)
+            self.assertEqual(config["max_extra_inventory_quote"], 10)
+            self.assertEqual(config["profit_protection_seconds"], 86400)
+            self.assertEqual(config["max_extra_inventory_hold_seconds"], 172800)
             if portfolio.quote_asset == "FDUSD":
                 self.assertTrue(config["macro_gate_enabled"])
                 self.assertTrue(config["macro_fail_closed"])
@@ -98,8 +107,18 @@ class GridLiveSafetyTest(unittest.TestCase):
                 self.assertTrue(config["technical_buy_gate_enabled"])
                 self.assertTrue(config["technical_buy_fail_closed"])
                 self.assertEqual(config["technical_buy_gate_max_age_seconds"], 150)
+                self.assertEqual(config["technical_buy_gate_file"], "data/xgboost_risk_gate.json")
             else:
                 self.assertFalse(config["macro_gate_enabled"])
+
+    def test_enabled_fdusd_config_requires_locked_xgboost_hashes(self):
+        config = build_live_config(PORTFOLIOS["FDUSD"], self.prices, Decimal("0"))
+        config["trading_enabled"] = True
+        with self.assertRaisesRegex(ValueError, "model and feature hashes"):
+            validate_live_config(config)
+        config["technical_model_sha256"] = "a" * 64
+        config["technical_feature_sha256"] = "b" * 64
+        validate_live_config(config)
 
     def test_fdusd_live_identity_is_fixed_and_has_no_timestamp(self):
         portfolio = PORTFOLIOS["FDUSD"]
@@ -156,8 +175,10 @@ class GridLiveSafetyTest(unittest.TestCase):
 
     def test_ledger_tracks_only_bot_inventory_delta(self):
         ledger = PairLedger.create("BTC-USDT", Decimal("0.002"))
+        self.assertEqual(ledger.average_base_cost(), Decimal("59375"))
         ledger.apply_fill("BUY", Decimal("65000"), Decimal("0.0001"), Decimal("0.0065"))
         self.assertEqual(ledger.inventory_delta(), Decimal("0.0001"))
+        self.assertGreater(ledger.average_base_cost(), Decimal("59375"))
         ledger.apply_fill("SELL", Decimal("65500"), Decimal("0.0001"), Decimal("0.00655"))
         self.assertEqual(ledger.inventory_delta(), Decimal("0"))
         self.assertEqual(ledger.buys + ledger.sells, 2)
@@ -169,6 +190,15 @@ class GridLiveSafetyTest(unittest.TestCase):
         self.assertEqual(restored.open_order_ids, {"owned-order"})
         self.assertEqual(restored.peak_equity, ledger.peak_equity)
 
+    def test_cost_floor_uses_moving_average_inventory_cost(self):
+        ledger = PairLedger.create("BTC-FDUSD", Decimal("0.002"))
+        ledger.apply_fill("BUY", Decimal("40000"), Decimal("0.001"), Decimal("0"))
+        self.assertEqual(ledger.average_base_cost(), Decimal("140") / Decimal("0.003"))
+        self.assertEqual(
+            ledger.minimum_profitable_sell_price(Decimal("0.006")),
+            Decimal("140") / Decimal("0.003") * Decimal("1.006"),
+        )
+
     def test_old_ledger_state_defaults_pair_peak_to_initial_pair_budget(self):
         restored = PairLedger.from_mapping({
             "trading_pair": "BTC-FDUSD",
@@ -178,6 +208,7 @@ class GridLiveSafetyTest(unittest.TestCase):
             "base": "0.002",
         })
         self.assertEqual(restored.peak_equity, Decimal("200"))
+        self.assertEqual(restored.base_cost_quote, Decimal("100"))
 
     def test_active_selection_is_bounded_and_fee_adjusted(self):
         payload = {
@@ -278,6 +309,43 @@ class GridLiveSafetyTest(unittest.TestCase):
             simulate(candles, Candidate(0.04, 0.008, 0.008, 0.02), 0.0,
                      order_refresh_seconds=0)
 
+    def test_inventory_exit_policy_validates_limits_and_tiers(self):
+        with self.assertRaisesRegex(ValueError, "max_extra_inventory_quote"):
+            InventoryExitPolicy(0, 3600)
+        with self.assertRaisesRegex(ValueError, "max_hold_seconds"):
+            InventoryExitPolicy(25, 0)
+        with self.assertRaisesRegex(ValueError, "stage fractions"):
+            InventoryExitPolicy(25, 3600, stage_one_fraction=0.8, stage_two_fraction=0.5)
+
+        policy = InventoryExitPolicy(25, 900)
+        state = {"excess_inventory_started_at": 1000.0}
+        self.assertEqual(inventory_profit_floor_rate(state, 1000, 0.006, policy), 0.006)
+        self.assertEqual(inventory_profit_floor_rate(state, 1300, 0.006, policy), 0.002)
+        self.assertEqual(inventory_profit_floor_rate(state, 1600, 0.006, policy), 0.0)
+
+    def test_inventory_policy_caps_extra_inventory_and_forces_taker_exit(self):
+        candles = {
+            "BTC-FDUSD": self.candles(65000, count=600, decline=0.10),
+            "ETH-FDUSD": self.candles(3500, count=600, decline=0.10),
+        }
+        policy = InventoryExitPolicy(25, 3 * 3600)
+        trades = []
+        result, _, pair_stats = simulate(
+            candles,
+            Candidate(0.03, 0.006, 0.006, 0.015),
+            0.0,
+            taker_fee=0.001,
+            risk_breakers_enabled=False,
+            inventory_exit_policy=policy,
+            trade_log=trades,
+        )
+        self.assertGreater(result["forced_inventory_exits"], 0)
+        self.assertTrue(any(trade["reason"] == "max_hold_exit" for trade in trades))
+        self.assertTrue(all(
+            stats["max_extra_inventory_quote_observed"] <= 25.5
+            for stats in pair_stats.values()
+        ))
+
     def test_technical_risk_off_suppresses_only_new_buys(self):
         candles = {
             "BTC-FDUSD": self.candles(65000, count=50),
@@ -369,8 +437,49 @@ class GridLiveSafetyTest(unittest.TestCase):
         }
         results = guard.flatten_deltas("FDUSD", snapshot, bot)
         self.assertEqual({"ok": True}, results["BTC-FDUSD"])
-        self.assertEqual("dust", results["ETH-FDUSD"])
+        self.assertEqual("ownership_unavailable_no_action", results["ETH-FDUSD"])
         self.assertEqual([], calls)
+
+    def test_guard_full_exit_is_capped_by_signed_reservation_plus_bot_delta(self):
+        guard = Guard.__new__(Guard)
+        guard.manifest = {"reservations": {"FDUSD": {"base": {
+            "BTC": "0.002", "ETH": "0.05",
+        }}}}
+        guard.save = lambda: None
+        guard.quantity_step = lambda pair: Decimal("0.000001")
+        orders = []
+        guard.emergency_exchange = type("Exchange", (), {
+            "market_order": lambda self, pair, side, amount: (
+                orders.append((pair, side, amount)) or {
+                    "orderId": 1, "executedQty": str(amount),
+                    "cummulativeQuoteQty": str(amount * Decimal("65000")),
+                    "fills": [],
+                }
+            )
+        })()
+        snapshot = {"pairs": {
+            "BTC-FDUSD": {"net_base": "0.0002", "mark": "65000"},
+            "ETH-FDUSD": {"net_base": "-0.05", "mark": "3500"},
+        }}
+        guard.flatten_deltas("FDUSD", snapshot, {})
+        self.assertEqual([("BTC-FDUSD", "SELL", Decimal("0.0022"))], orders)
+
+    def test_guard_escalates_recoverable_exit_after_three_seconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            database = data / "bot.sqlite"
+            database.touch()
+            (data / "live_grid_runtime_state.json").write_text(json.dumps({
+                "pair_recovery": {
+                    "BTC-FDUSD": {"phase": "EXITING", "triggered_at": 100},
+                },
+                "portfolio_recovery": {"phase": "ACTIVE"},
+            }), encoding="utf-8")
+            guard = Guard.__new__(Guard)
+            with patch("live_guard.grid_live_guard.time.time", return_value=104):
+                stuck, reason = guard._stuck_recoverable_exit({"database": str(database)})
+            self.assertTrue(stuck)
+            self.assertIn("BTC-FDUSD", reason)
 
     def test_guard_emergency_stop_cancels_exchange_and_stops_container(self):
         guard = Guard.__new__(Guard)

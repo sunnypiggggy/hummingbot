@@ -16,13 +16,18 @@ from typing import Any, Dict, Optional
 import requests
 
 from grid_live_common import PORTFOLIO_DRAWDOWN_LIMIT_PCT, PORTFOLIOS, budget_for_quote
-from grid_technical_gate import (
-    COMBINED_RECOVERY_RULE_VERSION,
-    atomic_json as atomic_gate_json,
-    build_technical_buy_gate,
-    failed_technical_buy_gate,
-    roc_sqz_signal_from_klines,
+from grid_xgboost_risk_gate import MODEL_VERSION as XGBOOST_MODEL_VERSION
+from grid_xgboost_risk_gate import SCHEMA as XGBOOST_GATE_SCHEMA
+from grid_xgboost_risk_gate import atomic_json as atomic_gate_json
+from grid_xgboost_risk_gate import load_runtime_xgboost_gate
+from ethbtc_forced_exit_contract import (
+    MODEL_VERSION as V22_MODEL_VERSION,
+    PACKAGE_ID as V22_PACKAGE_ID,
+    SCHEMA as V22_GATE_SCHEMA,
+    atomic_json as atomic_v22_json,
+    load_runtime_contract as load_runtime_v22_contract,
 )
+from risk_recovery import EMERGENCY_ESCALATION_SECONDS, EXITING
 
 try:
     from live_guard.dca_live_guard import BinanceEmergencyClient, DockerEmergencyClient
@@ -112,21 +117,82 @@ class Guard:
             20, int(os.getenv("GRID_LIVE_FAIL_CLOSED_SECONDS", "60"))
         )
         self.technical_refresh_seconds = max(
-            30, int(os.getenv("GRID_ROC_BUY_GUARD_REFRESH_SECONDS", "60"))
+            10, int(os.getenv("GRID_XGBOOST_GATE_DISTRIBUTION_SECONDS", "30"))
         )
-        self.roc_risk_off_pct = float(os.getenv("GRID_ROC_RISK_OFF_PCT", "-5"))
-        self.sqzmom_risk_off_pct = float(os.getenv("GRID_SQZMOM_RISK_OFF_PCT", "-1"))
-        self.roc_recovery_pct = float(os.getenv("GRID_ROC_RECOVERY_PCT", "1"))
-        self.sqzmom_recovery_pct = float(os.getenv("GRID_SQZMOM_RECOVERY_PCT", "-3"))
-        if self.roc_risk_off_pct >= 0 or self.sqzmom_risk_off_pct >= 0:
-            raise ValueError("Grid ROC/SQZMOM risk-off thresholds must be negative")
-        if self.roc_recovery_pct <= self.roc_risk_off_pct:
-            raise ValueError("Grid ROC recovery threshold must exceed the risk-off threshold")
         self.armed = os.getenv("GRID_LIVE_TRADING_ENABLED", "false").lower() == "true"
         self.shadow = os.getenv("GRID_LIVE_GUARD_SHADOW", "false").lower() == "true"
+        # FDUSD pair breakers live in the strategy so each pair can halt and
+        # restore its own inventory.  An external full-bot trip would collapse
+        # that isolation and is therefore intentionally disabled for FDUSD.
+        self.fdusd_external_breakers_enabled = os.getenv(
+            "GRID_FDUSD_EXTERNAL_BREAKERS_ENABLED", "false"
+        ).lower() == "true"
         if self.armed and self.shadow:
             raise ValueError("Grid Guard cannot be armed and shadowed at the same time")
-        self.technical_gate_path = self.state_dir / "technical_buy_gate.json"
+        self.technical_gate_path = self.state_dir / "xgboost_risk_gate.json"
+        self.v21_in_guard_enabled = os.getenv(
+            "GRID_V21_IN_GUARD_ENABLED", "true"
+        ).lower() == "true"
+        self.v21_live_authorized = os.getenv(
+            "GRID_V21_LIVE_AUTHORIZED", "false"
+        ).lower() == "true"
+        self.v22_in_guard_enabled = os.getenv(
+            "GRID_V22_IN_GUARD_ENABLED", "true"
+        ).lower() == "true"
+        self.v22_execution_mode = os.getenv(
+            "GRID_V22_EXECUTION_MODE", "observe"
+        ).lower()
+        if self.v22_execution_mode not in {"observe", "live"}:
+            raise ValueError("GRID_V22_EXECUTION_MODE must be observe or live")
+        self.v22_observation_gate_path = self.state_dir / "ethbtc_forced_exit_observation.json"
+        self.mechanisms = {
+            "v22_weekly_buy_gate": os.getenv("GRID_RISK_V22_WEEKLY_GATE_ENABLED", "true").lower() == "true",
+            "fomc_gate": os.getenv("GRID_RISK_FOMC_GATE_ENABLED", "true").lower() == "true",
+            "strategy_loss_breaker": os.getenv("GRID_RISK_STRATEGY_LOSS_BREAKER_ENABLED", "true").lower() == "true",
+            "strategy_drawdown_breaker": os.getenv("GRID_RISK_STRATEGY_DRAWDOWN_BREAKER_ENABLED", "true").lower() == "true",
+            "portfolio_loss_breaker": os.getenv("GRID_RISK_PORTFOLIO_LOSS_BREAKER_ENABLED", "true").lower() == "true",
+            "portfolio_drawdown_breaker": os.getenv("GRID_RISK_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED", "true").lower() == "true",
+            "position_protection": os.getenv("GRID_RISK_POSITION_PROTECTION_ENABLED", "true").lower() == "true",
+        }
+        if self.v21_in_guard_enabled:
+            # Keep the heavyweight XGBoost/joblib dependency inside the Guard
+            # container's inference path.  Importing Guard utilities for
+            # preflight or unit tests must not require the ML runtime.
+            from grid_v21_live_gate import V21LiveGateProducer
+            self.v21_producer = V21LiveGateProducer(
+                package_dir=Path(os.getenv("GRID_V21_PACKAGE_PATH", "/workspace/package")),
+                cache_dir=Path(os.getenv("GRID_V21_CANDLE_PATH", "/workspace/v21-candles")),
+                seed_cache_dir=Path(os.getenv(
+                    "GRID_V21_SEED_CANDLE_PATH", "/workspace/research-candles"
+                )),
+                state_dir=self.state_dir,
+                authorized=self.v21_live_authorized,
+                refresh_binance=True,
+            )
+        else:
+            self.v21_producer = None
+        if self.v22_in_guard_enabled:
+            from grid_v22_live_gate import V22LiveGateProducer
+            self.v22_producer = V22LiveGateProducer(
+                package_dir=Path(os.getenv("GRID_V22_PACKAGE_PATH", "/workspace/v22-package")),
+                cache_dir=Path(os.getenv("GRID_V22_CANDLE_PATH", "/workspace/v22-candles")),
+                seed_cache_dir=Path(os.getenv(
+                    "GRID_V22_SEED_CANDLE_PATH", "/workspace/research-candles"
+                )),
+                state_dir=self.state_dir,
+                authorization_path=Path(os.getenv(
+                    "GRID_V22_AUTHORIZATION_PATH",
+                    "/workspace/state/ethbtc_forced_exit_authorization.json",
+                )),
+                refresh_binance=True,
+            )
+            self.v22_producer.output = self.v22_observation_gate_path
+        else:
+            self.v22_producer = None
+        if self.v22_execution_mode == "live" and self.v21_in_guard_enabled:
+            raise RuntimeError("live v22 mode forbids an enabled v21 producer")
+        if self.armed and not self.v22_in_guard_enabled:
+            raise RuntimeError("armed Grid Guard requires the in-process v22 producer")
         self.next_technical_refresh = 0.0
         self.api = ApiClient()
         secret_path = Path(os.getenv(
@@ -172,15 +238,20 @@ class Guard:
         self.state.update({
             "armed": self.armed,
             "shadow": self.shadow,
-            "roc_risk_off_pct": self.roc_risk_off_pct,
-            "sqzmom_risk_off_pct": self.sqzmom_risk_off_pct,
-            "roc_recovery_pct": self.roc_recovery_pct,
-            "sqzmom_recovery_pct": self.sqzmom_recovery_pct,
-            "technical_recovery_rule_version": COMBINED_RECOVERY_RULE_VERSION,
+            "technical_gate_schema": XGBOOST_GATE_SCHEMA,
+            "technical_model_version": XGBOOST_MODEL_VERSION,
+            "mechanism1_runtime_fallback": False,
+            "mechanisms": dict(self.mechanisms),
+            "v21_in_guard": self.v21_in_guard_enabled,
+            "v21_live_authorized": self.v21_live_authorized,
+            "v22_in_guard": self.v22_in_guard_enabled,
+            "v22_execution_mode": self.v22_execution_mode,
+            "v22_package_id": V22_PACKAGE_ID,
+            "fdusd_external_breakers_enabled": self.fdusd_external_breakers_enabled,
         })
         emergency_error = None
         shadow_preflight = None
-        if self.shadow and self.emergency_exchange is not None:
+        if (self.shadow or self.armed) and self.emergency_exchange is not None:
             try:
                 pairs = [pair for key in self.portfolio_keys for pair in PORTFOLIOS[key].pairs]
                 shadow_preflight = self.verify_shadow_exchange_ready(pairs)
@@ -263,6 +334,19 @@ class Guard:
                 },
             )
             tested.append(pair)
+        balances = self.emergency_exchange.account_balances()
+        reservation = self.manifest.get("reservations", {}).get("FDUSD", {}).get("base", {})
+        ownership_coverage = {}
+        for pair in pairs:
+            asset = pair.split("-")[0]
+            managed = Decimal(str(reservation.get(asset, "0")))
+            available = balances.get(asset, {}).get("total", Decimal("0"))
+            ownership_coverage[pair] = {
+                "managed_base": str(managed), "account_total_base": str(available),
+                "covered": managed > 0 and managed <= available,
+            }
+        if not all(item["covered"] for item in ownership_coverage.values()):
+            raise RuntimeError("Grid managed inventory exceeds the emergency account balance")
         return {
             "account_read": True,
             "spot_trading": True,
@@ -274,6 +358,7 @@ class Guard:
             "test_order_pairs": tested,
             "open_order_counts": open_order_counts,
             "commissions": commissions,
+            "ownership_coverage": ownership_coverage,
         }
 
     def _technical_gate_targets(self) -> list[Path]:
@@ -281,67 +366,95 @@ class Guard:
         for key in self.portfolio_keys:
             bot_name = PORTFOLIOS[key].bot_name
             for instance in (self.bots_path / "instances").glob(f"{bot_name}*"):
-                targets.append(instance / "data" / "technical_buy_gate.json")
+                targets.append(instance / "data" / "xgboost_risk_gate.json")
         return sorted(set(targets))
 
+    @staticmethod
+    def _is_distributable_technical_gate(gate: dict) -> bool:
+        """Only the frozen live schema may cross into Hummingbot instances."""
+        return bool(
+            (gate.get("schema") == XGBOOST_GATE_SCHEMA
+             and gate.get("model_version") == XGBOOST_MODEL_VERSION)
+            or (gate.get("schema") == V22_GATE_SCHEMA
+                and gate.get("model_version") == V22_MODEL_VERSION
+                and gate.get("package_id") == V22_PACKAGE_ID)
+        )
+
     def publish_technical_buy_gate(self, *, force: bool = False) -> dict:
+        """Observe v22 beside v21, then permanently cut over at activation."""
         now = time.time()
         if not force and now < self.next_technical_refresh:
-            gate = dict(self.state.get("technical_buy_gate", {}))
-            # A new API-created instance can appear between signal refreshes.
-            # Republish the last fresh decision every Guard cycle so it starts
-            # fail-closed briefly, then receives the gate within one cycle.
-            if gate:
+            gate = dict(self.state.get("xgboost_risk_gate", {}))
+            if self._is_distributable_technical_gate(gate):
                 for target in self._technical_gate_targets():
-                    atomic_gate_json(target, gate)
+                    if target != self.technical_gate_path:
+                        atomic_gate_json(target, gate)
             return gate
         self.next_technical_refresh = now + self.technical_refresh_seconds
-        previous_gate = self.state.get("technical_buy_gate", {})
-        previous_active = bool(previous_gate.get("risk_off_active", False))
-        previous_rule_version = previous_gate.get("recovery_rule_version")
-        model_changed = previous_rule_version != COMBINED_RECOVERY_RULE_VERSION
+        previous_gate = self.state.get("xgboost_risk_gate", {})
+        if self.v22_producer is None:
+            raise RuntimeError("in-guard v22 producer is disabled")
         try:
-            server_time = requests.get(f"{BINANCE_API}/api/v3/time", timeout=15)
-            server_time.raise_for_status()
-            server_now_ms = int(server_time.json()["serverTime"])
-            response = requests.get(
-                f"{BINANCE_API}/api/v3/klines",
-                params={"symbol": "BTCFDUSD", "interval": "4h", "limit": 64},
-                timeout=15,
-            )
-            response.raise_for_status()
-            closed = [
-                item for item in response.json()
-                if isinstance(item, list) and len(item) > 6 and int(item[6]) < server_now_ms
-            ]
-            signal = roc_sqz_signal_from_klines(closed)
-            gate = build_technical_buy_gate(
-                signal,
-                previously_active=previous_active,
-                previous_bar_close_time=previous_gate.get(
-                    "last_evaluated_bar_close_time"
-                ) if not model_changed else None,
-                previous_sqzmom_color=previous_gate.get("last_sqzmom_color"),
-                roc_risk_off_pct=self.roc_risk_off_pct,
-                sqzmom_risk_off_pct=self.sqzmom_risk_off_pct,
-                roc_recovery_pct=self.roc_recovery_pct,
-                sqzmom_recovery_pct=self.sqzmom_recovery_pct,
-            )
+            v22_gate = self.v22_producer.produce(int(now))
+            v22_runtime = load_runtime_v22_contract(self.v22_observation_gate_path)
         except Exception as exc:
-            gate = failed_technical_buy_gate(repr(exc))
+            v22_gate = {}
+            v22_runtime = {"runtime_gate_healthy": False, "reason": f"fail_closed:{exc!r}"}
+        observation = self.state.setdefault("v22_observation", {})
+        release = str(v22_gate.get("release_sha256", ""))
+        if release and observation.get("release_sha256") != release:
+            observation.clear()
+            observation.update({"release_sha256": release, "started_at": now, "cycles": 0,
+                                "source_errors": 0, "integrity_errors": 0})
+        observation["last_seen_at"] = now
+        observation["cycles"] = int(observation.get("cycles", 0)) + 1
+        observation["event_ids"] = {
+            pair: item.get("event_id") for pair, item in v22_gate.get("pairs", {}).items()
+        }
+        if not v22_runtime.get("runtime_gate_healthy"):
+            failure = str(v22_runtime.get("reason", ""))
+            category = "source_errors" if any(
+                marker in failure.lower() for marker in ("timeout", "connection", "temporarily")
+            ) else "integrity_errors"
+            observation[category] = int(observation.get(category, 0)) + 1
+            observation["last_error"] = failure
+        cutover = bool(self.state.get("v22_cutover_complete"))
+        if bool(v22_gate.get("execution_authorized")):
+            cutover = True
+            self.state["v22_cutover_complete"] = True
+            self.state["v22_activated_at"] = now
+        if cutover or self.v22_execution_mode == "live":
+            gate = v22_gate
+            runtime = v22_runtime
+            healthy = bool(runtime.get("runtime_gate_healthy"))
+            self.state["active_technical_producer"] = "v22"
+        else:
+            if self.v21_producer is None:
+                raise RuntimeError("v22 observation requires the existing v21 live producer")
+            self.v21_producer.produce(int(now))
+            gate = json.loads(self.technical_gate_path.read_text(encoding="utf-8"))
+            runtime = load_runtime_xgboost_gate(self.technical_gate_path)
+            healthy = bool(runtime.get("runtime_gate_healthy"))
+            self.state["active_technical_producer"] = "v21_observation_bridge"
+        atomic_v22_json(self.technical_gate_path, gate)
+        distributable = self._is_distributable_technical_gate(gate)
         for target in self._technical_gate_targets():
-            atomic_gate_json(target, gate)
-        old_active = previous_active
-        new_active = bool(gate.get("risk_off_active", True))
-        self.state["technical_buy_gate"] = gate
-        if model_changed or old_active != new_active or not bool(gate.get("source_healthy")):
+            if target != self.technical_gate_path and distributable:
+                atomic_gate_json(target, gate)
+        previous_events = {
+            pair: value.get("event_id") for pair, value in previous_gate.get("pairs", {}).items()
+        }
+        current_events = {
+            pair: value.get("event_id") for pair, value in gate.get("pairs", {}).items()
+        }
+        self.state["xgboost_risk_gate"] = gate
+        if previous_events != current_events or not healthy:
             self.audit(
-                "grid_technical_buy_gate_transition",
-                previous_risk_off=old_active,
-                risk_off=new_active,
-                model_changed=model_changed,
-                previous_recovery_rule_version=previous_rule_version,
-                gate=gate,
+                "grid_xgboost_risk_gate_transition",
+                previous_event_ids=previous_events,
+                event_ids=current_events,
+                runtime_healthy=healthy,
+                reason=runtime.get("reason"), gate=gate,
             )
         return gate
 
@@ -358,7 +471,7 @@ class Guard:
         return Decimal(str(response.json()["price"]))
 
     @staticmethod
-    def quantity_step(pair: str) -> Decimal:
+    def market_filter(pair: str) -> tuple[Decimal, Decimal]:
         response = requests.get(
             f"{BINANCE_API}/api/v3/exchangeInfo",
             params={"symbol": pair.replace("-", "")},
@@ -369,7 +482,13 @@ class Guard:
             item["filterType"]: item
             for item in response.json()["symbols"][0]["filters"]
         }
-        return Decimal(str(filters["LOT_SIZE"]["stepSize"]))
+        lot = filters.get("MARKET_LOT_SIZE") or filters["LOT_SIZE"]
+        notional = filters.get("NOTIONAL") or filters["MIN_NOTIONAL"]
+        return Decimal(str(lot["stepSize"])), Decimal(str(notional["minNotional"]))
+
+    @staticmethod
+    def quantity_step(pair: str) -> Decimal:
+        return Guard.market_filter(pair)[0]
 
     @staticmethod
     def rows(database: Path, pair: str) -> list[tuple[Any, ...]]:
@@ -448,21 +567,31 @@ class Guard:
     def flatten_deltas(self, key: str, snapshot: dict, bot: dict):
         portfolio = PORTFOLIOS[key]
         results = bot.setdefault("flatten", {})
+        reservations = getattr(self, "manifest", {}).get("reservations", {}).get(key, {}).get("base", {})
         for pair, values in snapshot["pairs"].items():
             if pair in results:
                 continue
             delta, mark = Decimal(values["net_base"]), Decimal(values["mark"])
-            if abs(delta) * mark < Decimal("5.25"):
+            base_asset = pair.split("-", 1)[0]
+            if base_asset not in reservations:
+                # No ownership proof means no emergency market order.
+                results[pair] = "ownership_unavailable_no_action"
+                self.save()
+                continue
+            # Ownership is bounded by the signed capital reservation plus this
+            # bot's audited fills; never derive an amount from account balance.
+            owned = max(Decimal(str(reservations[base_asset])) + delta, Decimal("0"))
+            step, minimum_notional = self.market_filter(pair)
+            if owned * mark < minimum_notional:
                 results[pair] = "dust"
                 self.save()
                 continue
-            step = self.quantity_step(pair)
-            amount = (abs(delta) / step).to_integral_value(rounding=ROUND_DOWN) * step
-            if amount <= 0 or amount * mark < Decimal("5.25"):
+            amount = (owned / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if amount <= 0 or amount * mark < minimum_notional:
                 results[pair] = "dust_after_exchange_rounding"
                 self.save()
                 continue
-            side = "SELL" if delta > 0 else "BUY"
+            side = "SELL"
             if self.emergency_exchange is None:
                 raise RuntimeError("independent Binance emergency client is unavailable")
             response = self.emergency_exchange.market_order(pair, side, amount)
@@ -480,6 +609,24 @@ class Guard:
             results[pair] = {"status": "filled", **adjustment}
             self.save()
         return results
+
+    def _stuck_recoverable_exit(self, snapshot: dict) -> tuple[bool, str]:
+        if not snapshot.get("database"):
+            return False, "runtime database absent"
+        runtime_state_path = Path(snapshot["database"]).parent / "live_grid_runtime_state.json"
+        if not runtime_state_path.exists():
+            return False, "runtime state absent"
+        runtime = json.loads(runtime_state_path.read_text(encoding="utf-8"))
+        now = time.time()
+        states = list(runtime.get("pair_recovery", {}).items())
+        states.append(("PORTFOLIO", runtime.get("portfolio_recovery", {})))
+        for pair, state in states:
+            if state.get("phase") != EXITING:
+                continue
+            age = now - float(state.get("triggered_at") or now)
+            if age >= EMERGENCY_ESCALATION_SECONDS:
+                return True, f"recoverable {pair} exit remained incomplete for {age:.1f}s"
+        return False, "no stuck recoverable exit"
 
     @staticmethod
     def _items(payload: Any) -> list[dict]:
@@ -649,6 +796,10 @@ class Guard:
             })
             bot["peak_equity"] = str(peak)
             bot["latest"] = snapshot
+            stuck, stuck_reason = self._stuck_recoverable_exit(snapshot) if key == "FDUSD" else (False, "")
+            if stuck:
+                self.trip(key, stuck_reason, snapshot)
+                continue
             pair_limit = budget.pair_loss_limit
             breached_pair = next(
                 (
@@ -660,20 +811,26 @@ class Guard:
             pnl = Decimal(snapshot["pnl"])
             if bot.get("tripped") and not bot.get("action_complete"):
                 self.trip(key, bot.get("reason", "retry incomplete breaker"), snapshot)
-            elif breached_pair is not None:
+            elif breached_pair is not None and (
+                key != "FDUSD" or getattr(self, "fdusd_external_breakers_enabled", False)
+            ):
                 self.trip(
                     key,
                     f"pair PnL {breached_pair} {snapshot['pairs'][breached_pair]['pnl']} "
                     f"<= -{pair_limit} {key}",
                     snapshot,
                 )
-            elif pnl <= -budget.portfolio_loss_limit:
+            elif pnl <= -budget.portfolio_loss_limit and (
+                key != "FDUSD" or getattr(self, "fdusd_external_breakers_enabled", False)
+            ):
                 self.trip(
                     key,
                     f"portfolio PnL {pnl} <= -{budget.portfolio_loss_limit} {key}",
                     snapshot,
                 )
-            elif drawdown >= PORTFOLIO_DRAWDOWN_LIMIT_PCT:
+            elif drawdown >= PORTFOLIO_DRAWDOWN_LIMIT_PCT and (
+                key != "FDUSD" or getattr(self, "fdusd_external_breakers_enabled", False)
+            ):
                 self.trip(
                     key,
                     f"portfolio peak drawdown {drawdown:.2%} >= {PORTFOLIO_DRAWDOWN_LIMIT_PCT:.2%}",
@@ -696,6 +853,8 @@ class Guard:
         else:
             combined_drawdown = Decimal("0")
         if (
+            getattr(self, "fdusd_external_breakers_enabled", False)
+            and
             len(snapshots) == len(self.portfolio_keys)
             and combined_drawdown >= PORTFOLIO_DRAWDOWN_LIMIT_PCT
         ):

@@ -170,6 +170,7 @@ def main() -> int:
         args.maker_fee,
         start_ts,
         end_ts,
+        taker_fee=args.taker_fee,
         technical_buy_gate=technical_gate,
     )
     evaluations.to_csv(args.output_dir / "candidate_evaluations.csv", index=False)
@@ -183,6 +184,7 @@ def main() -> int:
     recommended, initial_candidates = select_candidate(
         initial_training,
         args.maker_fee,
+        taker_fee=args.taker_fee,
         require_eligible=False,
         technical_buy_gate=technical_gate,
     )

@@ -1,0 +1,16 @@
+pair,start_ts,end_ts,duration_hours,end_reason
+BTC-FDUSD,1766865600,1767182400,88.0,adaptive_structural_relief
+BTC-FDUSD,1769529600,1770422400,248.0,adaptive_structural_relief
+BTC-FDUSD,1772841600,1773086400,68.0,adaptive_structural_relief
+BTC-FDUSD,1774022400,1774310400,80.0,adaptive_structural_relief
+BTC-FDUSD,1778630400,1780833600,612.0,adaptive_structural_relief
+BTC-FDUSD,1781726400,1782014400,80.0,adaptive_structural_relief
+BTC-FDUSD,1783929600,1784131200,56.0,adaptive_structural_relief
+BTC-FDUSD,1784304000,1784520000,60.0,adaptive_structural_relief
+ETH-FDUSD,1765656000,1766160000,140.0,adaptive_structural_relief
+ETH-FDUSD,1768636800,1769472000,232.0,adaptive_structural_relief
+ETH-FDUSD,1769716800,1770436800,200.0,adaptive_structural_relief
+ETH-FDUSD,1774555200,1774872000,88.0,adaptive_structural_relief
+ETH-FDUSD,1779494400,1780848000,376.0,adaptive_structural_relief
+ETH-FDUSD,1782907200,1783080000,48.0,adaptive_structural_relief
+ETH-FDUSD,1783483200,1783742400,72.0,adaptive_structural_relief

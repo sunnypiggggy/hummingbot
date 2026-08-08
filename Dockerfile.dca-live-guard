@@ -4,6 +4,9 @@ WORKDIR /app
 COPY live_guard/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY scripts/dca_live_common.py /app/dca_live_common.py
+COPY scripts/risk_recovery.py /app/risk_recovery.py
+COPY scripts/grid_xgboost_risk_gate.py /app/grid_xgboost_risk_gate.py
+COPY scripts/ethbtc_forced_exit_contract.py /app/ethbtc_forced_exit_contract.py
 COPY scripts/deploy_dca_live.py /app/deploy_dca_live.py
 COPY controllers/market_making/dman_maker_v3_macro.py /app/dman_maker_v3_macro.py
 COPY live_guard/dca_live_guard.py /app/dca_live_guard.py

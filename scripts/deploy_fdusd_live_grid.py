@@ -26,7 +26,7 @@ from grid_live_common import (
     validate_live_config,
 )
 from grid_macro_gate import load_runtime_macro_gate
-from grid_technical_gate import load_runtime_technical_gate
+from grid_xgboost_risk_gate import load_runtime_xgboost_gate
 from prepare_fdusd_live_grid import MAX_BOOTSTRAP_SLIPPAGE, weighted_ask
 
 
@@ -193,14 +193,16 @@ def main() -> int:
     parser.add_argument("--accept-no-go", action="store_true")
     parser.add_argument("--no-go-confirm", default="")
     parser.add_argument("--bootstrap-receipt", type=Path)
+    parser.add_argument("--authorize-auto-reentry", action="store_true",
+                        help="Enable reviewed breaker re-entry; omitted for observation rollout")
     args = parser.parse_args()
 
     validation = json.loads((args.state_dir / "validation_result.json").read_text(encoding="utf-8"))
     preflight = json.loads((args.state_dir / "private_preflight.json").read_text(encoding="utf-8"))
     selection = json.loads((args.state_dir / "active_selection.json").read_text(encoding="utf-8"))
     macro_gate = load_runtime_macro_gate(args.state_dir / "macro_gate.json")
-    technical_gate = load_runtime_technical_gate(
-        args.state_dir / "technical_buy_gate.json"
+    technical_gate = load_runtime_xgboost_gate(
+        args.state_dir / "xgboost_risk_gate.json"
     )
     guard_state_path = args.state_dir / "guard_state.json"
     guard_state = (
@@ -230,7 +232,10 @@ def main() -> int:
         "fomc_execution_enabled": bool(macro_gate.get("execution_enabled")),
         "outside_fomc_pause_window": not bool(macro_gate.get("pause_new_orders")),
         "technical_gate_healthy": bool(technical_gate.get("runtime_gate_healthy")),
-        "technical_buy_enabled": bool(technical_gate.get("buy_enabled")),
+        "technical_buy_enabled": bool(
+            technical_gate.get("pairs")
+            and all(value.get("buy_enabled") for value in technical_gate["pairs"].values())
+        ),
         **guard_checks,
     }
     print(json.dumps({
@@ -352,6 +357,11 @@ def main() -> int:
         "move_threshold": float(params["move_threshold"]),
         "min_grid_move_seconds": int(params["min_grid_move_seconds"]),
         "active_parameter_version": selection["parameter_version"],
+        "technical_model_sha256": str(technical_gate["model_sha256"]),
+        "technical_feature_sha256": str(technical_gate["feature_schema_sha256"]),
+        # Roll out exit observation first. Operators explicitly authorize
+        # automatic market re-entry after reviewing the audit trail.
+        "risk_auto_reentry_enabled": bool(args.authorize_auto_reentry),
     })
     validate_live_config(config)
     scripts_dir = args.bots_path / "scripts"
@@ -364,8 +374,10 @@ def main() -> int:
                  scripts_dir / "grid_live_common.py")
     shutil.copy2(Path(__file__).with_name("grid_macro_gate.py"),
                  scripts_dir / "grid_macro_gate.py")
-    shutil.copy2(Path(__file__).with_name("grid_technical_gate.py"),
-                 scripts_dir / "grid_technical_gate.py")
+    shutil.copy2(Path(__file__).with_name("grid_xgboost_risk_gate.py"),
+                 scripts_dir / "grid_xgboost_risk_gate.py")
+    shutil.copy2(Path(__file__).with_name("risk_recovery.py"),
+                 scripts_dir / "risk_recovery.py")
     config_path = configs_dir / PORTFOLIOS["FDUSD"].config_name
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     atomic_json(args.state_dir / "capital_reservations.json", {

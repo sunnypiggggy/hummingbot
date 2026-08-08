@@ -1,0 +1,11 @@
+exit_type,strategy,trigger,category,is_stop_loss,current_offline_behavior
+STOP_LOSS,DCA,单执行器净收益率 <= -5%,持仓止损,是,按当前 5 分钟收盘价关闭执行器；forced-exit-v2 权益包含该结果
+RISK_FLATTEN,DCA,v22 或其他技术门从允许转为禁止,技术强制退出,是,按下一执行价和不利滑点关闭受控执行器
+TAKE_PROFIT,DCA,单执行器净收益率 > 2%,止盈,否,正常获利退出
+TIME_LIMIT,DCA,首次成交后达到 18000 秒（5 小时）,时间退出,否,正常生命周期退出；不等同于止损
+REFRESH,DCA,空执行器创建后达到 18000 秒（5 小时）,订单刷新,否,无持仓时更换报价
+max_hold_exit,Grid,额外库存连续存在 48 小时,库存风险退出,是,仅卖出高于启动库存的额外部分；forced-exit-v2 未复现
+cost_floor,Grid,卖价低于移动平均成本加利润底线,成交约束,否,抬高 SELL 报价；24 小时后额外库存利润要求可降至 0
+pair_breaker_flatten,Grid,单对绝对亏损或峰值回撤越界,单策略熔断,是,旧模拟器只恢复到启动库存而非纯现金；不可视为 forced-exit-v2 等价实现
+portfolio_breaker,Grid,组合绝对亏损或峰值回撤越界,组合熔断,是,旧模拟器默认停止回放；可选库存恢复仍不是纯现金退出
+END_OF_BACKTEST,DCA,样本窗口结束,记账收尾,否,用于结算回测；不是交易策略信号

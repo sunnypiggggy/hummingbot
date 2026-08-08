@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from deploy_dca_live import (  # noqa: E402
     can_start_eth,
     stage_configs,
 )
+from risk_recovery import EXITING, trigger_state  # noqa: E402
 
 
 class FakeApi:
@@ -153,28 +155,73 @@ class CanaryTests(unittest.TestCase):
 
 
 class DcaLiveSafetyTest(unittest.TestCase):
-    def test_roc_sqz_signal_detects_fast_decline_on_closed_4h_bars(self):
-        klines = []
-        for index in range(64):
-            close = 100.0 if index < 50 else 100.0 - (index - 49) * 2.0
-            klines.append([
-                index * 1000,
-                str(close + 1),
-                str(close + 1),
-                str(close - 1),
-                str(close),
-                "1",
-                index * 1000 + 999,
-            ])
+    def test_recoverable_exit_is_capped_by_deployment_owned_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "managed_inventory.json").write_text(json.dumps({
+                "pairs": {"BTC-USDT": {"managed_base": "0.002"}},
+            }), encoding="utf-8")
+            guard = Guard.__new__(Guard)
+            guard.managed_inventory_path = root / "managed_inventory.json"
+            guard.state_path = root / "guard_state.json"
+            guard.audit_path = root / "risk_audit.jsonl"
+            guard.emergency_exchange = FakeEmergencyExchange()
+            guard.state = {"bots": {"bot": {"recovery": trigger_state(
+                mechanism="strategy_loss_breaker", scope="strategy", now=100,
+                trigger_value=-16, signal_price=65000, reason="loss",
+            )}}}
+            guard._notify = lambda message: None
+            snapshot = {"pair": "BTC-USDT", "mark_price": "65000", "net_base": "0.001"}
+            with patch.object(guard, "_lot_filter", return_value=(Decimal("0.000001"), Decimal("5"))):
+                guard._process_recoverable(
+                    "bot", snapshot,
+                    macro={"healthy": True, "buy_enabled": True, "sell_enabled": True},
+                    technical={"buy_enabled": True}, now=104,
+                )
+            self.assertEqual(Decimal("0.003"), guard.emergency_exchange.orders[0][2])
+            self.assertEqual("COOLDOWN", guard.state["bots"]["bot"]["recovery"]["phase"])
 
-        signal = Guard._roc_sqz_signal_from_klines(klines)
+    def test_v21_maps_fdusd_signals_to_usdt_without_recomputing_features(self):
+        guard = Guard.__new__(Guard)
+        guard.mechanisms = {"v21_buy_gate": True}
+        guard.v21_gate_path = Path("ignored.json")
+        guard.v21_max_age_seconds = 150
+        contract = {
+            "runtime_gate_healthy": True,
+            "reason": "xgboost_gate_healthy",
+            "model_version": "xgboost-grid-long-risk-gate-v21-250d",
+            "generated_at": "2026-08-07T00:00:00Z",
+            "pairs": {
+                "BTC-FDUSD": {"buy_enabled": False, "risk_off_active": True,
+                               "transition": "long:hold", "reason": "long_risk_off"},
+                "ETH-FDUSD": {"buy_enabled": True, "risk_off_active": False,
+                               "transition": "long:clear", "reason": "long_channel_clear"},
+            },
+        }
+        with patch("dca_live_guard.load_runtime_xgboost_gate", return_value=contract):
+            result = guard._v21_gate()
+        self.assertFalse(result["pairs"]["BTC-USDT"]["buy_enabled"])
+        self.assertTrue(result["pairs"]["ETH-USDT"]["buy_enabled"])
+        self.assertEqual("BTC-FDUSD", result["pairs"]["BTC-USDT"]["source_pair"])
 
-        self.assertLess(signal["roc_48h_pct"], -8)
-        self.assertLess(signal["sqzmom_pct"], -3)
-        self.assertTrue(signal["sqzmom_red"])
-        self.assertFalse(signal["sqzmom_green"])
+    def test_v21_unhealthy_contract_fails_closed_for_both_dca_pairs(self):
+        guard = Guard.__new__(Guard)
+        guard.mechanisms = {"v21_buy_gate": True}
+        guard.v21_gate_path = Path("ignored.json")
+        guard.v21_max_age_seconds = 150
+        failed = {
+            "runtime_gate_healthy": False,
+            "reason": "fail_closed:model hash mismatch",
+            "pairs": {"BTC-FDUSD": {}, "ETH-FDUSD": {}},
+        }
+        with patch("dca_live_guard.load_runtime_xgboost_gate", return_value=failed):
+            result = guard._v21_gate()
+        self.assertFalse(result["healthy"])
+        self.assertTrue(all(
+            not item["buy_enabled"] for item in result["pairs"].values()
+        ))
 
-    def test_roc_gate_disables_only_buy_and_preserves_sell_gate(self):
+    def test_aggregate_gate_disables_buy_and_preserves_macro_sell_gate(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "bot.sqlite"
             connection = sqlite3.connect(database)
@@ -198,11 +245,12 @@ class DcaLiveSafetyTest(unittest.TestCase):
             guard = Guard.__new__(Guard)
             guard.api = FakeApi()
 
-            result = guard._set_roc_buy_gate(
+            result = guard._set_effective_gates(
                 "dca-live-btcusdt-200",
                 {"database": str(database)},
-                enabled=False,
-                decision_id="roc-buy-guard:risk-off:1",
+                buy_enabled=False,
+                sell_enabled=False,
+                reasons={"v21": "risk_off", "fomc": "positive_event"},
             )
 
             self.assertEqual("applied", result["status"])
@@ -210,7 +258,7 @@ class DcaLiveSafetyTest(unittest.TestCase):
             self.assertFalse(profile["macro_buy_enabled"])
             self.assertFalse(profile["macro_sell_enabled"])
 
-    def test_roc_recovery_does_not_override_external_buy_gate(self):
+    def test_v21_recovery_does_not_override_fomc_buy_gate(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "bot.sqlite"
             connection = sqlite3.connect(database)
@@ -234,14 +282,23 @@ class DcaLiveSafetyTest(unittest.TestCase):
             guard = Guard.__new__(Guard)
             guard.api = FakeApi()
 
-            result = guard._set_roc_buy_gate(
-                "dca-live-btcusdt-200",
-                {"database": str(database)},
-                enabled=True,
-                decision_id="roc-buy-guard:resume:2",
+            guard.state = {"bots": {}}
+            guard._macro_gate = lambda: {
+                "healthy": True, "buy_enabled": False, "sell_enabled": True,
+                "reason": "active_negative_fomc", "active_lease_ids": ["fomc"],
+            }
+            guard._v21_gate = lambda: {
+                "healthy": True, "reason": "healthy", "pairs": {
+                    "BTC-USDT": {"buy_enabled": True, "source_pair": "BTC-FDUSD",
+                                 "reason": "long_channel_clear"},
+                },
+            }
+            guard._apply_aggregate_gates(
+                {"dca-live-btcusdt-200": {
+                    "database": str(database), "pair": "BTC-USDT"
+                }},
+                risk_actions_enabled=True,
             )
-
-            self.assertEqual("preserved_external_gate", result["status"])
             self.assertFalse(guard.api.controller_updates)
 
     def test_database_inactivity_does_not_make_fresh_observation_unhealthy(self):

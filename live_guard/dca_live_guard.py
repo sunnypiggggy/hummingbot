@@ -28,12 +28,31 @@ from dca_live_common import (
     CONNECTOR,
     LIVE_PAIRS,
     SINGLE_BOT_LOSS_LIMIT,
+    STRATEGY_BUDGET_QUOTE,
+    side_budget,
     trade_pnl_from_rows,
+)
+from grid_xgboost_risk_gate import load_runtime_xgboost_gate
+from ethbtc_forced_exit_contract import (
+    SCHEMA as V22_CONTRACT_SCHEMA,
+    load_runtime_contract as load_runtime_v22_contract,
+)
+from risk_recovery import (
+    ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
+    EMERGENCY_ESCALATION_SECONDS, EXIT_CRITICAL_SECONDS,
+    advance_recovery, active_state,
+    mark_exit_complete, mark_reentry_complete, normalize_state, trigger_state,
 )
 
 
 LOG = logging.getLogger("dca-live-guard")
 BINANCE_API = "https://api.binance.com"
+V21_PAIR_MAP = {"BTC-USDT": "BTC-FDUSD", "ETH-USDT": "ETH-FDUSD"}
+V22_PAIR_MAP = V21_PAIR_MAP
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    return os.getenv(name, "true" if default else "false").lower() == "true"
 
 
 class BinanceEmergencyClient:
@@ -109,6 +128,17 @@ class BinanceEmergencyClient:
         for pair in pairs:
             self.open_orders(pair)
 
+    def account_balances(self) -> Dict[str, Dict[str, Decimal]]:
+        account = self._signed("GET", "/api/v3/account")
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for row in account.get("balances", []):
+            free = Decimal(str(row.get("free", "0")))
+            locked = Decimal(str(row.get("locked", "0")))
+            result[str(row.get("asset", ""))] = {
+                "free": free, "locked": locked, "total": free + locked,
+            }
+        return result
+
     def market_order(self, pair: str, side: str, amount: Decimal) -> dict:
         value = self._signed(
             "POST",
@@ -124,7 +154,6 @@ class BinanceEmergencyClient:
         if not isinstance(value, dict) or value.get("status") != "FILLED":
             raise RuntimeError(f"Binance emergency market order was not FILLED: {value}")
         return value
-
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
     def __init__(self, socket_path: str):
@@ -256,23 +285,46 @@ class Guard:
         self.state_path = self.state_dir / "guard_state.json"
         self.audit_path = self.state_dir / "risk_audit.jsonl"
         self.telemetry_path = self.state_dir / "dca_macro_telemetry.json"
+        self.managed_inventory_path = self.state_dir / "managed_inventory.json"
         self.interval = max(2, int(os.getenv("DCA_LIVE_GUARD_INTERVAL", "10")))
         self.fail_closed_seconds = max(20, int(os.getenv("DCA_LIVE_FAIL_CLOSED_SECONDS", "60")))
-        self.roc_buy_guard_enabled = (
-            os.getenv("DCA_ROC_BUY_GUARD_ENABLED", "true").lower() == "true"
+        self.v21_gate_path = Path(os.getenv(
+            "DCA_V22_GATE_PATH",
+            os.getenv("DCA_V21_GATE_PATH", "/workspace/technical/xgboost_risk_gate.json"),
+        ))
+        self.v22_observation_gate_path = Path(os.getenv(
+            "DCA_V22_OBSERVATION_GATE_PATH",
+            "/workspace/technical/ethbtc_forced_exit_observation.json",
+        ))
+        self.macro_state_path = Path(os.getenv(
+            "DCA_MACRO_STATE_PATH", "/workspace/macro/state.json"
+        ))
+        self.macro_max_age_seconds = max(
+            10, int(os.getenv("DCA_MACRO_STATE_MAX_AGE_SECONDS", "30"))
         )
-        self.roc_buy_guard_refresh_seconds = max(
-            30, int(os.getenv("DCA_ROC_BUY_GUARD_REFRESH_SECONDS", "60"))
+        self.v21_max_age_seconds = max(
+            30, int(os.getenv("DCA_V22_MAX_AGE_SECONDS", os.getenv("DCA_V21_MAX_AGE_SECONDS", "150")))
         )
-        self.roc_trigger_pct = float(
-            os.getenv("DCA_ROC_BUY_GUARD_TRIGGER_PCT", "-8")
-        )
-        self.sqz_trigger_pct = float(
-            os.getenv("DCA_SQZ_BUY_GUARD_TRIGGER_PCT", "-3")
-        )
-        if self.roc_trigger_pct >= 0 or self.sqz_trigger_pct >= 0:
-            raise ValueError("ROC and SQZMOM BUY guard trigger thresholds must be negative")
-        self._roc_signal_cache: Dict[str, Any] = {}
+        self.mechanisms = {
+            "v22_weekly_buy_gate": _env_enabled("DCA_RISK_V22_WEEKLY_GATE_ENABLED"),
+            "fomc_gate": _env_enabled("DCA_RISK_FOMC_GATE_ENABLED"),
+            "strategy_loss_breaker": _env_enabled("DCA_RISK_STRATEGY_LOSS_BREAKER_ENABLED"),
+            "strategy_drawdown_breaker": _env_enabled("DCA_RISK_STRATEGY_DRAWDOWN_BREAKER_ENABLED"),
+            "portfolio_loss_breaker": _env_enabled("DCA_RISK_PORTFOLIO_LOSS_BREAKER_ENABLED"),
+            "portfolio_drawdown_breaker": _env_enabled("DCA_RISK_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED"),
+            "position_protection": _env_enabled("DCA_RISK_POSITION_PROTECTION_ENABLED"),
+        }
+        self.strategy_drawdown_limit = Decimal(os.getenv(
+            "DCA_STRATEGY_DRAWDOWN_LIMIT_PCT", "0.08"
+        ))
+        self.portfolio_drawdown_limit = Decimal(os.getenv(
+            "DCA_PORTFOLIO_DRAWDOWN_LIMIT_PCT", "0.08"
+        ))
+        self.auto_reentry_enabled = _env_enabled("DCA_RISK_AUTO_REENTRY_ENABLED", False)
+        if not Decimal("0") < self.strategy_drawdown_limit < Decimal("1"):
+            raise ValueError("DCA strategy drawdown limit must be between zero and one")
+        if not Decimal("0") < self.portfolio_drawdown_limit < Decimal("1"):
+            raise ValueError("DCA portfolio drawdown limit must be between zero and one")
         self.api = ApiClient(os.getenv("HUMMINGBOT_API_URL", "http://hummingbot-api:8000"))
         secret_path = Path(
             os.getenv(
@@ -301,11 +353,43 @@ class Guard:
             for spec in LIVE_PAIRS.values():
                 self.emergency_docker.matching_containers(spec.bot_name)
         self.state = self._load_state()
+        self.state["emergency_ready"] = bool(
+            self.emergency_exchange is not None and self.emergency_docker is not None
+        )
+        if self.state["emergency_ready"] and self.managed_inventory_path.exists():
+            ownership = json.loads(self.managed_inventory_path.read_text(encoding="utf-8"))
+            balances = self.emergency_exchange.account_balances()
+            coverage = {}
+            for pair, spec in LIVE_PAIRS.items():
+                managed = Decimal(str(
+                    ownership.get("pairs", {}).get(pair, {}).get("managed_base", "0")
+                ))
+                available = balances.get(spec.base_asset, {}).get("total", Decimal("0"))
+                coverage[pair] = {
+                    "managed_base": str(managed), "account_total_base": str(available),
+                    "covered": managed > 0 and managed <= available,
+                }
+            self.state["ownership_preflight"] = coverage
+        self._save()
 
     def _load_state(self) -> Dict[str, Any]:
         if self.state_path.exists():
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
-        return {"version": 1, "armed": True, "bots": {}, "last_success_at": 0, "created_at": time.time()}
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        else:
+            state = {"version": 2, "armed": True, "bots": {}, "last_success_at": 0,
+                     "created_at": time.time()}
+        legacy = state.get("roc_buy_guard")
+        if legacy is not None:
+            state["roc_buy_guard"] = {
+                "retired": True,
+                "retired_reason": "replaced_by_ethbtc_forced_exit_v22",
+                "previous_active": bool(legacy.get("active", False)),
+            }
+        state["version"] = 2
+        state["mechanisms"] = dict(self.mechanisms)
+        for bot in state.get("bots", {}).values():
+            bot["recovery"] = normalize_state(bot.get("recovery"))
+        return state
 
     def _save(self) -> None:
         temporary = self.state_path.with_suffix(".tmp")
@@ -362,7 +446,9 @@ class Guard:
         )
         response.raise_for_status()
         filters = {item["filterType"]: item for item in response.json()["symbols"][0]["filters"]}
-        lot = filters["LOT_SIZE"]
+        # MARKET_LOT_SIZE is authoritative for the forced-exit/re-entry market
+        # orders. Some symbols expose a different market step than LOT_SIZE.
+        lot = filters.get("MARKET_LOT_SIZE") or filters["LOT_SIZE"]
         notional = filters.get("NOTIONAL") or filters["MIN_NOTIONAL"]
         return Decimal(str(lot["stepSize"])), Decimal(str(notional["minNotional"]))
 
@@ -415,7 +501,22 @@ class Guard:
             "observed_at": observed_at,
             "database_event_at": database_event_at,
             "database_event_age_seconds": max(0.0, observed_at - database_event_at),
+            "latest_stop_loss_at": self._latest_stop_loss_at(database),
         }
+
+    @staticmethod
+    def _latest_stop_loss_at(database: Path) -> float:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10)
+        try:
+            row = connection.execute(
+                "SELECT MAX(close_timestamp) FROM Executors WHERE close_type = 2"
+            ).fetchone()
+        finally:
+            connection.close()
+        value = float(row[0] or 0)
+        while value > 10_000_000_000:
+            value /= 1000
+        return value
 
     @staticmethod
     def _side(value: Any) -> str:
@@ -540,231 +641,176 @@ class Guard:
             "macro_decision_id": str(config.get("macro_decision_id", "")),
         }
 
-    @staticmethod
-    def _linreg_endpoint(values: list[float]) -> float:
-        length = len(values)
-        if length < 2:
-            raise ValueError("linear regression requires at least two values")
-        x_mean = (length - 1) / 2
-        y_mean = sum(values) / length
-        denominator = sum((index - x_mean) ** 2 for index in range(length))
-        slope = sum(
-            (index - x_mean) * (value - y_mean)
-            for index, value in enumerate(values)
-        ) / denominator
-        intercept = y_mean - slope * x_mean
-        return intercept + slope * (length - 1)
-
-    @classmethod
-    def _roc_sqz_signal_from_klines(
-        cls,
-        klines: list[list[Any]],
-        *,
-        roc_length: int = 12,
-        sqz_length: int = 20,
-    ) -> Dict[str, Any]:
-        if len(klines) < sqz_length * 2:
-            raise ValueError(
-                f"at least {sqz_length * 2} closed klines are required"
-            )
-        highs = [float(item[2]) for item in klines]
-        lows = [float(item[3]) for item in klines]
-        closes = [float(item[4]) for item in klines]
-        if any(value <= 0 for value in closes):
-            raise ValueError("kline closes must be positive")
-        sqz_sources = []
-        for index in range(sqz_length - 1, len(klines)):
-            start = index - sqz_length + 1
-            highest = max(highs[start:index + 1])
-            lowest = min(lows[start:index + 1])
-            close_sma = sum(closes[start:index + 1]) / sqz_length
-            midpoint = ((highest + lowest) / 2 + close_sma) / 2
-            sqz_sources.append(closes[index] - midpoint)
-        current_sqz = cls._linreg_endpoint(sqz_sources[-sqz_length:])
-        previous_sqz = cls._linreg_endpoint(sqz_sources[-sqz_length - 1:-1])
-        roc_pct = (closes[-1] / closes[-1 - roc_length] - 1) * 100
-        sqz_pct = current_sqz / closes[-1] * 100
-        return {
-            "bar_open_time": int(klines[-1][0]),
-            "bar_close_time": int(klines[-1][6]),
-            "close": closes[-1],
-            "roc_48h_pct": roc_pct,
-            "sqzmom": current_sqz,
-            "sqzmom_previous": previous_sqz,
-            "sqzmom_pct": sqz_pct,
-            "sqzmom_red": current_sqz < 0 and current_sqz < previous_sqz,
-            "sqzmom_green": current_sqz > 0,
-        }
-
-    def _roc_buy_signal(self) -> Dict[str, Any]:
-        now = time.time()
-        cached_at = float(self._roc_signal_cache.get("cached_at", 0))
-        if now - cached_at < self.roc_buy_guard_refresh_seconds:
-            if "error" in self._roc_signal_cache:
-                raise RuntimeError(self._roc_signal_cache["error"])
-            return dict(self._roc_signal_cache["signal"])
+    def _macro_gate(self, *, now: float | None = None) -> Dict[str, Any]:
+        if not self.mechanisms["fomc_gate"]:
+            return {"healthy": True, "buy_enabled": True, "sell_enabled": True,
+                    "reason": "fomc_gate_disabled", "active_lease_ids": []}
+        observed = now if now is not None else time.time()
         try:
-            server_time = requests.get(f"{BINANCE_API}/api/v3/time", timeout=15)
-            server_time.raise_for_status()
-            server_now_ms = int(server_time.json()["serverTime"])
-            response = requests.get(
-                f"{BINANCE_API}/api/v3/klines",
-                params={"symbol": "BTCUSDT", "interval": "4h", "limit": 64},
-                timeout=15,
+            payload = json.loads(self.macro_state_path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != 3:
+                raise ValueError("unsupported macro state schema")
+            reconciled = datetime.fromisoformat(
+                str(payload["last_reconcile"]).replace("Z", "+00:00")
+            ).astimezone(timezone.utc).timestamp()
+            age = observed - reconciled
+            if age < -10 or age > self.macro_max_age_seconds:
+                raise ValueError(f"macro state age is {age:.0f}s")
+            desired = payload["desired_gates"]
+            if not isinstance(desired.get("buy"), bool) or not isinstance(desired.get("sell"), bool):
+                raise ValueError("macro desired gates are invalid")
+            active = sorted(
+                key for key, lease in payload.get("leases", {}).items()
+                if lease.get("status") == "active"
             )
-            response.raise_for_status()
-            closed = [
-                item for item in response.json()
-                if isinstance(item, list) and len(item) > 6 and int(item[6]) < server_now_ms
-            ]
-            signal = self._roc_sqz_signal_from_klines(closed)
-            signal["trigger"] = bool(
-                signal["roc_48h_pct"] <= self.roc_trigger_pct
-                and signal["sqzmom_pct"] <= self.sqz_trigger_pct
-                and signal["sqzmom_red"]
-            )
-            signal["recover"] = bool(signal["sqzmom_green"])
-            self._roc_signal_cache = {"cached_at": now, "signal": signal}
-            return dict(signal)
-        except Exception as exc:
-            self._roc_signal_cache = {"cached_at": now, "error": repr(exc)}
-            raise
+            return {"healthy": True, "buy_enabled": desired["buy"],
+                    "sell_enabled": desired["sell"], "reason": "macro_state_healthy",
+                    "active_lease_ids": active, "age_seconds": max(0, age)}
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            return {"healthy": False, "buy_enabled": False, "sell_enabled": False,
+                    "reason": f"fail_closed:{exc}", "active_lease_ids": []}
 
-    def _set_roc_buy_gate(
-        self,
-        bot_name: str,
-        snapshot: Dict[str, Any],
-        *,
-        enabled: bool,
-        decision_id: str,
+    def _v21_gate(self) -> Dict[str, Any]:
+        # Keep the legacy key readable only for pre-cutover state/test
+        # compatibility. It does not reinstate ROC/SQZMOM or a model fallback.
+        enabled = self.mechanisms.get(
+            "v22_weekly_buy_gate", self.mechanisms.get("v21_buy_gate", False)
+        )
+        if not enabled:
+            return {"healthy": True, "reason": "v22_gate_disabled", "pairs": {
+                pair: {"buy_enabled": True, "source_pair": source}
+                for pair, source in V22_PAIR_MAP.items()
+            }}
+        contract = load_runtime_xgboost_gate(
+            self.v21_gate_path, max_age_seconds=self.v21_max_age_seconds
+        )
+        healthy = bool(contract.get("runtime_gate_healthy"))
+        mapped = {}
+        for dca_pair, source_pair in V22_PAIR_MAP.items():
+            source = contract.get("pairs", {}).get(source_pair, {})
+            mapped[dca_pair] = {
+                "source_pair": source_pair,
+                "buy_enabled": bool(source.get("buy_enabled")) if healthy else False,
+                "risk_off_active": bool(source.get("risk_off_active", True)),
+                "transition": source.get("transition", "fail_closed"),
+                "reason": source.get("reason", contract.get("reason", "v21_unhealthy")),
+                "event_id": source.get("event_id"),
+                "force_exit": bool(source.get("force_exit", False)),
+                "probability": source.get("probability"),
+                "execution_authorized": bool(contract.get("execution_authorized", False)),
+            }
+        return {"healthy": healthy, "reason": contract.get("reason"),
+                "schema": contract.get("schema"),
+                "release_sha256": contract.get("release_sha256"),
+                "execution_authorized": bool(contract.get("execution_authorized", False)),
+                "model_version": contract.get("model_version"),
+                "generated_at": contract.get("generated_at"), "pairs": mapped}
+
+    def _observe_v22_contract(self, now: float) -> None:
+        if not self.v22_observation_gate_path.exists():
+            return
+        contract = load_runtime_v22_contract(
+            self.v22_observation_gate_path,
+            now=datetime.fromtimestamp(now, timezone.utc),
+            max_age_seconds=self.v21_max_age_seconds,
+        )
+        observation = self.state.setdefault("v22_observation", {})
+        release = str(contract.get("release_sha256", ""))
+        if release and observation.get("release_sha256") != release:
+            observation.clear()
+            observation.update({"release_sha256": release, "started_at": now,
+                                "cycles": 0, "source_errors": 0, "integrity_errors": 0})
+        observation["last_seen_at"] = now
+        observation["cycles"] = int(observation.get("cycles", 0)) + 1
+        observation["event_ids"] = {
+            pair: contract.get("pairs", {}).get(source, {}).get("event_id")
+            for pair, source in V22_PAIR_MAP.items()
+        }
+        if not contract.get("runtime_gate_healthy"):
+            failure = str(contract.get("reason", ""))
+            category = "source_errors" if any(
+                marker in failure.lower() for marker in ("timeout", "connection", "temporarily")
+            ) else "integrity_errors"
+            observation[category] = int(observation.get(category, 0)) + 1
+            observation["last_error"] = failure
+
+    def _set_effective_gates(
+        self, bot_name: str, snapshot: Dict[str, Any], *, buy_enabled: bool,
+        sell_enabled: bool, reasons: Dict[str, Any],
     ) -> Dict[str, Any]:
         database = Path(snapshot["database"])
         controller_name, profile = self._controller_profile(database)
         if not controller_name or not profile:
             raise RuntimeError(f"controller config is unavailable for {bot_name}")
-        actual = bool(profile.get("macro_buy_enabled", True))
-        current_decision = str(profile.get("macro_decision_id", ""))
-        if actual == enabled:
+        actual_buy = bool(profile.get("macro_buy_enabled", True))
+        actual_sell = bool(profile.get("macro_sell_enabled", True))
+        if actual_buy == buy_enabled and actual_sell == sell_enabled:
             return {
                 "status": "unchanged",
-                "macro_buy_enabled": actual,
-                "macro_decision_id": current_decision,
+                "macro_buy_enabled": actual_buy,
+                "macro_sell_enabled": actual_sell,
+                "macro_decision_id": str(profile.get("macro_decision_id", "")),
             }
-        if enabled and not current_decision.startswith("roc-buy-guard:"):
-            return {
-                "status": "preserved_external_gate",
-                "macro_buy_enabled": actual,
-                "macro_decision_id": current_decision,
-            }
-        profile["macro_buy_enabled"] = enabled
-        # Never alter the SELL gate: it may be controlled by a different lease.
-        profile["macro_decision_id"] = decision_id
-        response = self.api.update_controller(
-            bot_name, controller_name, profile
-        )
+        digest = hashlib.sha256(json.dumps(
+            {"buy": buy_enabled, "sell": sell_enabled, "reasons": reasons},
+            sort_keys=True, default=str, separators=(",", ":"),
+        ).encode()).hexdigest()[:16]
+        profile["macro_buy_enabled"] = buy_enabled
+        profile["macro_sell_enabled"] = sell_enabled
+        profile["macro_decision_id"] = f"risk-aggregate:{digest}"
+        response = self.api.update_controller(bot_name, controller_name, profile)
         return {
             "status": "applied",
-            "macro_buy_enabled": enabled,
-            "macro_sell_enabled": bool(profile.get("macro_sell_enabled", True)),
-            "macro_decision_id": decision_id,
+            "macro_buy_enabled": buy_enabled,
+            "macro_sell_enabled": sell_enabled,
+            "macro_decision_id": profile["macro_decision_id"],
             "response": response,
         }
 
-    def _apply_roc_buy_guard(
-        self,
-        snapshots: Dict[str, Dict[str, Any]],
-        *,
-        risk_actions_enabled: bool,
+    def _apply_aggregate_gates(
+        self, snapshots: Dict[str, Dict[str, Any]], *, risk_actions_enabled: bool,
     ) -> None:
-        if not self.roc_buy_guard_enabled:
-            return
-        guard_state = self.state.setdefault(
-            "roc_buy_guard",
-            {"active": False, "controlled_bots": []},
-        )
-        try:
-            signal = self._roc_buy_signal()
-        except Exception as exc:
-            guard_state["last_error"] = repr(exc)
-            guard_state["last_error_at"] = time.time()
-            return
-        guard_state.pop("last_error", None)
-        guard_state["latest"] = signal
-        was_active = bool(guard_state.get("active", False))
-        active = was_active
-        transition = ""
-        if not active and signal["trigger"]:
-            active = True
-            transition = "risk_off"
-            guard_state["triggered_at"] = time.time()
-        elif active and signal["recover"]:
-            active = False
-            transition = "recovered"
-            guard_state["recovered_at"] = time.time()
-        guard_state["active"] = active
-        if transition:
-            self._audit(
-                f"roc_buy_guard_{transition}",
-                signal=signal,
-                thresholds={
-                    "roc_48h_pct": self.roc_trigger_pct,
-                    "sqzmom_pct": self.sqz_trigger_pct,
-                },
-            )
-            if risk_actions_enabled:
-                self._notify(
-                    "DCA ROC BUY GUARD "
-                    + ("RISK OFF: BUY stopped" if active else "RECOVERED: BUY enabled")
-                    + f"\nROC48={signal['roc_48h_pct']:.2f}% "
-                    + f"SQZMOM={signal['sqzmom_pct']:.2f}%"
-                )
-        if not risk_actions_enabled:
-            return
-        controlled = set(guard_state.get("controlled_bots", []))
-        desired_enabled = not active
-        decision_id = (
-            f"roc-buy-guard:{'resume' if desired_enabled else 'risk-off'}:"
-            f"{signal['bar_close_time']}"
-        )
+        macro = self._macro_gate()
+        v21 = self._v21_gate()
+        aggregate = {"macro": macro, "v22": v21, "bots": {}}
         for bot_name, snapshot in snapshots.items():
             bot_state = self.state.get("bots", {}).get(bot_name, {})
             if bot_state.get("tripped"):
                 continue
-            if desired_enabled and bot_name not in controlled:
+            pair = str(snapshot["pair"])
+            technical = v21["pairs"][pair]
+            recovery = normalize_state(bot_state.get("recovery"))
+            recoverable_blocked = recovery["phase"] != ACTIVE
+            buy_enabled = bool(
+                macro["buy_enabled"] and technical["buy_enabled"]
+                and not recoverable_blocked
+            )
+            sell_enabled = bool(macro["sell_enabled"] and not recoverable_blocked)
+            reasons = {
+                "fomc": macro["reason"],
+                "v22": technical["reason"],
+                "v22_source_pair": technical["source_pair"],
+                "recovery_phase": recovery["phase"],
+                "recovery_mechanism": recovery.get("mechanism", ""),
+            }
+            aggregate["bots"][bot_name] = {
+                "pair": pair, "buy_enabled": buy_enabled,
+                "sell_enabled": sell_enabled, "reasons": reasons,
+            }
+            if not risk_actions_enabled:
                 continue
             try:
-                result = self._set_roc_buy_gate(
-                    bot_name,
-                    snapshot,
-                    enabled=desired_enabled,
-                    decision_id=decision_id,
+                result = self._set_effective_gates(
+                    bot_name, snapshot, buy_enabled=buy_enabled,
+                    sell_enabled=sell_enabled, reasons=reasons,
                 )
-                if not desired_enabled and (
-                    result["status"] == "applied"
-                    or str(result.get("macro_decision_id", "")).startswith(
-                        "roc-buy-guard:"
-                    )
-                ):
-                    controlled.add(bot_name)
-                if desired_enabled and result["status"] in {
-                    "applied", "unchanged", "preserved_external_gate"
-                }:
-                    controlled.discard(bot_name)
                 if result["status"] != "unchanged":
-                    self._audit(
-                        "roc_buy_guard_gate_update",
-                        bot=bot_name,
-                        desired_buy_enabled=desired_enabled,
-                        result=result,
-                    )
+                    self._audit("aggregate_gate_update", bot=bot_name,
+                                desired=aggregate["bots"][bot_name], result=result)
             except Exception as exc:
-                self._audit(
-                    "roc_buy_guard_gate_update_failed",
-                    bot=bot_name,
-                    desired_buy_enabled=desired_enabled,
-                    error=repr(exc),
-                )
-        guard_state["controlled_bots"] = sorted(controlled)
+                self._audit("aggregate_gate_update_failed", bot=bot_name,
+                            desired=aggregate["bots"][bot_name], error=repr(exc))
+        self.state["gate_aggregate"] = aggregate
 
     @staticmethod
     def _market_telemetry(pair: str) -> Dict[str, float]:
@@ -1166,11 +1212,177 @@ class Guard:
         result["verified_no_live_instances"] = True
         return result
 
+    def _managed_base_target(self, pair: str) -> Decimal:
+        """Return the deployment-audited base allocation; never use account-wide balance."""
+        payload = json.loads(self.managed_inventory_path.read_text(encoding="utf-8"))
+        value = payload.get("pairs", {}).get(pair, {}).get("managed_base")
+        if value is None:
+            raise RuntimeError(f"managed base ownership is not recorded for {pair}")
+        amount = Decimal(str(value))
+        if amount <= 0:
+            raise RuntimeError(f"managed base ownership is invalid for {pair}")
+        return amount
+
+    def _owned_base(self, bot_name: str, snapshot: Dict[str, Any]) -> Decimal:
+        bot = self.state["bots"].setdefault(bot_name, {})
+        target = Decimal(str(bot.get("managed_base_target", "0")))
+        if target <= 0:
+            target = self._managed_base_target(str(snapshot["pair"]))
+            bot["managed_base_target"] = str(target)
+        return max(target + Decimal(str(snapshot["net_base"])), Decimal("0"))
+
+    def _trigger_recoverable(
+        self, bot_name: str, snapshot: Dict[str, Any], *, mechanism: str,
+        scope: str, trigger_value: Any, reason: str,
+    ) -> None:
+        bot = self.state["bots"].setdefault(bot_name, {})
+        current = normalize_state(bot.get("recovery"))
+        if current["phase"] != ACTIVE:
+            return
+        bot["recovery"] = trigger_state(
+            mechanism=mechanism, scope=scope, now=time.time(),
+            trigger_value=trigger_value, signal_price=snapshot["mark_price"], reason=reason,
+        )
+        self._audit("recoverable_breaker_triggered", bot=bot_name,
+                    pair=snapshot["pair"], recovery=bot["recovery"])
+        self._save()
+
+    def _latch_integrity_failure(self, bot_name: str, snapshot: Dict[str, Any], reason: str) -> None:
+        bot = self.state["bots"].setdefault(bot_name, {})
+        if normalize_state(bot.get("recovery"))["phase"] in {EXITING, LATCHED}:
+            return
+        bot["recovery"] = trigger_state(
+            mechanism="infrastructure_integrity_breaker", scope="infrastructure",
+            now=time.time(), trigger_value=reason, signal_price=snapshot["mark_price"],
+            reason=reason, latch_after_exit=True,
+        )
+        self._audit("integrity_failure_exit_then_latch", bot=bot_name,
+                    pair=snapshot["pair"], reason=reason)
+        # The integrity latch is a safety boundary.  Persist it immediately so
+        # a process crash cannot reopen trading on restart.
+        self._save()
+
+    def _record_emergency_fill(self, bot_name: str, pair: str, side: str,
+                               response: Dict[str, Any]) -> Dict[str, str]:
+        metrics = self._emergency_fill_metrics(pair, side, response)
+        self.state["bots"].setdefault(bot_name, {}).setdefault(
+            "emergency_adjustments", []
+        ).append({
+            "recorded_at": datetime.now(timezone.utc).isoformat(), "pair": pair,
+            "side": side, "order_id": str(response.get("orderId", "")),
+            "executed_qty": str(response.get("executedQty", "0")),
+            "cummulative_quote_qty": str(response.get("cummulativeQuoteQty", "0")),
+            **metrics,
+        })
+        return metrics
+
+    def _process_recoverable(
+        self, bot_name: str, snapshot: Dict[str, Any], *,
+        macro: Dict[str, Any], technical: Dict[str, Any], now: float,
+        portfolio_all_gates: bool = True,
+    ) -> None:
+        bot = self.state["bots"][bot_name]
+        state = normalize_state(bot.get("recovery"))
+        if state["phase"] in {ACTIVE, LATCHED}:
+            return
+        pair = str(snapshot["pair"])
+        step, minimum_notional = self._lot_filter(pair)
+        mark = Decimal(snapshot["mark_price"])
+        if state["phase"] == EXITING:
+            # Give the in-process executor one short window to complete its
+            # market close. The independent channel takes over only after the
+            # persisted deadline, preventing a stale double-close race.
+            if now - float(state.get("triggered_at") or now) < EMERGENCY_ESCALATION_SECONDS:
+                bot["recovery"] = state
+                return
+            self.emergency_exchange.cancel_all_orders(pair)
+            try:
+                refreshed = self._snapshot(bot_name, pair)
+                if refreshed is not None:
+                    snapshot = refreshed
+                    mark = Decimal(snapshot["mark_price"])
+            except Exception as exc:
+                self._audit("exit_snapshot_refresh_failed", bot=bot_name,
+                            pair=pair, error=repr(exc))
+            owned = self._owned_base(bot_name, snapshot)
+            amount = (owned / step).to_integral_value(rounding=ROUND_DOWN) * step
+            state["remaining_base"] = {pair: str(owned)}
+            state["exit_attempts"] = int(state.get("exit_attempts", 0)) + 1
+            if amount > 0 and amount * mark >= minimum_notional:
+                state["first_exit_order_at"] = state.get("first_exit_order_at") or now
+                response = self.emergency_exchange.market_order(pair, "SELL", amount)
+                metrics = self._record_emergency_fill(bot_name, pair, "SELL", response)
+                state["last_exit_fill"] = {"response": response, "metrics": metrics}
+                # A FILLED response is authoritative; subtract only that fill
+                # from the ownership-capped amount rather than reading account balance.
+                owned = max(owned - Decimal(str(response["executedQty"])), Decimal("0"))
+                amount = (owned / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if amount <= 0 or amount * mark < minimum_notional:
+                state = mark_exit_complete(
+                    state, now=now, remaining_base={pair: owned},
+                    execution={"target": "quote_only", "attempts": state["exit_attempts"],
+                               "last_fill": state.get("last_exit_fill", {})},
+                )
+                self._audit("recoverable_exit_complete", bot=bot_name, pair=pair, recovery=state)
+            elif now - float(state.get("triggered_at") or now) >= EXIT_CRITICAL_SECONDS:
+                if not state.get("critical_alerted"):
+                    state["critical_alerted"] = True
+                    self._notify(f"DCA CRITICAL EXIT DELAY: {bot_name} owns {owned} base")
+                    self._audit("recoverable_exit_critical_delay", bot=bot_name,
+                                pair=pair, remaining_base=str(owned))
+            bot["recovery"] = state
+            return
+
+        counts = self._executor_counts(Path(snapshot["database"]))
+        no_runtime_risk = not self.emergency_exchange.open_orders(pair) and all(
+            counts[key] == 0 for key in counts
+        )
+        underlying_healthy = bool(macro["healthy"] and technical.get("buy_enabled"))
+        gates_allow = bool(
+            self.auto_reentry_enabled and macro["buy_enabled"] and macro["sell_enabled"]
+            and technical.get("buy_enabled") and technical.get("execution_authorized")
+        )
+        if state.get("scope") == "portfolio":
+            gates_allow = gates_allow and portfolio_all_gates
+        state = advance_recovery(
+            state, now=now, healthy=underlying_healthy and no_runtime_risk,
+            gates_allow_reentry=gates_allow,
+        )
+        if state.get("reentry_allowed"):
+            target_quote = side_budget()
+            amount = ((target_quote / mark) / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if amount <= 0 or amount * mark < minimum_notional:
+                raise RuntimeError(f"DCA reentry amount is below exchange minimum for {pair}")
+            response = self.emergency_exchange.market_order(pair, "BUY", amount)
+            metrics = self._record_emergency_fill(bot_name, pair, "BUY", response)
+            baseline = {"base": response["executedQty"], "target_quote": target_quote,
+                        "mark_price": mark}
+            if state.get("scope") == "portfolio":
+                state["reentry_filled"] = True
+                state["reentry_baseline"] = {key: str(value) for key, value in baseline.items()}
+                state["reentry_allowed"] = False
+            else:
+                state = mark_reentry_complete(state, now=now, baseline=baseline)
+            bot["peak_equity"] = str(STRATEGY_BUDGET_QUOTE)
+            bot["pnl_offset_pending"] = True
+            self._audit("recoverable_reentry_complete", bot=bot_name, pair=pair,
+                        response=response, metrics=metrics, recovery=state)
+        bot["recovery"] = state
+
     def _trip(self, bot_name: str, reason: str, snapshot: Optional[Dict[str, Any]]) -> None:
         bot_state = self.state["bots"].setdefault(bot_name, {})
         if bot_state.get("action_complete"):
             return
-        bot_state.update({"tripped": True, "trip_reason": reason, "tripped_at": time.time()})
+        observed = time.time()
+        signal_price = snapshot.get("mark_price", "") if snapshot else ""
+        bot_state.update({
+            "tripped": True, "trip_reason": reason, "tripped_at": observed,
+            "recovery": trigger_state(
+                mechanism="infrastructure_integrity_breaker", scope="infrastructure",
+                now=observed, trigger_value=reason, signal_price=signal_price,
+                reason=reason, latched=True,
+            ),
+        })
         self._save()
         try:
             pair = snapshot["pair"] if snapshot is not None else next(
@@ -1217,6 +1429,8 @@ class Guard:
         status_text = json.dumps(self.api.status(), ensure_ascii=True)
         snapshots: Dict[str, Dict[str, Any]] = {}
         now = time.time()
+        self._observe_v22_contract(now)
+        mechanisms = getattr(self, "mechanisms", {})
         for pair, spec in LIVE_PAIRS.items():
             if spec.bot_name not in status_text:
                 continue
@@ -1225,32 +1439,163 @@ class Guard:
                 "started_at": now,
                 "tripped": False,
                 "action_complete": False,
+                "recovery": active_state(),
             })
+            bot_state["recovery"] = normalize_state(bot_state.get("recovery"))
             snapshot = self._snapshot(spec.bot_name, pair)
             if snapshot is None:
                 continue
             snapshots[spec.bot_name] = snapshot
+            raw_pnl = Decimal(snapshot["pnl_quote"])
+            if bot_state.pop("pnl_offset_pending", False):
+                bot_state["pnl_offset_quote"] = str(-raw_pnl)
+            pnl = raw_pnl + Decimal(str(bot_state.get("pnl_offset_quote", "0")))
+            snapshot["raw_pnl_quote"] = str(raw_pnl)
+            snapshot["pnl_quote"] = str(pnl)
+            equity = STRATEGY_BUDGET_QUOTE + pnl
+            peak = max(
+                STRATEGY_BUDGET_QUOTE,
+                Decimal(str(bot_state.get("peak_equity", STRATEGY_BUDGET_QUOTE))),
+                equity,
+            )
+            drawdown = (peak - equity) / peak if peak > 0 else Decimal("0")
+            snapshot.update({
+                "equity": str(equity), "peak_equity": str(peak),
+                "drawdown_pct": str(drawdown),
+            })
+            bot_state["peak_equity"] = str(peak)
             bot_state["latest"] = snapshot
             if risk_actions_enabled and bot_state.get("tripped"):
                 if not bot_state.get("action_complete"):
                     self._trip(spec.bot_name, bot_state.get("trip_reason", "retry"), snapshot)
                 continue
-            pnl = Decimal(snapshot["pnl_quote"])
-            if risk_actions_enabled and pnl <= -SINGLE_BOT_LOSS_LIMIT:
-                self._trip(spec.bot_name, f"single bot PnL {pnl} <= -{SINGLE_BOT_LOSS_LIMIT} USDT", snapshot)
+            latest_stop = float(snapshot.get("latest_stop_loss_at", 0))
+            if "last_position_stop_seen" not in bot_state:
+                bot_state["last_position_stop_seen"] = latest_stop
+            last_seen_stop = float(bot_state.get("last_position_stop_seen", 0))
+            if (
+                risk_actions_enabled
+                and mechanisms.get("position_protection", True)
+                and latest_stop > last_seen_stop
+                and bot_state["recovery"]["phase"] == ACTIVE
+            ):
+                bot_state["last_position_stop_seen"] = latest_stop
+                self._trigger_recoverable(
+                    spec.bot_name, snapshot, mechanism="position_protection",
+                    scope="position", trigger_value="5%", reason="executor_stop_loss",
+                )
+            strategy_loss_enabled = mechanisms.get("strategy_loss_breaker", True)
+            strategy_drawdown_enabled = mechanisms.get("strategy_drawdown_breaker", True)
+            if risk_actions_enabled and strategy_loss_enabled and pnl <= -SINGLE_BOT_LOSS_LIMIT:
+                self._trigger_recoverable(
+                    spec.bot_name, snapshot, mechanism="strategy_loss_breaker",
+                    scope="strategy", trigger_value=pnl,
+                    reason=f"single bot PnL {pnl} <= -{SINGLE_BOT_LOSS_LIMIT} USDT",
+                )
+            elif (
+                risk_actions_enabled and strategy_drawdown_enabled
+                and drawdown >= getattr(self, "strategy_drawdown_limit", Decimal("0.08"))
+            ):
+                limit = getattr(self, "strategy_drawdown_limit", Decimal("0.08"))
+                self._trigger_recoverable(
+                    spec.bot_name, snapshot, mechanism="strategy_drawdown_breaker",
+                    scope="strategy", trigger_value=drawdown,
+                    reason=(f"single bot peak drawdown {drawdown:.2%} >= "
+                            f"{limit:.2%}"),
+                )
 
         combined_pnl = sum((Decimal(item["pnl_quote"]) for item in snapshots.values()), Decimal("0"))
         self.state["combined_pnl_quote"] = str(combined_pnl)
+        initial_equity = STRATEGY_BUDGET_QUOTE * Decimal(len(LIVE_PAIRS))
+        combined_equity = initial_equity + combined_pnl
+        combined_peak = max(
+            initial_equity,
+            Decimal(str(self.state.get("combined_peak_equity", initial_equity))),
+            combined_equity,
+        )
+        combined_drawdown = (
+            (combined_peak - combined_equity) / combined_peak
+            if combined_peak > 0 else Decimal("0")
+        )
+        self.state["combined_equity"] = str(combined_equity)
+        self.state["combined_peak_equity"] = str(combined_peak)
+        self.state["combined_drawdown_pct"] = str(combined_drawdown)
         if (
             risk_actions_enabled
             and len(snapshots) == len(LIVE_PAIRS)
+            and mechanisms.get("portfolio_loss_breaker", True)
             and combined_pnl <= -COMBINED_LOSS_LIMIT
         ):
             for bot_name, snapshot in snapshots.items():
-                self._trip(bot_name, f"combined PnL {combined_pnl} <= -{COMBINED_LOSS_LIMIT} USDT", snapshot)
-        self._apply_roc_buy_guard(
+                self._trigger_recoverable(
+                    bot_name, snapshot, mechanism="portfolio_loss_breaker",
+                    scope="portfolio", trigger_value=combined_pnl,
+                    reason=f"combined PnL {combined_pnl} <= -{COMBINED_LOSS_LIMIT} USDT",
+                )
+        elif (
+            risk_actions_enabled
+            and len(snapshots) == len(LIVE_PAIRS)
+            and mechanisms.get("portfolio_drawdown_breaker", True)
+            and combined_drawdown >= getattr(self, "portfolio_drawdown_limit", Decimal("0.08"))
+        ):
+            limit = getattr(self, "portfolio_drawdown_limit", Decimal("0.08"))
+            for bot_name, snapshot in snapshots.items():
+                self._trigger_recoverable(
+                    bot_name, snapshot, mechanism="portfolio_drawdown_breaker",
+                    scope="portfolio", trigger_value=combined_drawdown,
+                    reason=(f"combined peak drawdown {combined_drawdown:.2%} >= "
+                            f"{limit:.2%}"),
+                )
+        macro_contract = self._macro_gate()
+        v21_contract = self._v21_gate()
+        if risk_actions_enabled:
+            for bot_name, snapshot in snapshots.items():
+                if not macro_contract["healthy"]:
+                    self._latch_integrity_failure(bot_name, snapshot, str(macro_contract["reason"]))
+                elif not v21_contract["healthy"]:
+                    self._latch_integrity_failure(bot_name, snapshot, str(v21_contract["reason"]))
+                else:
+                    technical = v21_contract["pairs"][snapshot["pair"]]
+                    if (
+                        v21_contract.get("schema") == V22_CONTRACT_SCHEMA
+                        and technical.get("force_exit")
+                    ):
+                        self._trigger_recoverable(
+                            bot_name, snapshot, mechanism="v22_weekly_buy_gate",
+                            scope="technical", trigger_value=technical.get("probability"),
+                            reason=str(technical.get("reason", "v22_risk_off")),
+                        )
+        self._apply_aggregate_gates(
             snapshots, risk_actions_enabled=risk_actions_enabled
         )
+        if risk_actions_enabled:
+            macro = macro_contract
+            v21 = v21_contract
+            portfolio_all_gates = bool(
+                macro["healthy"] and macro["buy_enabled"] and macro["sell_enabled"]
+                and all(item.get("buy_enabled") for item in v21["pairs"].values())
+            )
+            for bot_name, snapshot in snapshots.items():
+                self._process_recoverable(
+                    bot_name, snapshot, macro=macro,
+                    technical=v21["pairs"][snapshot["pair"]], now=now,
+                    portfolio_all_gates=portfolio_all_gates,
+                )
+            portfolio_states = [
+                normalize_state(self.state["bots"][name].get("recovery"))
+                for name in snapshots
+            ]
+            if (
+                len(portfolio_states) == len(LIVE_PAIRS)
+                and all(state.get("scope") == "portfolio" for state in portfolio_states)
+                and all(state.get("reentry_filled") for state in portfolio_states)
+            ):
+                for bot_name in snapshots:
+                    state = normalize_state(self.state["bots"][bot_name]["recovery"])
+                    self.state["bots"][bot_name]["recovery"] = mark_reentry_complete(
+                        state, now=now, baseline=state["reentry_baseline"],
+                    )
+                self._audit("portfolio_reentry_committed", bots=sorted(snapshots))
         self.state["last_success_at"] = now
         self.state.pop("last_monitor_error", None)
         self.state.pop("first_failure_at", None)

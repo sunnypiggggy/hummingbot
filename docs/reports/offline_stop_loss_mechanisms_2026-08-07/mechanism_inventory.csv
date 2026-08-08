@@ -1,0 +1,8 @@
+mechanism,scope,Grid_trigger,DCA_trigger,execution_action,recovery,current_forced_exit_v2_status
+v22_weekly_buy_gate,单交易对,冻结 v22 周模型进入 Risk-Off,FDUSD 信号映射到对应 USDT 机器人,下一根可执行 5 分钟 K 取消订单并清空机器人所属基础币,模型恢复且其他门放行并连续 3 个健康周期；固定冷却为 0,已执行：Grid 15 次退出；DCA 13 次退出
+fomc_gate,方向门,审批窗口限制 BUY/SELL/双侧,审批窗口限制 BUY/SELL/双侧,按批准方向暂停订单；不应阻止紧急退出,租约结束后恢复,无可信历史事件；forced-exit-v2 不执行
+strategy_loss_breaker,单交易对/单机器人,-6 FDUSD 相对风险周期基准,-16 USDT 相对单机器人基准,目标语义为取消订单并清空该机器人库存,6 小时冷却 + 3 个健康周期 + 其他门放行,阈值存在；forced-exit-v2 未接线
+strategy_drawdown_breaker,单交易对/单机器人,从周期峰值回撤 3%,从周期峰值回撤 8%,目标语义为取消订单并清空该机器人库存,6 小时冷却 + 3 个健康周期 + 其他门放行,阈值存在；forced-exit-v2 未接线
+portfolio_loss_breaker,策略组合,-24 FDUSD 相对 420 FDUSD 组合基准,-32 USDT 相对 380 USDT 组合基准,目标语义为同时停止并清空 BTC/ETH 机器人库存,12 小时冷却；BTC/ETH 原子重建 + 3 个健康周期,阈值存在；forced-exit-v2 未接线
+portfolio_drawdown_breaker,策略组合,从组合峰值回撤 6%,从组合峰值回撤 8%,目标语义为同时停止并清空 BTC/ETH 机器人库存,12 小时冷却；BTC/ETH 原子重建 + 3 个健康周期,阈值存在；forced-exit-v2 未接线
+position_protection,单持仓/额外库存,额外库存上限 10 FDUSD；24 小时成本利润保护；48 小时 Taker 退出额外库存,单执行器净亏损达到 5%；部分成交也受保护,Grid 只退出高于启动库存的额外部分；DCA 关闭触发止损的执行器,统一恢复设计为 30 分钟 + 3 个健康周期,forced-exit-v2 中 DCA 5% 执行器止损生效；Grid 库存保护未接线

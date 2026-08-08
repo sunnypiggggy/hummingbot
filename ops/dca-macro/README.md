@@ -180,6 +180,20 @@ python -m macro_control.hermes_cli ledger-replay \
 Do not enable execution until shadow decisions, lease expiry, audit output,
 paper trading, and the BTC 24-hour canary have passed.
 
+## Single-writer live gate
+
+`DCA_MACRO_EXECUTION_ENABLED` remains `false` after promotion. The gateway
+records approvals, maintains leases, and publishes `desired_gates` in
+`dca-macro-data/state.json`; it no longer writes controller configuration.
+The existing `dca-live-guard` mounts that state read-only, combines it with the
+shared v21 BUY contract, and is the sole writer of the final BUY/SELL gates.
+This prevents a v21 recovery from reopening BUY while an FOMC lease is active.
+
+The former ROC/SQZMOM BUY guard is retired. v21 is produced once by
+`grid-live-guard` and consumed by DCA through the read-only
+`grid-live-fdusd-data` mount. Missing, stale, unauthorized, or hash-invalid v21
+state fails closed for new BUY orders but never blocks SELL or emergency exits.
+
 ## FDUSD live Grid bridge
 
 The FDUSD live Grid scheduler reuses the gateway's approved FOMC leases. It

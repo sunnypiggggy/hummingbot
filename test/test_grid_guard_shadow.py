@@ -17,49 +17,59 @@ class GridGuardShadowTest(unittest.TestCase):
     def test_cached_technical_gate_is_republished_to_new_instance(self, atomic_json):
         guard = Guard.__new__(Guard)
         guard.next_technical_refresh = float("inf")
-        gate = {"source_healthy": True, "buy_enabled": True}
-        guard.state = {"technical_buy_gate": gate}
-        target = Path("instance/data/technical_buy_gate.json")
+        gate = {"schema": "grid-xgboost-long-risk-gate-v1",
+                "model_version": "xgboost-grid-long-risk-gate-v21-250d", "source_healthy": True}
+        guard.state = {"xgboost_risk_gate": gate}
+        guard.technical_gate_path = Path("state/xgboost_risk_gate.json")
+        target = Path("instance/data/xgboost_risk_gate.json")
         guard._technical_gate_targets = Mock(return_value=[target])
 
         self.assertEqual(gate, guard.publish_technical_buy_gate())
         atomic_json.assert_called_once_with(target, gate)
 
     @patch("live_guard.grid_live_guard.atomic_gate_json")
-    @patch("live_guard.grid_live_guard.build_technical_buy_gate")
-    @patch("live_guard.grid_live_guard.roc_sqz_signal_from_klines")
-    @patch("live_guard.grid_live_guard.requests.get")
-    def test_recovery_model_migration_forces_latest_closed_bar_re_evaluation(
-        self, get, signal, build, atomic_json,
+    @patch("live_guard.grid_live_guard.load_runtime_xgboost_gate")
+    def test_guard_distributes_xgboost_contract_without_building_mechanism1(
+        self, load_gate, atomic_json,
     ):
-        server, klines = Mock(), Mock()
-        server.json.return_value = {"serverTime": 1_000_000}
-        klines.json.return_value = [[0, 1, 2, 0.5, 1, 0, 999_000]]
-        get.side_effect = [server, klines]
-        signal.return_value = {"bar_close_time": 999_000}
-        build.return_value = {
-            "source_healthy": True,
-            "risk_off_active": True,
-            "recovery_rule_version": "combined-roc1-sqz3-improving-v1",
-        }
+        with tempfile.TemporaryDirectory() as directory:
+            guard = Guard.__new__(Guard)
+            guard.next_technical_refresh = 0
+            guard.technical_refresh_seconds = 30
+            guard.state = {"xgboost_risk_gate": {}}
+            guard.technical_gate_path = Path(directory) / "xgboost_risk_gate.json"
+            gate = {"schema": "grid-xgboost-long-risk-gate-v1",
+                    "model_version": "xgboost-grid-long-risk-gate-v21-250d", "pairs": {}}
+            guard.v21_producer = Mock()
+            guard.v21_producer.produce.side_effect = lambda observed: guard.technical_gate_path.write_text(
+                __import__("json").dumps(gate), encoding="utf-8"
+            )
+            target = Path(directory) / "instance" / "data" / "xgboost_risk_gate.json"
+            guard._technical_gate_targets = Mock(return_value=[guard.technical_gate_path, target])
+            guard.audit = Mock()
+            load_gate.return_value = {"runtime_gate_healthy": True, "reason": "healthy"}
+
+            self.assertEqual(gate, guard.publish_technical_buy_gate(force=True))
+            atomic_json.assert_called_once_with(target, gate)
+            load_gate.assert_called_once_with(guard.technical_gate_path)
+
+    @patch("live_guard.grid_live_guard.atomic_gate_json")
+    def test_guard_never_distributes_v21_shadow_contract(self, atomic_json):
         guard = Guard.__new__(Guard)
-        guard.next_technical_refresh = 0
-        guard.technical_refresh_seconds = 60
-        guard.state = {"technical_buy_gate": {
-            "risk_off_active": True,
-            "last_evaluated_bar_close_time": 123,
-        }}
-        guard.roc_risk_off_pct = -5
-        guard.sqzmom_risk_off_pct = -1
-        guard.roc_recovery_pct = 1
-        guard.sqzmom_recovery_pct = -3
-        guard._technical_gate_targets = Mock(return_value=[])
-        guard.audit = Mock()
+        guard.next_technical_refresh = float("inf")
+        shadow = {
+            "schema": "grid-xgboost-long-risk-gate-v2",
+            "model_version": "xgboost-grid-long-risk-gate-v21-250d",
+            "shadow_mode": True,
+            "deployment_allowed": False,
+        }
+        guard.state = {"xgboost_risk_gate": shadow}
+        guard.technical_gate_path = Path("state/xgboost_risk_gate.json")
+        guard._technical_gate_targets = Mock(return_value=[
+            guard.technical_gate_path, Path("instance/data/xgboost_risk_gate.json")
+        ])
 
-        guard.publish_technical_buy_gate(force=True)
-
-        self.assertIsNone(build.call_args.kwargs["previous_bar_close_time"])
-        self.assertTrue(guard.audit.call_args.kwargs["model_changed"])
+        self.assertEqual(shadow, guard.publish_technical_buy_gate())
         atomic_json.assert_not_called()
 
     def test_shadow_preflight_uses_no_fill_test_orders(self):

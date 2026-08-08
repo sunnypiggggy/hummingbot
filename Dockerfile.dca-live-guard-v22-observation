@@ -1,0 +1,6 @@
+FROM hummingbot/dca-live-guard:local
+
+COPY live_guard/dca_live_guard_legacy.py /app/dca_live_guard_legacy.py
+COPY scripts/run_guard_with_v22_observation.py /app/run_guard_with_v22_observation.py
+
+CMD ["python", "/app/run_guard_with_v22_observation.py", "--role", "dca", "--guard", "/app/dca_live_guard_legacy.py"]

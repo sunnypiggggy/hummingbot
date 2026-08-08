@@ -1,0 +1,11 @@
+name: grid-deep-risk-py312
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.12.13
+  - pytorch=2.5.1=py3.12_cpu_0
+  - cpuonly=2.0
+  - pip=26.1.2
+  - pip:
+      - -r requirements-grid-deep-risk-py312.txt

@@ -55,6 +55,9 @@ class DManMakerV3MacroConfig(_DManMakerV2Config):
     stop_loss_on_partial_fills: bool = Field(
         default=True, json_schema_extra={"is_updatable": True}
     )
+    shutdown_retry_seconds: float = Field(
+        default=1.0, ge=0.2, le=5.0, json_schema_extra={"is_updatable": True}
+    )
 
     @field_validator("dca_spreads")
     @classmethod
@@ -97,6 +100,8 @@ class DManMakerV3Macro(_DManMakerV2):
             raise ValueError("macro DCA time limit must start at first fill")
         if not new_config.stop_loss_on_partial_fills:
             raise ValueError("macro DCA must protect partial fills with stop loss")
+        if new_config.shutdown_retry_seconds != 1.0:
+            raise ValueError("macro DCA shutdown verification must run every second")
         if new_config.policy_version != "dca-macro-v3":
             raise ValueError("unsupported macro policy version")
         super().update_config(new_config)
@@ -110,6 +115,7 @@ class DManMakerV3Macro(_DManMakerV2):
         config = super().get_executor_config(level_id, price, amount)
         config.time_limit_from_first_fill = self.config.time_limit_from_first_fill
         config.stop_loss_on_partial_fills = self.config.stop_loss_on_partial_fills
+        config.shutdown_retry_seconds = self.config.shutdown_retry_seconds
         return config
 
     def create_actions_proposal(self) -> List[ExecutorAction]:

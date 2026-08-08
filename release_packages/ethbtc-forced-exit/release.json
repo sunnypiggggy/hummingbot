@@ -1,0 +1,22 @@
+{
+  "schema": "ethbtc-forced-exit-release-v1",
+  "package_id": "ethbtc-forced-exit",
+  "execution_policy_version": "v22-risk-off-forced-exit-v2",
+  "release_stage": "offline_release_candidate",
+  "verdict": "NO-GO",
+  "offline_only": true,
+  "deployment_allowed": false,
+  "promotion_authorized": false,
+  "orders_submitted": false,
+  "frozen_model_effective_end": "2026-08-02T15:00:00+00:00",
+  "frozen_model_expired_at_packaging": true,
+  "deployment_blockers": [
+    "frozen v22 historical verdict is NO-GO and promotion is not authorized",
+    "signed weekly coverage ended at 2026-08-02T15:00:00+00:00",
+    "forced-exit-v2 is an offline execution overlay, not a production exchange adapter",
+    "OCI credentials, balances, filters, ownership ledger, alerts, and rollback were not live-verified"
+  ],
+  "integrity_command": "python tools/verify_package.py .",
+  "smoke_test_command": "python tools/smoke_test.py .",
+  "strict_deployment_gate_command": "python tools/verify_package.py . --require-deployable"
+}

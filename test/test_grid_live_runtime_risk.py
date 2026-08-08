@@ -11,7 +11,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from grid_live_common import PairLedger  # noqa: E402
-from walk_forward_portfolio_grid_live import LivePortfolioGrid  # noqa: E402
+from walk_forward_portfolio_grid_live import GridState, LivePortfolioGrid  # noqa: E402
+from risk_recovery import EXITING, trigger_state  # noqa: E402
 
 
 class Order:
@@ -34,12 +35,26 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             portfolio_stop_loss_quote=Decimal("24"),
             portfolio_drawdown_limit_pct=Decimal("0.06"),
             trading_pairs=["BTC-FDUSD", "ETH-FDUSD"],
+            pair_breakers_enabled=True,
+            portfolio_breakers_enabled=True,
+            cost_floor_enabled=True,
+            inventory_exit_enabled=True,
+            max_extra_inventory_quote=Decimal("10"),
+            profit_protection_seconds=24 * 3600,
+            max_extra_inventory_hold_seconds=48 * 3600,
+            take_profit=Decimal("0.006"),
+            min_order_quote=Decimal("5"),
         )
         strategy.ledgers = {
             "BTC-FDUSD": PairLedger.create("BTC-FDUSD", Decimal("0.002")),
             "ETH-FDUSD": PairLedger.create("ETH-FDUSD", Decimal("0.05")),
         }
         strategy.flatten_order_ids = {}
+        strategy.pending_inventory_exit = set()
+        strategy.inventory_exit_order_ids = {}
+        strategy.excess_inventory_started_at = {
+            pair: None for pair in strategy.config.trading_pairs
+        }
         strategy.buy_order_ids = set()
         strategy.sell_order_ids = set()
         strategy.first_cycle_failure_at = None
@@ -60,6 +75,10 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.technical_gate_healthy = True
         strategy.technical_reason = "active"
         strategy.technical_signal = {}
+        strategy.technical_buy_enabled_by_pair = {pair: True for pair in strategy.config.trading_pairs}
+        strategy.technical_gate_healthy_by_pair = {pair: True for pair in strategy.config.trading_pairs}
+        strategy.technical_reason_by_pair = {pair: "active" for pair in strategy.config.trading_pairs}
+        strategy.technical_signal_by_pair = {pair: {} for pair in strategy.config.trading_pairs}
         strategy.technical_transition_key = None
         strategy.runtime_events = []
         return strategy
@@ -92,6 +111,26 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertEqual({"flatten"}, flatten)
         self.assertEqual((set(), set()), strategy._partition_flatten_orders([]))
 
+    def test_breaker_exit_sells_all_managed_base_not_only_inventory_delta(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        strategy.config.trading_pairs = [pair]
+        strategy.ledgers = {pair: strategy.ledgers[pair]}
+        strategy.ledgers[pair].base += Decimal("0.0002")
+        strategy.pending_flatten = {pair}
+        strategy.pair_recovery = {pair: trigger_state(
+            mechanism="strategy_loss_breaker", scope="strategy", now=1000,
+            trigger_value=-6, signal_price=65000, reason="loss",
+        )}
+        strategy.portfolio_recovery = {"phase": "ACTIVE"}
+        submitted = []
+        strategy.sell = lambda exchange, trading_pair, amount, order_type: (
+            submitted.append(amount) or "quote-only-exit"
+        )
+        strategy._restore_inventory({pair: Decimal("65000")})
+        self.assertEqual([Decimal("0.0022")], submitted)
+        self.assertEqual(EXITING, strategy.pair_recovery[pair]["phase"])
+
     def test_terminal_order_events_remove_owned_ids(self):
         strategy = self.strategy()
         strategy.ledgers["BTC-FDUSD"].open_order_ids.add("done")
@@ -99,6 +138,82 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy._forget_order("done")
         self.assertNotIn("done", strategy.ledgers["BTC-FDUSD"].open_order_ids)
         self.assertNotIn("done", strategy.buy_order_ids)
+
+    def test_grid_sell_price_respects_average_cost_floor(self):
+        strategy = self.strategy()
+        strategy.config.trading_pairs = ["BTC-FDUSD"]
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.config.take_profit = Decimal("0.006")
+        strategy.config.min_order_quote = Decimal("5")
+        strategy.config.move_threshold = Decimal("0.015")
+        strategy.config.min_grid_move_seconds = 1800
+        strategy.technical_buy_enabled_by_pair["BTC-FDUSD"] = False
+        ledger = strategy.ledgers["BTC-FDUSD"]
+        ledger.apply_fill("BUY", Decimal("40000"), Decimal("0.001"), Decimal("0"))
+        strategy.ledgers = {"BTC-FDUSD": ledger}
+        strategy.grid_states = {
+            "BTC-FDUSD": GridState(
+                lower=Decimal("39000"), upper=Decimal("41000"),
+                levels=[Decimal("39000"), Decimal("41000")],
+            )
+        }
+        strategy.buy = lambda *args, **kwargs: "buy"
+        submitted = []
+        strategy.sell = lambda exchange, pair, amount, order_type, price: (
+            submitted.append((pair, amount, price)) or "sell"
+        )
+
+        strategy._place_grids({"BTC-FDUSD": Decimal("40000")})
+
+        self.assertEqual(1, len(submitted))
+        self.assertEqual(
+            ledger.minimum_profitable_sell_price(Decimal("0.006")),
+            submitted[0][2],
+        )
+
+    def test_grid_buy_budget_is_capped_at_ten_quote_above_baseline(self):
+        strategy = self.strategy()
+        strategy.config.trading_pairs = ["BTC-FDUSD"]
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.config.move_threshold = Decimal("0.015")
+        strategy.config.min_grid_move_seconds = 1800
+        strategy.ledgers = {"BTC-FDUSD": strategy.ledgers["BTC-FDUSD"]}
+        strategy.grid_states = {"BTC-FDUSD": GridState(
+            lower=Decimal("39000"), upper=Decimal("41000"),
+            levels=[Decimal("39000"), Decimal("41000")],
+        )}
+        submitted = []
+        strategy.buy = lambda exchange, pair, amount, order_type, price: (
+            submitted.append(amount * price) or "buy"
+        )
+        strategy.sell = lambda *args, **kwargs: "sell"
+        strategy._place_grids({"BTC-FDUSD": Decimal("40000")})
+        self.assertEqual([Decimal("10")], submitted)
+
+    def test_cost_floor_relaxes_to_break_even_after_24_hours(self):
+        strategy = self.strategy()
+        strategy.excess_inventory_started_at["BTC-FDUSD"] = (
+            strategy.current_timestamp - 25 * 3600
+        )
+        self.assertEqual(Decimal("0"), strategy._inventory_profit_floor_rate("BTC-FDUSD"))
+
+    def test_48_hour_exit_sells_only_inventory_above_baseline(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        ledger = strategy.ledgers[pair]
+        extra = Decimal("0.0002")
+        ledger.base += extra
+        strategy.excess_inventory_started_at[pair] = strategy.current_timestamp - 48 * 3600
+        submitted = []
+        strategy.sell = lambda exchange, trading_pair, amount, order_type: (
+            submitted.append((trading_pair, amount, order_type)) or "inventory-exit"
+        )
+        self.assertTrue(strategy._process_inventory_exit_policy(
+            {"BTC-FDUSD": Decimal("60000"), "ETH-FDUSD": Decimal("3000")}, []
+        ))
+        self.assertEqual(extra, submitted[0][1])
+        self.assertEqual("inventory-exit", strategy.inventory_exit_order_ids[pair])
+        self.assertEqual(ledger.initial_base + extra, ledger.base)
 
     def test_technical_risk_off_cancels_buy_but_preserves_sell(self):
         strategy = self.strategy()
@@ -146,18 +261,22 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.config.technical_buy_gate_file = "unused"
         strategy.config.technical_buy_gate_max_age_seconds = 150
         strategy.config.technical_buy_fail_closed = True
-        strategy.cancel_owned_buy_orders = lambda: True
-        with patch("walk_forward_portfolio_grid_live.load_runtime_technical_gate", return_value={
+        strategy.config.technical_model_sha256 = ""
+        strategy.config.technical_feature_sha256 = ""
+        strategy.cancel_owned_buy_orders = lambda pair=None: True
+        with patch("walk_forward_portfolio_grid_live.load_runtime_xgboost_gate", return_value={
             "runtime_gate_healthy": True,
-            "buy_enabled": False,
-            "reason": "roc_sqzmom_combined_risk_off",
-            "signal": {"roc_48h_pct": -6, "sqzmom_pct": -2},
+            "reason": "xgboost_gate_healthy",
+            "pairs": {
+                "BTC-FDUSD": {"buy_enabled": False, "reason": "channel_or_risk_off"},
+                "ETH-FDUSD": {"buy_enabled": True, "reason": "all_channels_clear"},
+            },
         }):
             strategy._poll_technical_buy_gate()
         self.assertEqual(0.0, strategy.next_refresh)
         self.assertFalse(strategy.technical_buy_enabled)
         self.assertEqual(
-            "technical_risk_off_unknown_sides_sell_rebuild_scheduled",
+            "xgboost_risk_off_unknown_sides_sell_rebuild_scheduled",
             strategy.runtime_events[-1]["event"],
         )
 
@@ -174,13 +293,17 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.config.technical_buy_gate_file = "unused"
         strategy.config.technical_buy_gate_max_age_seconds = 150
         strategy.config.technical_buy_fail_closed = True
+        strategy.config.technical_model_sha256 = ""
+        strategy.config.technical_feature_sha256 = ""
         strategy.technical_buy_enabled = False
-        strategy.cancel_owned_buy_orders = lambda: True
-        with patch("walk_forward_portfolio_grid_live.load_runtime_technical_gate", return_value={
+        strategy.cancel_owned_buy_orders = lambda pair=None: True
+        with patch("walk_forward_portfolio_grid_live.load_runtime_xgboost_gate", return_value={
             "runtime_gate_healthy": True,
-            "buy_enabled": False,
-            "reason": "roc_sqzmom_combined_risk_off",
-            "signal": {},
+            "reason": "xgboost_gate_healthy",
+            "pairs": {
+                "BTC-FDUSD": {"buy_enabled": False, "reason": "channel_or_risk_off"},
+                "ETH-FDUSD": {"buy_enabled": False, "reason": "channel_or_risk_off"},
+            },
         }):
             strategy._poll_technical_buy_gate()
         self.assertEqual(0.0, strategy.next_refresh)
@@ -212,6 +335,42 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         })
         self.assertTrue(strategy.portfolio_tripped)
         self.assertEqual(set(strategy.config.trading_pairs), strategy.pending_flatten)
+
+    def test_fdusd_mechanisms_1_to_3_do_not_enable_portfolio_breaker(self):
+        strategy = self.strategy()
+        strategy.config.portfolio_breakers_enabled = False
+        for ledger in strategy.ledgers.values():
+            ledger.quote = Decimal("187")
+            ledger.base = Decimal("0")
+            ledger.initial_base = Decimal("0")
+            ledger.peak_equity = Decimal("200")
+        strategy._control_risk({
+            "BTC-FDUSD": Decimal("65000"),
+            "ETH-FDUSD": Decimal("3500"),
+        })
+        self.assertFalse(strategy.portfolio_tripped)
+        # Pair-local breakers still act independently.
+        self.assertEqual(set(strategy.config.trading_pairs), strategy.pending_flatten)
+
+    def test_inventory_cap_is_absent_when_inventory_exit_mechanism_is_disabled(self):
+        strategy = self.strategy()
+        strategy.config.trading_pairs = ["BTC-FDUSD"]
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.config.move_threshold = Decimal("0.015")
+        strategy.config.min_grid_move_seconds = 1800
+        strategy.config.inventory_exit_enabled = False
+        strategy.ledgers = {"BTC-FDUSD": strategy.ledgers["BTC-FDUSD"]}
+        strategy.grid_states = {"BTC-FDUSD": GridState(
+            lower=Decimal("39000"), upper=Decimal("41000"),
+            levels=[Decimal("39000"), Decimal("41000")],
+        )}
+        submitted = []
+        strategy.buy = lambda exchange, pair, amount, order_type, price: (
+            submitted.append(amount * price) or "buy"
+        )
+        strategy.sell = lambda *args, **kwargs: "sell"
+        strategy._place_grids({"BTC-FDUSD": Decimal("40000")})
+        self.assertEqual([Decimal("100")], submitted)
 
 
 if __name__ == "__main__":

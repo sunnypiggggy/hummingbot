@@ -9,7 +9,13 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from validate_grid_live import Candidate, candidates, simulate, slice_window
+from validate_grid_live import (
+    Candidate,
+    InventoryExitPolicy,
+    candidates,
+    simulate,
+    slice_window,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -66,15 +72,21 @@ def pair_risk_triggered(pair_stats: Dict[str, dict]) -> bool:
 
 
 def select_candidate(candles: Dict[str, pd.DataFrame], maker_fee: float,
+                     taker_fee: float | None = None,
                      candidate_pool: Iterable[Candidate] | None = None,
                      require_eligible: bool = True,
                      technical_buy_gate: Dict[int, bool] | None = None,
+                     cost_floor_enabled: bool = True,
+                     inventory_exit_policy: InventoryExitPolicy | None = None,
                      ) -> tuple[Candidate, pd.DataFrame]:
     rows = []
     ranked = []
     for candidate in candidate_pool or candidates():
         result, _, per_pair = simulate(
-            candles, candidate, maker_fee, technical_buy_gate=technical_buy_gate
+            candles, candidate, maker_fee, taker_fee=taker_fee,
+            technical_buy_gate=technical_buy_gate,
+            cost_floor_enabled=cost_floor_enabled,
+            inventory_exit_policy=inventory_exit_policy,
         )
         pair_stop = pair_risk_triggered(per_pair)
         eligible = not bool(result["liquidated"]) and not pair_stop
@@ -104,7 +116,10 @@ def select_candidate(candles: Dict[str, pd.DataFrame], maker_fee: float,
 
 def run_walk_forward(candles: Dict[str, pd.DataFrame], maker_fee: float,
                      start_ts: int, end_ts: int,
+                     taker_fee: float | None = None,
                      technical_buy_gate: Dict[int, bool] | None = None,
+                     cost_floor_enabled: bool = True,
+                     inventory_exit_policy: InventoryExitPolicy | None = None,
                      ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     evaluations = []
     summaries = []
@@ -118,8 +133,11 @@ def run_walk_forward(candles: Dict[str, pd.DataFrame], maker_fee: float,
         selected, candidate_rows = select_candidate(
             training,
             maker_fee,
+            taker_fee=taker_fee,
             require_eligible=False,
             technical_buy_gate=technical_buy_gate,
+            cost_floor_enabled=cost_floor_enabled,
+            inventory_exit_policy=inventory_exit_policy,
         )
         eligible_count = int(candidate_rows.attrs.get("eligible_count", 0))
         candidate_rows.insert(0, "fold", fold)
@@ -127,7 +145,10 @@ def run_walk_forward(candles: Dict[str, pd.DataFrame], maker_fee: float,
         candidate_rows.insert(2, "train_end", train_end)
         evaluations.append(candidate_rows)
         result, _, pair_stats = simulate(
-            testing, selected, maker_fee, technical_buy_gate=technical_buy_gate
+            testing, selected, maker_fee, taker_fee=taker_fee,
+            technical_buy_gate=technical_buy_gate,
+            cost_floor_enabled=cost_floor_enabled,
+            inventory_exit_policy=inventory_exit_policy,
         )
         summaries.append({
             "fold": fold,

@@ -1,0 +1,8 @@
+name: grid-deep-risk-base-cu126-snapshot
+channels:
+  - defaults
+dependencies:
+  - python=3.13.5
+  - pip
+  - pip:
+      - -r requirements-grid-deep-risk-base-cu126.txt
