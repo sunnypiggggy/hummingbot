@@ -23,7 +23,13 @@ def update_status(path: Path, contract: dict, now: float, role: str,
                   error: str | None = None) -> None:
     current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     release = str(contract.get("release_sha256", ""))
-    if release and current.get("release_sha256") != release:
+    valid_release = bool(
+        len(release) == 64
+        and release != "0" * 64
+        and all(character in "0123456789abcdef" for character in release.lower())
+    )
+    if valid_release and current.get("release_sha256") != release:
+        previous_release = current.get("release_sha256")
         current = {
             "schema": "ethbtc-forced-exit-observer-status-v1",
             "release_sha256": release,
@@ -31,21 +37,28 @@ def update_status(path: Path, contract: dict, now: float, role: str,
             "cycles": 0,
             "source_errors": 0,
             "integrity_errors": 0,
+            "previous_release_sha256": previous_release,
+            "release_change_count": int(current.get("release_change_count", 0)) + 1,
         }
     current["last_seen_at"] = now
     current["cycles"] = int(current.get("cycles", 0)) + 1
     current["source_healthy"] = bool(contract.get("runtime_gate_healthy", contract.get("source_healthy")))
     current["execution_authorized"] = bool(contract.get("execution_authorized"))
     if role == "grid":
-        current["event_ids"] = {
+        mapped_events = {
             pair: contract.get("pairs", {}).get(pair, {}).get("event_id")
             for pair in PAIR_MAP.values()
         }
     else:
-        current["event_ids"] = {
+        mapped_events = {
             pair: contract.get("pairs", {}).get(source, {}).get("event_id")
             for pair, source in PAIR_MAP.items()
         }
+    # A failed runtime view deliberately carries an all-zero synthetic release
+    # and event IDs. Keep the last healthy parity evidence while counting the
+    # failure; otherwise one transient error can erase the 24h audit window.
+    if valid_release and all(mapped_events.values()):
+        current["event_ids"] = mapped_events
     if error:
         category = "source_errors" if any(
             marker in error.lower() for marker in ("timeout", "connection", "temporarily")

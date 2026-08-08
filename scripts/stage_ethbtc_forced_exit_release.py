@@ -60,6 +60,14 @@ def main() -> int:
     )
     if execution_policy.get("package_id") != PACKAGE_ID:
         raise RuntimeError("lineage execution policy package mismatch")
+    documentation = args.lineage_package / "documentation"
+    if not documentation.is_dir() or not (documentation / "README.md").is_file():
+        raise RuntimeError("release lineage documentation is missing")
+    documentation_hashes = {
+        path.relative_to(documentation).as_posix(): sha256_file(path)
+        for path in sorted(documentation.rglob("*")) if path.is_file()
+    }
+    documentation_sha256 = canonical_hash(documentation_hashes)
     identity = {
         "package_id": PACKAGE_ID,
         "execution_policy_version": EXECUTION_POLICY_VERSION,
@@ -73,6 +81,7 @@ def main() -> int:
         "effective_end": int(source_lock["effective_end"]),
         "execution_policy_sha256": execution_policy["execution_policy_sha256"],
         "lineage_manifest_sha256": sha256_file(args.lineage_package / "MANIFEST.sha256"),
+        "documentation_sha256": documentation_sha256,
     }
     release_sha = canonical_hash(identity)
     target = args.release_root / release_sha
@@ -91,6 +100,7 @@ def main() -> int:
         atomic_json(staged_lock_path, staged_lock)
         shutil.copy2(args.lineage_package / "evidence/execution_policy.json",
                      staging / "execution_policy.json")
+        shutil.copytree(documentation, staging / "documentation")
         production = {
             "schema": "ethbtc-forced-exit-production-lock-v1",
             **identity, "release_sha256": release_sha,

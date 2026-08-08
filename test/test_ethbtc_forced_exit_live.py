@@ -144,3 +144,24 @@ def test_observation_status_maps_the_same_events_without_authorizing(tmp_path: P
     assert grid["execution_authorized"] is False
     assert grid["event_ids"]["BTC-FDUSD"] == dca["event_ids"]["BTC-USDT"]
     assert grid["event_ids"]["ETH-FDUSD"] == dca["event_ids"]["ETH-USDT"]
+
+
+def test_failed_runtime_does_not_erase_observation_window(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    path = tmp_path / "status.json"
+    healthy = contract(now)
+    healthy["runtime_gate_healthy"] = True
+    update_status(path, healthy, now, "grid")
+    before = json.loads(path.read_text(encoding="utf-8"))
+    failed = {
+        "release_sha256": "0" * 64,
+        "runtime_gate_healthy": False,
+        "execution_authorized": False,
+        "pairs": {},
+    }
+    update_status(path, failed, now + 30, "grid", "timeout")
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert after["release_sha256"] == healthy["release_sha256"]
+    assert after["started_at"] == before["started_at"]
+    assert after["event_ids"] == before["event_ids"]
+    assert after["source_errors"] == 1

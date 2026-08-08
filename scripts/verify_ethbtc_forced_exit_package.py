@@ -21,6 +21,23 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_hash(value: object) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def documentation_hash(package_dir: Path) -> str:
+    documentation = package_dir / "documentation"
+    if not documentation.is_dir() or not (documentation / "README.md").is_file():
+        raise ValueError("release documentation is missing")
+    hashes = {
+        path.relative_to(documentation).as_posix(): sha256_file(path)
+        for path in sorted(documentation.rglob("*"))
+        if path.is_file()
+    }
+    return canonical_hash(hashes)
+
+
 def parse_manifest(path: Path) -> dict[str, str]:
     entries: dict[str, str] = {}
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -66,6 +83,7 @@ def verify(package_dir: Path, require_deployable: bool = False) -> dict[str, obj
         lock_path = package_dir / "shadow_package/shadow_lock.json"
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
         model = package_dir / "shadow_package/models/xgboost_long_risk_gate_v22_weekly.joblib"
+        expected_documentation_sha = production.get("documentation_sha256")
         checks = {
             "package_id": production.get("package_id") == PACKAGE_ID == release.get("package_id"),
             "release_sha": production.get("release_sha256") == release.get("release_sha256"),
@@ -76,6 +94,13 @@ def verify(package_dir: Path, require_deployable: bool = False) -> dict[str, obj
             "effective_end": int(lock.get("effective_end", 0)) == int(production.get("effective_end", -1)),
             "fallback_forbidden": production.get("previous_model_fallback_allowed") is False,
             "candidate_closed": production.get("deployment_allowed") is False,
+            # Releases staged before documentation became part of the release
+            # identity remain verifiable and immutable. All newer releases bind
+            # the complete UTF-8 documentation tree to the production lock.
+            "documentation_sha": (
+                expected_documentation_sha is None
+                or documentation_hash(package_dir) == expected_documentation_sha
+            ),
         }
         if not all(checks.values()):
             raise ValueError(f"production candidate validation failed: {checks}")
