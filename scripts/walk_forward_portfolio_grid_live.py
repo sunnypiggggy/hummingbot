@@ -7,9 +7,11 @@ reserved quote and base inventory.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import signal
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -42,6 +44,7 @@ from scripts.grid_live_common import (
     PAIR_LOSS_LIMIT,
     PORTFOLIO_DRAWDOWN_LIMIT_PCT,
     RISK_STATE_PERSIST_SECONDS,
+    STARTUP_ORDER_RECONCILE_SECONDS,
     RESERVE_QUOTE,
     SIDE_BUDGET,
     STRATEGY_BUDGET,
@@ -103,6 +106,7 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
     profit_protection_seconds: int = 24 * 60 * 60
     max_extra_inventory_hold_seconds: int = 48 * 60 * 60
     risk_state_persist_seconds: int = RISK_STATE_PERSIST_SECONDS
+    startup_order_reconcile_seconds: int = STARTUP_ORDER_RECONCILE_SECONDS
     portfolio_stop_loss_quote: Decimal = BOT_LOSS_LIMIT
     pair_stop_loss_quote: Decimal = PAIR_LOSS_LIMIT
     portfolio_drawdown_limit_pct: Decimal = PORTFOLIO_DRAWDOWN_LIMIT_PCT
@@ -177,6 +181,8 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
                 raise ValueError("Extra inventory maximum holding time must be exactly 48 hours.")
         if self.risk_state_persist_seconds != RISK_STATE_PERSIST_SECONDS:
             raise ValueError("Live Grid risk state must be persisted every 5 seconds.")
+        if self.startup_order_reconcile_seconds != STARTUP_ORDER_RECONCILE_SECONDS:
+            raise ValueError("Live Grid startup order reconciliation must last exactly 30 seconds.")
         if set(self.reserved_base_by_pair) != set(self.trading_pairs):
             raise ValueError("Every pair requires a dedicated positive base reservation.")
         if any(value <= 0 for value in self.reserved_base_by_pair.values()):
@@ -282,13 +288,31 @@ class LivePortfolioGrid(StrategyV2Base):
         self.next_technical_poll = 0.0
         self.technical_transition_key: Optional[tuple] = None
         self.runtime_events: List[Dict[str, Any]] = []
+        # Process-local by design: every process start must reconcile exchange
+        # orders before it is allowed to create a fresh grid.  Persisting this
+        # flag would let a restart bypass the safety window.
+        self.startup_reconcile_started_at: Optional[float] = None
+        self.startup_reconcile_quiet_cycles = 0
+        self.startup_reconcile_cancel_attempts: Dict[str, float] = {}
+        self.startup_reconcile_complete = False
+        self._termination_signal_received: Optional[int] = None
+        self._termination_task: Optional[asyncio.Task] = None
+        self._termination_loop: Optional[asyncio.AbstractEventLoop] = None
         self._restore_state()
+        self._install_termination_signal_handlers()
 
     @property
     def connector(self) -> ConnectorBase:
         return self.connectors[self.config.exchange]
 
     def on_tick(self):
+        # StrategyV2Base.on_stop() sets this flag before its asynchronous
+        # executor cleanup. This custom on_tick must honor it explicitly;
+        # otherwise the clock can recreate orders after shutdown cancellation
+        # and leave them orphaned for the next process. Order cancellation is
+        # deliberately left to TradingCore.shutdown so it has one writer.
+        if getattr(self, "_is_stop_triggered", False):
+            return
         # The environment switch is a deployment-time interlock. Hummingbot API
         # instances do not inherit the manager container's environment, so the
         # immutable, validated per-instance config is the runtime authority.
@@ -298,6 +322,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.logger().warning("Live grid is disabled; owned orders are cancelled and no orders will be submitted.")
                 self.disabled_logged = True
             return
+
         if self.config.bootstrap_from_quote and not self.config.bootstrap_completed:
             self.logger().error("Quote-only inventory bootstrap is incomplete; live orders are blocked.")
             self.cancel_owned_orders()
@@ -345,6 +370,11 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.first_cycle_failure_at = None
                 return
 
+            if self._startup_order_reconciliation(active):
+                self._persist(prices)
+                self.first_cycle_failure_at = None
+                return
+
             self._poll_parameter_update()
             if self.pending_parameters is not None:
                 if self._owned_active_orders(active):
@@ -386,6 +416,67 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.portfolio_tripped = True
                 self.pending_flatten.update(self.config.trading_pairs)
                 self.cancel_owned_orders()
+
+    def _install_termination_signal_handlers(self) -> None:
+        """Make Docker SIGTERM follow Hummingbot's graceful shutdown path.
+
+        The headless quickstart process is PID 1 and does not install a SIGTERM
+        handler. Linux consequently ignores Docker's default stop signal for
+        that process. Registering on the running asyncio loop keeps order
+        cancellation and database cleanup inside the normal event loop.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._termination_loop = loop
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(signum, self._request_termination, signum)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # add_signal_handler is unavailable on Windows and can only be
+                # installed from the main thread. OCI runs Linux/main-thread.
+                continue
+
+    def _request_termination(self, signum: int) -> None:
+        if self._termination_signal_received is not None:
+            return
+        self._termination_signal_received = int(signum)
+        self._is_stop_triggered = True
+        self.logger().warning(
+            "Termination signal %s received; blocking new Grid orders and winding down.",
+            signum,
+        )
+        loop = self._termination_loop
+        if loop is not None and loop.is_running():
+            self._termination_task = loop.create_task(self._graceful_signal_shutdown())
+
+    async def _graceful_signal_shutdown(self) -> None:
+        """Cancel orders, stop the trading core, then terminate PID 1.
+
+        ``run_headless`` otherwise remains in its infinite keep-alive loop even
+        after the trading core has stopped, so Docker would eventually SIGKILL
+        it. The hard process exit happens only after the bounded graceful
+        shutdown attempt.
+        """
+        exit_code = 0
+        try:
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+
+            app = HummingbotApplication.main_application()
+            completed = await asyncio.wait_for(
+                app.trading_core.shutdown(skip_order_cancellation=False),
+                timeout=35,
+            )
+            if not completed:
+                exit_code = 1
+                self.logger().error("Trading core reported an incomplete Grid shutdown.")
+        except Exception:
+            exit_code = 1
+            self.logger().exception("Grid graceful signal shutdown failed.")
+        finally:
+            logging.shutdown()
+            os._exit(exit_code)
 
     def _poll_macro_gate(self) -> None:
         if not self.config.macro_gate_enabled:
@@ -590,6 +681,10 @@ class LivePortfolioGrid(StrategyV2Base):
         self.logger().warning("Activated live-grid parameter version %s.", self.active_parameter_version)
 
     def _place_grids(self, prices: Dict[str, Decimal]) -> None:
+        # Exchange available balances already exclude quantities locked by
+        # orders from a previous process.  Ledger budgets retain strategy
+        # ownership; the exchange balances add a second, real-time cap.
+        remaining_quote = self._available_balance(self.config.quote_asset)
         for pair in self.config.trading_pairs:
             ledger = self.ledgers[pair]
             if ledger.halted:
@@ -614,7 +709,7 @@ class LivePortfolioGrid(StrategyV2Base):
                     baseline_deficit_quote + self.config.max_extra_inventory_quote - extra_quote,
                     Decimal("0"),
                 ))
-            buy_budget = min(buy_limits)
+            buy_budget = min(*buy_limits, remaining_quote)
             if lower_levels and self.technical_buy_enabled_by_pair.get(pair, False):
                 # Do not silently disable BUY when the position-protection
                 # budget is valid in aggregate but splitting it across every
@@ -634,7 +729,16 @@ class LivePortfolioGrid(StrategyV2Base):
                                             OrderType.LIMIT_MAKER, level)
                         ledger.open_order_ids.add(order_id)
                         self.buy_order_ids.add(order_id)
-            sell_budget = min(max(ledger.base, Decimal("0")), ledger.initial_base)
+                    remaining_quote = max(
+                        remaining_quote - order_quote * Decimal(len(selected_lower_levels)),
+                        Decimal("0"),
+                    )
+            base_asset = pair.split("-", 1)[0]
+            sell_budget = min(
+                max(ledger.base, Decimal("0")),
+                ledger.initial_base,
+                self._available_balance(base_asset),
+            )
             if upper_levels and sell_budget > 0:
                 amount = sell_budget / Decimal(len(upper_levels))
                 cost_floor = (
@@ -655,6 +759,83 @@ class LivePortfolioGrid(StrategyV2Base):
                                              OrderType.LIMIT_MAKER, sell_price)
                         ledger.open_order_ids.add(order_id)
                         self.sell_order_ids.add(order_id)
+
+    def _available_balance(self, asset: str) -> Decimal:
+        value = Decimal(str(self.connector.get_available_balance(asset)))
+        if not value.is_finite():
+            raise RuntimeError(f"Non-finite available balance for {asset}")
+        return max(value, Decimal("0"))
+
+    def _strategy_pair_active_orders(self, active_orders: list | None = None) -> list:
+        """Return all connector-tracked orders on Grid's pair-exclusive symbols."""
+        candidates = list(active_orders or [])
+        candidates.extend(list(getattr(self.connector, "limit_orders", []) or []))
+        pairs = set(self.config.trading_pairs)
+        by_id = {}
+        for order in candidates:
+            order_id = str(getattr(order, "client_order_id", ""))
+            pair = str(getattr(order, "trading_pair", ""))
+            if order_id and pair in pairs:
+                by_id[order_id] = order
+        return list(by_id.values())
+
+    def cancel_strategy_pair_orders(self, active_orders: list | None = None) -> int:
+        # BTC/ETH-FDUSD are reserved exclusively for this Grid strategy.  This
+        # intentionally includes connector-restored orders absent from the
+        # latest runtime-state write (for example, an abrupt kill mid-tick).
+        orders = self._strategy_pair_active_orders(active_orders)
+        attempts = getattr(self, "shutdown_cancel_attempts", {})
+        now = self.current_timestamp
+        for order in orders:
+            last_attempt = attempts.get(order.client_order_id)
+            if last_attempt is not None and now - float(last_attempt) < 5:
+                continue
+            self.cancel(
+                self.config.exchange, order.trading_pair, order.client_order_id,
+            )
+            attempts[order.client_order_id] = now
+        self.shutdown_cancel_attempts = attempts
+        return len(orders)
+
+    def _startup_order_reconciliation(self, active_orders: list) -> bool:
+        if self.startup_reconcile_complete:
+            return False
+        now = self.current_timestamp
+        if self.startup_reconcile_started_at is None:
+            self.startup_reconcile_started_at = now
+            self._record_runtime_event(
+                "startup_order_reconciliation_started",
+                wait_seconds=self.config.startup_order_reconcile_seconds,
+            )
+        orders = self._strategy_pair_active_orders(active_orders)
+        if orders:
+            self.startup_reconcile_quiet_cycles = 0
+            for order in orders:
+                last_attempt = self.startup_reconcile_cancel_attempts.get(
+                    order.client_order_id,
+                )
+                if last_attempt is not None and now - last_attempt < 5:
+                    continue
+                self.cancel(
+                    self.config.exchange, order.trading_pair, order.client_order_id,
+                )
+                self.startup_reconcile_cancel_attempts[order.client_order_id] = now
+        else:
+            self.startup_reconcile_quiet_cycles += 1
+        elapsed = now - self.startup_reconcile_started_at
+        if (
+            elapsed >= self.config.startup_order_reconcile_seconds
+            and self.startup_reconcile_quiet_cycles >= 3
+        ):
+            self.startup_reconcile_complete = True
+            self.next_refresh = 0.0
+            self._record_runtime_event(
+                "startup_order_reconciliation_complete",
+                elapsed_seconds=elapsed,
+                cancelled_order_ids=sorted(self.startup_reconcile_cancel_attempts),
+            )
+            return False
+        return True
 
     def _inventory_profit_floor_rate(self, pair: str) -> Decimal:
         started = self.excess_inventory_started_at.get(pair)

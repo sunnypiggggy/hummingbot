@@ -420,14 +420,19 @@ class Guard:
                 mechanism == "fomc_gate" and not bool(details.get("sell_enabled"))
             )
             transition = "TRIGGERED" if blocked else "RECOVERED"
+            if mechanism == "v22_weekly_buy_gate":
+                phase_from = "RISK_ON" if blocked else "RISK_OFF"
+                phase_to = "RISK_OFF" if blocked else "RISK_ON"
+            else:
+                phase_from = "ACTIVE" if blocked else "RESTRICTED"
+                phase_to = "RESTRICTED" if blocked else "ACTIVE"
             append_event(path, build_event(
                 source="dca-live-guard", strategy="dca",
                 bot=str(details.get("bot", "")), pair=str(details.get("pair", "")),
                 mechanism=mechanism, transition=transition,
                 reason=str(details.get("reason") or audit_event),
                 severity="warning" if blocked else "info",
-                phase_from="ACTIVE" if blocked else "REENTRY",
-                phase_to="RISK_OFF" if blocked else "ACTIVE",
+                phase_from=phase_from, phase_to=phase_to,
                 action=("aggregate_gate_blocks_orders" if blocked
                         else "await_remaining_gates"),
                 trigger_value=details.get("probability"),
@@ -440,6 +445,12 @@ class Guard:
                     "buy_enabled": details.get("buy_enabled"),
                     "sell_enabled": details.get("sell_enabled"),
                     "source_pair": details.get("source_pair"),
+                    "effective_buy_enabled": details.get("effective_buy_enabled"),
+                    "effective_sell_enabled": details.get("effective_sell_enabled"),
+                    "recovery_phase": details.get("recovery_phase"),
+                    "execution_applied": details.get("execution_applied"),
+                    "controller_update_status": details.get("controller_update_status"),
+                    "controller_update_error": details.get("controller_update_error"),
                 },
             ))
             return
@@ -889,44 +900,58 @@ class Guard:
                 "v22_event_id": technical.get("event_id"),
             }
             previous_bot = previous_bots.get(bot_name, {})
-            if (
+            macro_changed = (
                 previous_macro.get("buy_enabled") != macro.get("buy_enabled")
                 or previous_macro.get("sell_enabled") != macro.get("sell_enabled")
                 or previous_macro.get("healthy") != macro.get("healthy")
-            ):
+            )
+            v22_changed = (
+                previous_bot.get("v22_buy_enabled") != technical.get("buy_enabled")
+                or previous_bot.get("v22_event_id") != technical.get("event_id")
+            )
+            controller_result: Dict[str, Any] = {"status": "observation_only"}
+            controller_error = ""
+            if risk_actions_enabled:
+                try:
+                    controller_result = self._set_effective_gates(
+                        bot_name, snapshot, buy_enabled=buy_enabled,
+                        sell_enabled=sell_enabled, reasons=reasons,
+                    )
+                    if controller_result["status"] != "unchanged":
+                        self._audit("aggregate_gate_update", bot=bot_name,
+                                    desired=aggregate["bots"][bot_name], result=controller_result)
+                except Exception as exc:
+                    controller_error = repr(exc)
+                    controller_result = {"status": "failed"}
+                    self._audit("aggregate_gate_update_failed", bot=bot_name,
+                                desired=aggregate["bots"][bot_name], error=controller_error)
+            common_transition_details = {
+                "effective_buy_enabled": buy_enabled,
+                "effective_sell_enabled": sell_enabled,
+                "recovery_phase": recovery["phase"],
+                "execution_applied": bool(risk_actions_enabled and not controller_error),
+                "controller_update_status": controller_result.get("status", "unknown"),
+                "controller_update_error": controller_error,
+            }
+            if macro_changed:
                 self._audit(
                     "fomc_gate_transition", bot=bot_name, pair=pair,
                     buy_enabled=macro["buy_enabled"], sell_enabled=macro["sell_enabled"],
-                    reason=macro["reason"],
+                    reason=macro["reason"], **common_transition_details,
                     correlation_id="|".join(macro.get("active_lease_ids", []))
                     or f"fomc:{macro['buy_enabled']}:{macro['sell_enabled']}:{macro['reason']}",
                 )
-            if (
-                previous_bot.get("v22_buy_enabled") != technical.get("buy_enabled")
-                or previous_bot.get("v22_event_id") != technical.get("event_id")
-            ):
+            if v22_changed:
                 self._audit(
                     "v22_gate_transition", bot=bot_name, pair=pair,
                     buy_enabled=technical["buy_enabled"], sell_enabled=True,
                     reason=technical["reason"], probability=technical.get("probability"),
                     source_pair=technical.get("source_pair"),
+                    **common_transition_details,
                     release_sha256=v21.get("release_sha256", ""),
                     model_sha256=v21.get("model_sha256", ""),
                     correlation_id=technical.get("event_id") or "",
                 )
-            if not risk_actions_enabled:
-                continue
-            try:
-                result = self._set_effective_gates(
-                    bot_name, snapshot, buy_enabled=buy_enabled,
-                    sell_enabled=sell_enabled, reasons=reasons,
-                )
-                if result["status"] != "unchanged":
-                    self._audit("aggregate_gate_update", bot=bot_name,
-                                desired=aggregate["bots"][bot_name], result=result)
-            except Exception as exc:
-                self._audit("aggregate_gate_update_failed", bot=bot_name,
-                            desired=aggregate["bots"][bot_name], error=repr(exc))
         self.state["gate_aggregate"] = aggregate
 
     @staticmethod

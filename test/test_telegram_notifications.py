@@ -16,6 +16,7 @@ from live_guard.telegram_notifications import (
     TelegramOutbox,
     append_event,
     build_event,
+    explain_event,
     format_event,
     hermes_recovery_prompt,
     render_mobile_profit_card,
@@ -225,6 +226,113 @@ def test_latched_prompt_contains_binding_but_no_secret_or_command():
     assert value["event_id"] in prompt
     assert "release=" in prompt and "model=" in prompt
     assert "Token" not in prompt and "reset --" not in prompt
+
+
+def test_risk_event_message_explains_cause_and_follow_up_impact_in_one_line():
+    value = event(
+        strategy="grid", mechanism="strategy_drawdown_breaker",
+        transition="TRIGGERED", reason="drawdown 3.01% >= 3.00%",
+        action="cancel_orders_and_flatten",
+    )
+    explanation = explain_event(value)
+    assert explanation.startswith("解释：由于单机器人权益从峰值回撤达到策略保护条件")
+    assert "原始原因：drawdown 3.01% >= 3.00%" in explanation
+    assert "停止新增订单、撤销活动订单并退出归属库存" in explanation
+    assert explanation.count("\n") == 0 and explanation.endswith("。")
+    message = format_event(value)
+    assert explanation in message
+    assert message.index("原因：") < message.index("解释：") < message.index("动作：")
+
+    multiline = event(reason="first line\nsecond line")
+    assert "\n" not in explain_event(multiline)
+
+
+def test_recovered_explanation_never_claims_all_gates_are_open():
+    value = event(
+        strategy="dca", mechanism="v22_weekly_buy_gate",
+        transition="RECOVERED", reason="weekly signal returned risk-on",
+        phase_from="REENTRY", phase_to="ACTIVE",
+        details={
+            "buy_enabled": True,
+            "effective_buy_enabled": True,
+            "effective_sell_enabled": True,
+            "recovery_phase": "ACTIVE",
+            "execution_applied": True,
+            "controller_update_status": "applied",
+        },
+    )
+    explanation = explain_event(value)
+    assert "v22 BUY 门=放行（Risk-On）" in explanation
+    assert "DCA 聚合门 BUY=放行、SELL=放行" in explanation
+    assert "交易正常" in explanation
+
+
+def test_dca_v22_recovered_but_another_gate_still_blocks_buy_is_explicit():
+    value = event(
+        strategy="dca", mechanism="v22_weekly_buy_gate",
+        transition="RECOVERED", reason="long_risk_gate_clear",
+        phase_from="RISK_OFF", phase_to="RISK_ON",
+        details={
+            "buy_enabled": True,
+            "effective_buy_enabled": False,
+            "effective_sell_enabled": True,
+            "recovery_phase": "COOLDOWN",
+            "execution_applied": True,
+            "controller_update_status": "unchanged",
+        },
+    )
+    explanation = explain_event(value)
+    assert "v22 BUY 门=放行（Risk-On）" in explanation
+    assert "DCA 聚合门 BUY=阻止、SELL=放行" in explanation
+    assert "不会创建新的普通 BUY executor" in explanation
+    assert "交易处于受限状态" in explanation
+
+
+def test_dca_v22_legacy_event_without_aggregate_state_does_not_guess():
+    value = event(
+        strategy="dca", mechanism="v22_weekly_buy_gate",
+        transition="RECOVERED", reason="long_risk_gate_clear",
+    )
+    explanation = explain_event(value)
+    assert "v22 BUY 门=放行（Risk-On）" in explanation
+    assert "不能据此判断交易是否正常" in explanation
+
+
+def test_dca_v22_producer_preserves_aggregate_and_controller_state():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "events.jsonl"
+        guard = DcaGuard.__new__(DcaGuard)
+        guard.notification_path = path
+        guard._emit_notification("v22_gate_transition", {
+            "bot": "dca-live-btcusdt-200",
+            "pair": "BTC-USDT",
+            "buy_enabled": True,
+            "sell_enabled": True,
+            "effective_buy_enabled": False,
+            "effective_sell_enabled": True,
+            "recovery_phase": "COOLDOWN",
+            "execution_applied": True,
+            "controller_update_status": "unchanged",
+            "reason": "long_risk_gate_clear",
+            "correlation_id": "v22-btc-event",
+        })
+        value = json.loads(path.read_text(encoding="utf-8"))
+        assert value["phase_from"] == "RISK_OFF"
+        assert value["phase_to"] == "RISK_ON"
+        assert value["details"]["effective_buy_enabled"] is False
+        assert value["details"]["effective_sell_enabled"] is True
+        assert value["details"]["recovery_phase"] == "COOLDOWN"
+        assert value["details"]["execution_applied"] is True
+
+
+def test_integrity_latched_explanation_requires_manual_recovery():
+    value = event(
+        mechanism="infrastructure_integrity_breaker", transition="LATCHED",
+        reason="contract hash mismatch", requires_manual_action=True,
+    )
+    explanation = explain_event(value)
+    assert "完整性检查失败" in explanation
+    assert "Hermes 或 OCI 的人工复核" in explanation
 
 
 def test_dca_recovery_lifecycle_emits_each_transition_and_manual_reentry_prompt():

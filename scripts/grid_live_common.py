@@ -61,6 +61,7 @@ COMBINED_LOSS_LIMIT = Decimal("80")
 MIN_ORDER_QUOTE = Decimal("5.25")
 ORDER_REFRESH_SECONDS = 2 * 60 * 60
 RISK_STATE_PERSIST_SECONDS = 5
+STARTUP_ORDER_RECONCILE_SECONDS = 30
 PAIR_DRAWDOWN_LIMIT_PCT = Decimal("0.03")
 PORTFOLIO_DRAWDOWN_LIMIT_PCT = Decimal("0.06")
 CONFIRMATION = "LIVE-GRID-FDUSD-400"
@@ -353,6 +354,7 @@ def build_live_config(portfolio: GridPortfolio, prices: Mapping[str, Decimal], m
         "profit_protection_seconds": 86400,
         "max_extra_inventory_hold_seconds": 172800,
         "risk_state_persist_seconds": RISK_STATE_PERSIST_SECONDS,
+        "startup_order_reconcile_seconds": STARTUP_ORDER_RECONCILE_SECONDS,
         "portfolio_stop_loss_quote": float(budget.portfolio_loss_limit),
         "pair_stop_loss_quote": float(budget.pair_loss_limit),
         "portfolio_drawdown_limit_pct": float(PORTFOLIO_DRAWDOWN_LIMIT_PCT),
@@ -420,6 +422,8 @@ def validate_live_config(config: Mapping[str, Any]) -> None:
             raise ValueError("Live Grid extra inventory must Taker-exit after exactly 48 hours.")
     if int(config.get("risk_state_persist_seconds", 0)) != RISK_STATE_PERSIST_SECONDS:
         raise ValueError("Live Grid risk state must be persisted every 5 seconds.")
+    if int(config.get("startup_order_reconcile_seconds", 0)) != STARTUP_ORDER_RECONCILE_SECONDS:
+        raise ValueError("Live Grid startup order reconciliation must last exactly 30 seconds.")
     reservations = config.get("reserved_base_by_pair", {})
     if set(reservations) != set(PORTFOLIOS[quote].pairs):
         raise ValueError("Every live pair requires an explicit base reservation.")

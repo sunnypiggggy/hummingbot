@@ -35,6 +35,15 @@ RECOVERED`，以及 `LATCHED`、`EXIT_DELAY` 和 `ACTION_FAILED`。生产者使�
 源事件 ID 或触发时间作为 `correlation_id`。SQLite outbox 以事件 ID、附件哈希和
 频道 ID 幂等去重；重启不会重复发送已经成功的内容。
 
+每条 Grid/DCA 风控事件在原始“原因”字段后增加自然语言解释。DCA 的 v22 事件
+必须明确列出：v22 BUY 门当前为“放行（Risk-On）”还是“阻止（Risk-Off）”、
+恢复阶段、最终 DCA 聚合门的 BUY/SELL 状态、controller 更新是否已落地，以及
+“交易正常”或“交易受限”的结论。只有聚合 BUY/SELL 均放行、恢复阶段为
+`ACTIVE` 且 controller 更新已确认时，才允许写“交易正常”；缺字段时必须写明
+“不能据此判断”，不得猜测。其他机制的后续影响按
+`TRIGGERED/EXITING/EXIT_COMPLETE/COOLDOWN/REENTRY/RECOVERED/LATCHED/EXIT_DELAY/ACTION_FAILED`
+分别生成；`RECOVERED` 只表示当前机制解除，不能表述成全部风控门已经放行。
+
 Telegram 失败不进入交易决策链。待发送项指数退避重试，并保存发送时间、消息
 ID、重试次数和最终错误；发送器按单频道限速。
 

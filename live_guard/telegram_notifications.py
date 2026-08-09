@@ -148,6 +148,108 @@ def hermes_recovery_prompt(event: Mapping[str, Any]) -> str:
     )
 
 
+MECHANISM_EXPLANATIONS = {
+    "v22_weekly_buy_gate": "v22 周度模型信号改变了该交易对的 BUY 风险状态",
+    "fomc_gate": "FOMC 宏观租约改变了交易方向权限",
+    "strategy_loss_breaker": "单机器人累计亏损达到策略保护条件",
+    "strategy_drawdown_breaker": "单机器人权益从峰值回撤达到策略保护条件",
+    "portfolio_loss_breaker": "同一策略的 BTC/ETH 组合累计亏损达到组合保护条件",
+    "portfolio_drawdown_breaker": "同一策略的 BTC/ETH 组合权益回撤达到组合保护条件",
+    "position_protection": "机器人归属持仓达到止损或异常持仓保护条件",
+    "infrastructure_integrity_breaker": "模型、合同、行情、API 或数据完整性检查失败",
+}
+
+
+def explain_event(event: Mapping[str, Any]) -> str:
+    """Return one plain-language sentence covering cause and next impact."""
+    mechanism = str(event.get("mechanism", ""))
+    strategy = str(event.get("strategy", "")).lower()
+    transition = str(event.get("transition", "")).upper()
+    reason = " ".join(str(event.get("reason") or "未提供原始原因").split())
+    cause = MECHANISM_EXPLANATIONS.get(mechanism, "该风控机制的状态发生变化")
+    details = event.get("details", {})
+    details = details if isinstance(details, Mapping) else {}
+
+    if mechanism == "v22_weekly_buy_gate" and strategy == "dca":
+        mechanism_buy = details.get("buy_enabled")
+        if mechanism_buy is None:
+            mechanism_buy = transition == "RECOVERED"
+        gate_state = "放行（Risk-On）" if mechanism_buy else "阻止（Risk-Off）"
+        effective_buy = details.get("effective_buy_enabled")
+        effective_sell = details.get("effective_sell_enabled")
+        recovery_phase = str(details.get("recovery_phase") or event.get("phase_to") or "未知")
+        execution_applied = details.get("execution_applied")
+        controller_status = str(details.get("controller_update_status") or "未提供")
+        state = f"当前状态：v22 BUY 门={gate_state}，恢复阶段={recovery_phase}"
+        if effective_buy is None or effective_sell is None or execution_applied is None:
+            impact = (
+                "影响：事件没有携带 DCA 聚合门和控制器落地结果，"
+                "只能确认本机制状态，不能据此判断交易是否正常"
+            )
+        elif not execution_applied:
+            impact = (
+                "影响：控制器更新未确认"
+                f"（状态={controller_status}），按 Fail-Closed 视为交易未正常恢复"
+            )
+        elif bool(effective_buy) and bool(effective_sell) and recovery_phase == "ACTIVE":
+            impact = (
+                "影响：DCA 聚合门 BUY=放行、SELL=放行；"
+                "可正常创建普通 BUY executor并执行SELL，交易正常"
+            )
+        elif not bool(effective_buy):
+            sell_text = "放行" if effective_sell else "阻止"
+            impact = (
+                f"影响：DCA 聚合门 BUY=阻止、SELL={sell_text}；"
+                "不会创建新的普通 BUY executor，交易处于受限状态"
+            )
+        else:
+            impact = (
+                "影响：DCA 聚合门 BUY=放行、SELL=阻止；"
+                "不能视为双侧正常交易"
+            )
+        return f"解释：由于{cause}（原始原因：{reason}）。{state}。{impact}。"
+
+    if transition == "TRIGGERED":
+        if mechanism == "v22_weekly_buy_gate":
+            impact = "后续该交易对停止新增普通 BUY，并在已授权时进入撤单和归属库存退出流程"
+        elif mechanism == "fomc_gate":
+            buy = details.get("buy_enabled")
+            sell = details.get("sell_enabled")
+            if buy is not None or sell is not None:
+                impact = (
+                    "后续仅按当前方向门执行"
+                    f"（BUY={'放行' if buy else '关闭'}、SELL={'放行' if sell else '关闭'}）"
+                )
+            else:
+                impact = "后续受限方向停止创建新交易，直至宏观租约结束或撤销"
+        elif mechanism == "infrastructure_integrity_breaker":
+            impact = "后续停止新增风险并退出归属库存，退出完成后保持 LATCHED 等待人工处理"
+        else:
+            impact = "后续停止新增订单、撤销活动订单并退出归属库存，再按该机制的冷却和恢复条件处理"
+    elif transition == "EXITING":
+        impact = "后续保持双侧关闭并持续撤单、复核成交和清理归属库存，直至只剩不可成交 dust"
+    elif transition == "EXIT_COMPLETE":
+        impact = "后续不再承担可成交归属库存的价格风险，并进入冷却、重入或锁存阶段"
+    elif transition == "COOLDOWN":
+        impact = "后续继续禁止新交易，冷却结束且健康条件满足后才进入重入检查"
+    elif transition == "REENTRY":
+        impact = "后续等待其他所有风控门放行和连续健康检查，通过后才重建基础库存并恢复策略"
+    elif transition == "RECOVERED":
+        impact = "后续只解除本机制的限制，最终交易权限仍需其他所有已启用风控门共同放行"
+    elif transition == "LATCHED":
+        impact = "后续保持禁止重入，必须先修复根因并通过 Hermes 或 OCI 的人工复核流程"
+    elif transition == "EXIT_DELAY":
+        impact = "后续继续 Fail-Closed 重试撤单和退出，同时保持严重告警，不能提前恢复交易"
+    elif transition == "ACTION_FAILED":
+        impact = "后续保持 Fail-Closed 并重试或等待人工处理，不会因本次执行失败自动放行"
+    else:
+        action = " ".join(
+            str(event.get("action") or "继续按当前风控阶段处理").split()
+        )
+        impact = f"后续执行“{action}”，最终权限仍由全部已启用风控门共同决定"
+    return f"解释：由于{cause}（原始原因：{reason}）；{impact}。"
+
+
 def format_event(event: Mapping[str, Any]) -> str:
     if event.get("mechanism") == "profit_report":
         lines = [
@@ -190,6 +292,7 @@ def format_event(event: Mapping[str, Any]) -> str:
         f"机制：{event.get('mechanism')}",
         f"转换：{event.get('phase_from') or '-'} → {event.get('phase_to') or event.get('transition')}",
         f"原因：{event.get('reason')}",
+        explain_event(event),
         f"动作：{event.get('action') or '-'}",
         f"时间：{event.get('occurred_at')}",
         f"事件ID：{str(event.get('event_id', ''))[:20]}",

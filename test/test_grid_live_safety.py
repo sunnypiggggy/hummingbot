@@ -23,6 +23,7 @@ from grid_live_common import (  # noqa: E402
     PORTFOLIOS,
     PORTFOLIO_DRAWDOWN_LIMIT_PCT,
     RISK_STATE_PERSIST_SECONDS,
+    STARTUP_ORDER_RECONCILE_SECONDS,
     RESERVE_QUOTE,
     SIDE_BUDGET,
     STRATEGY_BUDGET,
@@ -81,6 +82,7 @@ class GridLiveSafetyTest(unittest.TestCase):
         self.assertEqual(PORTFOLIO_DRAWDOWN_LIMIT_PCT, Decimal("0.06"))
         self.assertEqual(ORDER_REFRESH_SECONDS, 7200)
         self.assertEqual(RISK_STATE_PERSIST_SECONDS, 5)
+        self.assertEqual(STARTUP_ORDER_RECONCILE_SECONDS, 30)
 
     def test_configs_are_disabled_spot_and_btc_eth_only(self):
         for portfolio in PORTFOLIOS.values():

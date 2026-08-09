@@ -1,4 +1,5 @@
 import sys
+import signal
 import unittest
 from unittest.mock import patch
 from decimal import Decimal
@@ -21,11 +22,25 @@ class Order:
         self.trading_pair = pair
 
 
+class Connector:
+    def __init__(self):
+        self.limit_orders = []
+        self.available = {
+            "FDUSD": Decimal("1000"),
+            "BTC": Decimal("1"),
+            "ETH": Decimal("10"),
+        }
+
+    def get_available_balance(self, asset):
+        return self.available.get(asset, Decimal("0"))
+
+
 class GridLiveRuntimeRiskTest(unittest.TestCase):
     def strategy(self):
         strategy = LivePortfolioGrid.__new__(LivePortfolioGrid)
         strategy.config = SimpleNamespace(
             exchange="binance",
+            quote_asset="FDUSD",
             fail_closed_seconds=60,
             reserve_quote=Decimal("20"),
             pair_budget_quote=Decimal("200"),
@@ -46,7 +61,9 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             min_order_quote=Decimal("5"),
             move_threshold=Decimal("0.015"),
             min_grid_move_seconds=1800,
+            startup_order_reconcile_seconds=30,
         )
+        strategy.connectors = {"binance": Connector()}
         strategy.ledgers = {
             "BTC-FDUSD": PairLedger.create("BTC-FDUSD", Decimal("0.002")),
             "ETH-FDUSD": PairLedger.create("ETH-FDUSD", Decimal("0.05")),
@@ -64,7 +81,7 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.portfolio_tripped = False
         strategy.peak_equity = Decimal("420")
         strategy.notify = lambda message: None
-        strategy._current_timestamp = 1_000.0
+        strategy._set_current_timestamp(1_000.0)
         strategy.next_refresh = 9_999.0
         strategy.next_macro_poll = 0.0
         strategy.next_technical_poll = 0.0
@@ -85,6 +102,100 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.runtime_events = []
         strategy._append_notification_event = lambda *args, **kwargs: None
         return strategy
+
+    def test_shutdown_flag_blocks_new_orders_without_competing_cancellation(self):
+        strategy = LivePortfolioGrid.__new__(LivePortfolioGrid)
+        strategy._is_stop_triggered = True
+        calls = []
+        strategy.cancel_strategy_pair_orders = lambda: calls.append("cancel")
+        strategy.on_tick()
+        self.assertEqual([], calls)
+
+    def test_shutdown_pair_cancellation_is_rate_limited_but_retried(self):
+        strategy = self.strategy()
+        strategy.connector.limit_orders = [Order("old", "ETH-FDUSD")]
+        strategy._set_current_timestamp(1000)
+        cancelled = []
+        strategy.cancel = lambda exchange, pair, order_id: cancelled.append(order_id)
+
+        self.assertEqual(1, strategy.cancel_strategy_pair_orders())
+        self.assertEqual(1, strategy.cancel_strategy_pair_orders())
+        self.assertEqual(["old"], cancelled)
+        strategy._set_current_timestamp(1005)
+        self.assertEqual(1, strategy.cancel_strategy_pair_orders())
+        self.assertEqual(["old", "old"], cancelled)
+
+    def test_sigterm_blocks_orders_and_schedules_only_one_graceful_shutdown(self):
+        strategy = self.strategy()
+        scheduled = []
+
+        class Loop:
+            @staticmethod
+            def is_running():
+                return True
+
+            @staticmethod
+            def create_task(coroutine):
+                scheduled.append(coroutine)
+                return "shutdown-task"
+
+        strategy._termination_signal_received = None
+        strategy._termination_loop = Loop()
+        strategy._request_termination(signal.SIGTERM)
+        strategy._request_termination(signal.SIGTERM)
+
+        self.assertTrue(strategy._is_stop_triggered)
+        self.assertEqual(signal.SIGTERM, strategy._termination_signal_received)
+        self.assertEqual(1, len(scheduled))
+        self.assertEqual("shutdown-task", strategy._termination_task)
+        scheduled[0].close()
+
+    def test_startup_reconciliation_cancels_restored_orders_before_new_grid(self):
+        strategy = self.strategy()
+        strategy.startup_reconcile_started_at = None
+        strategy.startup_reconcile_quiet_cycles = 0
+        strategy.startup_reconcile_cancel_attempts = {}
+        strategy.startup_reconcile_complete = False
+        strategy.ledgers["ETH-FDUSD"].open_order_ids.add("old-sell")
+        restored = Order("old-sell", "ETH-FDUSD")
+        strategy.connector.limit_orders = [restored]
+        cancelled = []
+        strategy.cancel = lambda exchange, pair, order_id: cancelled.append(order_id)
+
+        self.assertTrue(strategy._startup_order_reconciliation([]))
+        self.assertEqual(["old-sell"], cancelled)
+        strategy.connector.limit_orders = []
+        strategy._set_current_timestamp(1030)
+        self.assertTrue(strategy._startup_order_reconciliation([]))
+        strategy._set_current_timestamp(1031)
+        self.assertTrue(strategy._startup_order_reconciliation([]))
+        strategy._set_current_timestamp(1032)
+        self.assertFalse(strategy._startup_order_reconciliation([]))
+        self.assertTrue(strategy.startup_reconcile_complete)
+
+    def test_grid_orders_are_capped_by_exchange_available_balances(self):
+        strategy = self.strategy()
+        strategy.config.trading_pairs = ["ETH-FDUSD"]
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.ledgers = {"ETH-FDUSD": strategy.ledgers["ETH-FDUSD"]}
+        strategy.grid_states = {"ETH-FDUSD": GridState(
+            lower=Decimal("1900"), upper=Decimal("2100"),
+            levels=[Decimal("1900"), Decimal("2100")],
+        )}
+        strategy.connector.available["FDUSD"] = Decimal("6")
+        strategy.connector.available["ETH"] = Decimal("0.01")
+        buys, sells = [], []
+        strategy.buy = lambda exchange, pair, amount, order_type, price: (
+            buys.append(amount * price) or "buy"
+        )
+        strategy.sell = lambda exchange, pair, amount, order_type, price: (
+            sells.append(amount) or "sell"
+        )
+
+        strategy._place_grids({"ETH-FDUSD": Decimal("2000")})
+
+        self.assertEqual([Decimal("6")], buys)
+        self.assertEqual([Decimal("0.01")], sells)
 
     def test_notification_failure_does_not_interrupt_runtime_risk_event(self):
         strategy = self.strategy()
