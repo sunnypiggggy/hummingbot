@@ -32,13 +32,9 @@ def falling_klines(count: int = 64) -> list[list]:
 
 
 class GridTechnicalGateTest(unittest.TestCase):
-    def test_signal_math_matches_existing_dca_guard(self):
-        rows = falling_klines()
-        grid = roc_sqz_signal_from_klines(rows)
-        dca = DcaGuard._roc_sqz_signal_from_klines(rows)
-        for key in ("roc_48h_pct", "sqzmom", "sqzmom_previous", "sqzmom_pct"):
-            self.assertAlmostEqual(grid[key], dca[key], places=12)
-        self.assertEqual(grid["sqzmom_red"], dca["sqzmom_red"])
+    def test_legacy_signal_remains_replay_only_and_is_absent_from_dca_guard(self):
+        grid = roc_sqz_signal_from_klines(falling_klines())
+        self.assertFalse(hasattr(DcaGuard, "_roc_sqz_signal_from_klines"))
         expected_color = (
             "lime" if grid["sqzmom"] > 0 and grid["sqzmom"] > grid["sqzmom_previous"]
             else "green" if grid["sqzmom"] > 0

@@ -1015,7 +1015,17 @@ class LivePortfolioGrid(StrategyV2Base):
             **details,
         })
         self.runtime_events = self.runtime_events[-100:]
-        self._append_notification_event(event, occurred_at, details)
+        # Notifications are an observability side channel. A read-only mount,
+        # full disk, or malformed notification must never interrupt the risk
+        # cycle that cancels orders and exits managed inventory.
+        try:
+            self._append_notification_event(event, occurred_at, details)
+        except Exception as exc:
+            self.logger().error(
+                "Grid notification event could not be persisted for %s: %s",
+                event,
+                exc,
+            )
 
     def _append_notification_event(
         self, runtime_event: str, occurred_at: str, details: Mapping[str, Any],

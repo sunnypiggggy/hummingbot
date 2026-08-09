@@ -10,7 +10,7 @@ from grid_live_common import PORTFOLIOS, build_live_config  # noqa: E402
 
 
 def test_grid_risk_execution_switches_are_independent(monkeypatch) -> None:
-    monkeypatch.setenv("GRID_RISK_V21_BUY_GATE_ENABLED", "false")
+    monkeypatch.setenv("GRID_RISK_V22_WEEKLY_GATE_ENABLED", "false")
     monkeypatch.setenv("GRID_RISK_FOMC_GATE_ENABLED", "true")
     monkeypatch.setenv("GRID_RISK_STRATEGY_LOSS_BREAKER_ENABLED", "false")
     monkeypatch.setenv("GRID_RISK_STRATEGY_DRAWDOWN_BREAKER_ENABLED", "true")

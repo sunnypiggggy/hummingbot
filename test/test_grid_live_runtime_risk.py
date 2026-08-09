@@ -44,6 +44,8 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             max_extra_inventory_hold_seconds=48 * 3600,
             take_profit=Decimal("0.006"),
             min_order_quote=Decimal("5"),
+            move_threshold=Decimal("0.015"),
+            min_grid_move_seconds=1800,
         )
         strategy.ledgers = {
             "BTC-FDUSD": PairLedger.create("BTC-FDUSD", Decimal("0.002")),
@@ -81,7 +83,19 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.technical_signal_by_pair = {pair: {} for pair in strategy.config.trading_pairs}
         strategy.technical_transition_key = None
         strategy.runtime_events = []
+        strategy._append_notification_event = lambda *args, **kwargs: None
         return strategy
+
+    def test_notification_failure_does_not_interrupt_runtime_risk_event(self):
+        strategy = self.strategy()
+        strategy.logger = lambda: SimpleNamespace(error=lambda *args, **kwargs: None)
+        strategy._append_notification_event = lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("notification volume is read-only")
+        )
+
+        strategy._record_runtime_event("risk_breaker_triggered", pair="BTC-FDUSD")
+
+        self.assertEqual("risk_breaker_triggered", strategy.runtime_events[-1]["event"])
 
     def test_foreign_orders_do_not_block_or_get_cancelled(self):
         strategy = self.strategy()
@@ -272,7 +286,10 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         }):
             strategy._poll_macro_gate()
         self.assertEqual(0.0, strategy.next_refresh)
-        self.assertEqual("fomc_gate_resumed_immediate_refresh", strategy.runtime_events[-1]["event"])
+        self.assertEqual(
+            ["fomc_gate_resumed_immediate_refresh", "fomc_gate_transition"],
+            [event["event"] for event in strategy.runtime_events[-2:]],
+        )
 
     def test_unknown_sides_risk_off_forces_sell_only_refresh(self):
         strategy = self.strategy()

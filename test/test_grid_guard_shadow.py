@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -10,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from live_guard.grid_live_guard import Guard  # noqa: E402
+from ethbtc_forced_exit_contract import MODEL_VERSION, PACKAGE_ID, SCHEMA  # noqa: E402
 
 
 class GridGuardShadowTest(unittest.TestCase):
@@ -28,9 +30,10 @@ class GridGuardShadowTest(unittest.TestCase):
         atomic_json.assert_called_once_with(target, gate)
 
     @patch("live_guard.grid_live_guard.atomic_gate_json")
-    @patch("live_guard.grid_live_guard.load_runtime_xgboost_gate")
-    def test_guard_distributes_xgboost_contract_without_building_mechanism1(
-        self, load_gate, atomic_json,
+    @patch("live_guard.grid_live_guard.atomic_v22_json")
+    @patch("live_guard.grid_live_guard.load_runtime_v22_contract")
+    def test_guard_distributes_v22_contract_from_the_single_in_process_producer(
+        self, load_gate, atomic_v22_json, atomic_json,
     ):
         with tempfile.TemporaryDirectory() as directory:
             guard = Guard.__new__(Guard)
@@ -38,12 +41,14 @@ class GridGuardShadowTest(unittest.TestCase):
             guard.technical_refresh_seconds = 30
             guard.state = {"xgboost_risk_gate": {}}
             guard.technical_gate_path = Path(directory) / "xgboost_risk_gate.json"
-            gate = {"schema": "grid-xgboost-long-risk-gate-v1",
-                    "model_version": "xgboost-grid-long-risk-gate-v21-250d", "pairs": {}}
-            guard.v21_producer = Mock()
-            guard.v21_producer.produce.side_effect = lambda observed: guard.technical_gate_path.write_text(
-                __import__("json").dumps(gate), encoding="utf-8"
-            )
+            gate = {"schema": SCHEMA, "package_id": PACKAGE_ID,
+                    "model_version": MODEL_VERSION, "execution_authorized": True,
+                    "release_sha256": "a" * 64, "pairs": {}}
+            guard.v22_producer = Mock()
+            guard.v22_producer.produce.return_value = gate
+            guard.v22_observation_gate_path = Path(directory) / "ethbtc_forced_exit_observation.json"
+            guard.v22_execution_mode = "live"
+            guard.v21_producer = None
             target = Path(directory) / "instance" / "data" / "xgboost_risk_gate.json"
             guard._technical_gate_targets = Mock(return_value=[guard.technical_gate_path, target])
             guard.audit = Mock()
@@ -51,7 +56,9 @@ class GridGuardShadowTest(unittest.TestCase):
 
             self.assertEqual(gate, guard.publish_technical_buy_gate(force=True))
             atomic_json.assert_called_once_with(target, gate)
-            load_gate.assert_called_once_with(guard.technical_gate_path)
+            atomic_v22_json.assert_called_once_with(guard.technical_gate_path, gate)
+            load_gate.assert_called_once_with(guard.v22_observation_gate_path)
+            self.assertEqual("v22", guard.state["active_technical_producer"])
 
     @patch("live_guard.grid_live_guard.atomic_gate_json")
     def test_guard_never_distributes_v21_shadow_contract(self, atomic_json):
@@ -76,6 +83,13 @@ class GridGuardShadowTest(unittest.TestCase):
         guard = Guard.__new__(Guard)
         guard.emergency_exchange = Mock()
         guard.emergency_exchange.open_orders.return_value = []
+        guard.emergency_exchange.account_balances.return_value = {
+            "BTC": {"total": Decimal("0.002")},
+            "ETH": {"total": Decimal("0.05")},
+        }
+        guard.manifest = {"reservations": {"FDUSD": {"base": {
+            "BTC": "0.002", "ETH": "0.05",
+        }}}}
         guard.emergency_exchange._signed.side_effect = [
             {
                 "enableWithdrawals": False,

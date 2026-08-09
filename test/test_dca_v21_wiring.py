@@ -13,14 +13,16 @@ from dca_live_guard import Guard  # noqa: E402
 from backtest_dca_momentum_guard import gate_for_frame  # noqa: E402
 
 
-def test_dca_v21_reuses_grid_guard_without_a_new_container() -> None:
+def test_dca_v22_reuses_grid_guard_without_a_new_container() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     dockerfile = (ROOT / "Dockerfile.dca-live-guard").read_text(encoding="utf-8")
     macro_compose = (ROOT / "ops/dca-macro/docker-compose.yml").read_text(encoding="utf-8")
     assert "  grid-xgboost-v21-shadow:" not in compose
-    assert "./grid-live-fdusd-data:/workspace/v21:ro" in compose
+    assert "  grid-xgboost-v22:" not in compose
+    assert "./grid-live-fdusd-data:/workspace/technical:ro" in compose
+    assert "DCA_V22_GATE_PATH: /workspace/technical/xgboost_risk_gate.json" in compose
     assert "./dca-macro-data:/workspace/macro:ro" in compose
-    assert "COPY scripts/grid_xgboost_risk_gate.py" in dockerfile
+    assert "COPY scripts/ethbtc_forced_exit_contract.py" in dockerfile
     assert 'DCA_MACRO_EXECUTION_ENABLED: "false"' in macro_compose
 
 
@@ -39,7 +41,7 @@ def test_roc_sqz_runtime_configuration_is_removed() -> None:
         assert legacy not in source
 
 
-def test_legacy_roc_state_is_retired_without_becoming_v21_state(tmp_path) -> None:
+def test_legacy_roc_state_is_retired_without_becoming_v22_state(tmp_path) -> None:
     state_path = tmp_path / "guard_state.json"
     state_path.write_text(json.dumps({
         "version": 1, "bots": {},
@@ -47,15 +49,15 @@ def test_legacy_roc_state_is_retired_without_becoming_v21_state(tmp_path) -> Non
     }), encoding="utf-8")
     guard = Guard.__new__(Guard)
     guard.state_path = state_path
-    guard.mechanisms = {"v21_buy_gate": True}
+    guard.mechanisms = {"v22_weekly_buy_gate": True}
     state = guard._load_state()
     assert state["version"] == 2
     assert state["roc_buy_guard"] == {
         "retired": True,
-        "retired_reason": "replaced_by_v21",
+        "retired_reason": "replaced_by_ethbtc_forced_exit_v22",
         "previous_active": True,
     }
-    assert "v21" not in state["roc_buy_guard"]
+    assert "active" not in state["roc_buy_guard"]
 
 
 def test_dca_backtest_maps_fdusd_v21_state_by_base_asset() -> None:
