@@ -12,6 +12,11 @@ DCA Guard、Grid 参数调度器和 v22 发布工具只写标准 JSONL 事件，
 
 ## 配置
 
+`dca-live-report` 只加载仓库根目录的 `telegram-notify.env` 作为通知专用、非秘密
+配置。该文件持久保存总开关、四小时报告开关和频道 ID，避免 `docker compose up`
+时因调用 shell 未导出变量而回退到关闭状态。禁止给该服务加载 `.env.control`；Bot
+Token 仍只能通过 Docker secret 注入。
+
 - `TELEGRAM_NOTIFY_ENABLED`：总发送开关，默认 `false`。
 - `TELEGRAM_NOTIFY_BOT_TOKEN_FILE`：Docker secret 文件，默认
   `/run/secrets/telegram_notify_bot_token`。

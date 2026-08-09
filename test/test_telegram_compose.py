@@ -12,7 +12,8 @@ def test_existing_report_service_is_the_only_sender_and_no_service_was_added():
     assert "telegram-notifier" not in services
     report = services["dca-live-report"]
     assert report["command"] == ["python", "/app/dca_live_report.py"]
-    assert "env_file" not in report
+    assert report["env_file"] == ["./telegram-notify.env"]
+    assert ".env.control" not in report["env_file"]
     assert "telegram_notify_bot_token" in report["secrets"]
     assert any(volume.endswith(":/workspace/grid:ro") for volume in report["volumes"])
     assert any(volume.endswith(":/workspace/releases:ro") for volume in report["volumes"])
@@ -21,6 +22,23 @@ def test_existing_report_service_is_the_only_sender_and_no_service_was_added():
         assert "TELEGRAM_NOTIFY_BOT_TOKEN_FILE" not in environment
         assert environment["TELEGRAM_TOKEN"] == ""
         assert environment["ADMIN_USER_ID"] == ""
+
+
+def test_report_notification_settings_are_persistent_and_secret_free():
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    environment = compose["services"]["dca-live-report"]["environment"]
+    assert "TELEGRAM_NOTIFY_ENABLED" not in environment
+    assert "TELEGRAM_PROFIT_REPORT_ENABLED" not in environment
+    assert "TELEGRAM_NOTIFY_CHANNEL_ID" not in environment
+    values = {}
+    for line in (ROOT / "telegram-notify.env").read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            values[key] = value
+    assert values["TELEGRAM_NOTIFY_ENABLED"] == "true"
+    assert values["TELEGRAM_PROFIT_REPORT_ENABLED"] == "true"
+    assert values["TELEGRAM_NOTIFY_CHANNEL_ID"].startswith("-100")
+    assert all("TOKEN" not in key for key in values)
 
 
 def test_all_seven_notification_switches_default_enabled():

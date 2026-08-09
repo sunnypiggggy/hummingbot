@@ -907,7 +907,6 @@ class Guard:
             )
             v22_changed = (
                 previous_bot.get("v22_buy_enabled") != technical.get("buy_enabled")
-                or previous_bot.get("v22_event_id") != technical.get("event_id")
             )
             controller_result: Dict[str, Any] = {"status": "observation_only"}
             controller_error = ""

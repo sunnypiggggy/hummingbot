@@ -327,16 +327,17 @@ services:
       dockerfile: Dockerfile.dca-live-guard
     image: hummingbot/dca-live-guard:local
     restart: unless-stopped
+    env_file:
+      # Notification-only, non-secret settings. Do not mount .env.control:
+      # the report sender must not receive API/Hermes credentials.
+      - ./telegram-notify.env
     environment:
       BOTS_PATH: /workspace/bots
       DCA_LIVE_STATE_PATH: /workspace/state
       GRID_LIVE_STATE_PATH: /workspace/grid
       ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
       DCA_LIVE_REPORT_INTERVAL: "300"
-      TELEGRAM_NOTIFY_ENABLED: "${TELEGRAM_NOTIFY_ENABLED:-false}"
-      TELEGRAM_PROFIT_REPORT_ENABLED: "${TELEGRAM_PROFIT_REPORT_ENABLED:-true}"
       TELEGRAM_NOTIFY_BOT_TOKEN_FILE: /run/secrets/telegram_notify_bot_token
-      TELEGRAM_NOTIFY_CHANNEL_ID: "${TELEGRAM_NOTIFY_CHANNEL_ID:-}"
       TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED: "${TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED:-true}"
       TELEGRAM_ALERT_FOMC_GATE_ENABLED: "${TELEGRAM_ALERT_FOMC_GATE_ENABLED:-true}"
       TELEGRAM_ALERT_STRATEGY_LOSS_BREAKER_ENABLED: "${TELEGRAM_ALERT_STRATEGY_LOSS_BREAKER_ENABLED:-true}"

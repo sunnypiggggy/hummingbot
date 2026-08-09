@@ -325,6 +325,18 @@ def test_dca_v22_producer_preserves_aggregate_and_controller_state():
         assert value["details"]["execution_applied"] is True
 
 
+def test_hourly_v22_event_id_refresh_is_not_a_state_transition():
+    dca_source = (ROOT / "live_guard" / "dca_live_guard.py").read_text(encoding="utf-8")
+    grid_source = (ROOT / "live_guard" / "grid_live_guard.py").read_text(encoding="utf-8")
+    changed_block = dca_source.split("v22_changed = (", 1)[1].split(
+        "controller_result", 1
+    )[0]
+    assert "v22_buy_enabled" in changed_block
+    assert "v22_event_id" not in changed_block
+    assert "previous_risk_off" in grid_source
+    assert "previous_event_ids" not in grid_source
+
+
 def test_integrity_latched_explanation_requires_manual_recovery():
     value = event(
         mechanism="infrastructure_integrity_breaker", transition="LATCHED",

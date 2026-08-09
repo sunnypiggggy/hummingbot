@@ -315,11 +315,11 @@ class Guard:
                     model_sha256=str(gate.get("model_sha256", "")),
                     correlation_id=str(gate.get("generated_at") or details.get("reason")),
                 ))
-            previous = details.get("previous_event_ids", {})
+            previous_states = details.get("previous_risk_off", {})
             for pair, item in gate.get("pairs", {}).items():
-                if previous.get(pair) == item.get("event_id"):
-                    continue
                 active = bool(item.get("risk_off_active"))
+                if pair in previous_states and bool(previous_states[pair]) == active:
+                    continue
                 append_event(self.notification_path, build_event(
                     source="grid-live-guard", strategy="grid",
                     bot=PORTFOLIOS["FDUSD"].bot_name, pair=str(pair),
@@ -500,18 +500,20 @@ class Guard:
         for target in self._technical_gate_targets():
             if target != self.technical_gate_path and distributable:
                 atomic_gate_json(target, gate)
-        previous_events = {
-            pair: value.get("event_id") for pair, value in previous_gate.get("pairs", {}).items()
+        previous_states = {
+            pair: bool(value.get("risk_off_active"))
+            for pair, value in previous_gate.get("pairs", {}).items()
         }
-        current_events = {
-            pair: value.get("event_id") for pair, value in gate.get("pairs", {}).items()
+        current_states = {
+            pair: bool(value.get("risk_off_active"))
+            for pair, value in gate.get("pairs", {}).items()
         }
         self.state["xgboost_risk_gate"] = gate
-        if previous_events != current_events or not healthy:
+        if previous_states != current_states or not healthy:
             self.audit(
                 "grid_xgboost_risk_gate_transition",
-                previous_event_ids=previous_events,
-                event_ids=current_events,
+                previous_risk_off=previous_states,
+                current_risk_off=current_states,
                 runtime_healthy=healthy,
                 reason=runtime.get("reason"), gate=gate,
             )
