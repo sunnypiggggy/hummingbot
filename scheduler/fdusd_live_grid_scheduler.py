@@ -31,6 +31,10 @@ from grid_macro_gate import build_grid_macro_gate
 from ethbtc_forced_exit_contract import MODEL_VERSION as XGBOOST_MODEL_VERSION
 from ethbtc_forced_exit_contract import SCHEMA as XGBOOST_GATE_SCHEMA
 from validate_grid_live import INTERVAL_SECONDS, load_candles
+try:
+    from telegram_notifications import append_event, build_event, canonical_sha256
+except ModuleNotFoundError:
+    from live_guard.telegram_notifications import append_event, build_event, canonical_sha256
 
 
 LOG = logging.getLogger("grid-live-fdusd-scheduler")
@@ -46,6 +50,7 @@ class Scheduler:
         self.state_path = self.root / "scheduler_state.json"
         self.fee_state_path = self.root / "private_preflight.json"
         self.canonical_selection = self.root / "active_selection.json"
+        self.notification_path = self.root / "telegram_events.jsonl"
         self.canonical_config = self.root / PORTFOLIOS["FDUSD"].config_name
         self.macro_source = Path(
             os.getenv("GRID_LIVE_MACRO_STATE_PATH", "/workspace/macro/state.json")
@@ -146,7 +151,9 @@ class Scheduler:
             pair: load_candles(pair, train_start, train_end, self.cache, allow_download=True)
             for pair in PORTFOLIOS["FDUSD"].pairs
         }
-        selected, evaluations = select_candidate(candles, maker_fee)
+        selected, evaluations = select_candidate(candles, maker_fee, taker_fee=taker_fee,
+                                                 require_eligible=False)
+        previous_selection = self.read_json(self.canonical_selection, {})
         report_dir = self.selections / period
         report_dir.mkdir(parents=True, exist_ok=True)
         evaluations.to_csv(report_dir / "candidate_evaluations.csv", index=False)
@@ -173,6 +180,36 @@ class Scheduler:
             },
         }
         self.atomic_json(report_dir / "selection.json", selection)
+        selection_hash = canonical_sha256(selection)
+        eligible_count = int(evaluations.attrs.get("eligible_count", 0))
+        best_rejected = (
+            evaluations.iloc[0].where(evaluations.iloc[0].notna(), None).to_dict()
+            if not evaluations.empty else {}
+        )
+        if eligible_count == 0:
+            append_event(self.notification_path, build_event(
+                source="grid-live-fdusd-scheduler", strategy="grid",
+                bot=PORTFOLIOS["FDUSD"].bot_name,
+                pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                mechanism="parameter_update", transition="PARAMETER_RETAINED",
+                reason="无合格参数，维持旧参数", severity="warning",
+                action="keep_previous_parameters", parameter_sha256=selection_hash,
+                correlation_id=period,
+                details={"candidate": selection,
+                         "previous_parameters": previous_selection.get("parameters", {}),
+                         "best_rejected_candidate": best_rejected,
+                         "rejection_reason": "eligible_count=0 under existing deployment gates",
+                         "candidate_evaluations": str(report_dir / "candidate_evaluations.csv"),
+                         "report_request": "grid_360d"},
+            ))
+            state.update({
+                "evaluated_period": period,
+                "last_evaluation": {"qualified": False, "candidate": selection,
+                                    "parameter_sha256": selection_hash},
+            })
+            self.atomic_json(self.state_path, state)
+            LOG.warning("No eligible FDUSD parameters for %s; previous version remains active.", period)
+            return
         self.atomic_json(self.canonical_selection, selection)
         self.write_disabled_config(candles, selected, maker_fee, period)
         updated_instances = self.publish_to_active_instances(selection)
@@ -188,6 +225,22 @@ class Scheduler:
             "trading_enabled": False,
         }
         self.atomic_json(self.state_path, state)
+        append_event(self.notification_path, build_event(
+            source="grid-live-fdusd-scheduler", strategy="grid",
+            bot=PORTFOLIOS["FDUSD"].bot_name,
+            pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+            mechanism="parameter_update", transition="PARAMETER_ACTIVATED",
+            reason=f"Grid 参数已发布到 {updated_instances} 个实例", severity="info",
+            action="instances_reload_after_order_cancellation",
+            parameter_sha256=selection_hash, correlation_id=period,
+            details={"parameter_version": period, "updated_instances": updated_instances,
+                     "candidate": selection,
+                     "previous_parameters": previous_selection.get("parameters", {}),
+                     "best_candidate_evaluation": best_rejected,
+                     "candidate_evaluations": str(report_dir / "candidate_evaluations.csv"),
+                     "report_request": "grid_360d",
+                     "candidate_and_activation_merged": True},
+        ))
         LOG.warning("Published FDUSD parameter version %s to %d instance(s).", period, updated_instances)
 
     def ensure_fixed_selection(self) -> dict:
@@ -223,6 +276,18 @@ class Scheduler:
         current = self.read_json(self.canonical_selection, None)
         if current != selection:
             self.atomic_json(self.canonical_selection, selection)
+            append_event(self.notification_path, build_event(
+                source="grid-live-fdusd-scheduler", strategy="grid",
+                bot=PORTFOLIOS["FDUSD"].bot_name,
+                pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                mechanism="parameter_update", transition="PARAMETER_ACTIVATED",
+                reason="固定审核参数已发布", severity="info",
+                action="publish_fixed_selection",
+                parameter_sha256=canonical_sha256(selection),
+                correlation_id=selection["parameter_version"],
+                details={"parameter_version": selection["parameter_version"],
+                         "report_request": "grid_360d"},
+            ))
         self.publish_to_active_instances(selection)
         state = {
             "mode": "fixed",
@@ -269,6 +334,12 @@ class Scheduler:
         shutil.copy2("/app/grid_live_common.py", scripts / "grid_live_common.py")
         shutil.copy2("/app/grid_macro_gate.py", scripts / "grid_macro_gate.py")
         shutil.copy2("/app/grid_xgboost_risk_gate.py", scripts / "grid_xgboost_risk_gate.py")
+        shutil.copy2(
+            "/app/ethbtc_forced_exit_contract.py",
+            scripts / "ethbtc_forced_exit_contract.py",
+        )
+        shutil.copy2("/app/risk_recovery.py", scripts / "risk_recovery.py")
+        shutil.copy2("/app/telegram_notifications.py", scripts / "telegram_notifications.py")
 
     def publish_macro_gate(self) -> int:
         macro_state = self.read_json(self.macro_source, None)

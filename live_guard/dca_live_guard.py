@@ -43,6 +43,10 @@ from risk_recovery import (
     advance_recovery, active_state,
     mark_exit_complete, mark_reentry_complete, normalize_state, trigger_state,
 )
+try:
+    from telegram_notifications import append_event, build_event
+except ModuleNotFoundError:
+    from live_guard.telegram_notifications import append_event, build_event
 
 
 LOG = logging.getLogger("dca-live-guard")
@@ -284,6 +288,7 @@ class Guard:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.state_dir / "guard_state.json"
         self.audit_path = self.state_dir / "risk_audit.jsonl"
+        self.notification_path = self.state_dir / "telegram_events.jsonl"
         self.telemetry_path = self.state_dir / "dca_macro_telemetry.json"
         self.managed_inventory_path = self.state_dir / "managed_inventory.json"
         self.interval = max(2, int(os.getenv("DCA_LIVE_GUARD_INTERVAL", "10")))
@@ -398,23 +403,101 @@ class Guard:
 
     def _audit(self, event: str, **details: Any) -> None:
         record = {"timestamp": datetime.now(timezone.utc).isoformat(), "event": event, **details}
-        with self.audit_path.open("a", encoding="utf-8") as output:
-            output.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        audit_path = getattr(self, "audit_path", None)
+        if audit_path is not None:
+            with audit_path.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         LOG.warning("%s %s", event, json.dumps(details, ensure_ascii=False, default=str))
+        self._emit_notification(event, details)
+
+    def _emit_notification(self, audit_event: str, details: Dict[str, Any]) -> None:
+        path = getattr(self, "notification_path", None)
+        if path is None:
+            return
+        if audit_event in {"fomc_gate_transition", "v22_gate_transition"}:
+            mechanism = "fomc_gate" if audit_event.startswith("fomc") else "v22_weekly_buy_gate"
+            blocked = not bool(details.get("buy_enabled")) or (
+                mechanism == "fomc_gate" and not bool(details.get("sell_enabled"))
+            )
+            transition = "TRIGGERED" if blocked else "RECOVERED"
+            append_event(path, build_event(
+                source="dca-live-guard", strategy="dca",
+                bot=str(details.get("bot", "")), pair=str(details.get("pair", "")),
+                mechanism=mechanism, transition=transition,
+                reason=str(details.get("reason") or audit_event),
+                severity="warning" if blocked else "info",
+                phase_from="ACTIVE" if blocked else "REENTRY",
+                phase_to="RISK_OFF" if blocked else "ACTIVE",
+                action=("aggregate_gate_blocks_orders" if blocked
+                        else "await_remaining_gates"),
+                trigger_value=details.get("probability"),
+                release_sha256=str(details.get("release_sha256", "")),
+                model_sha256=str(details.get("model_sha256", "")),
+                correlation_id=str(details.get("correlation_id") or (
+                    f"{audit_event}:{details.get('bot')}:{blocked}:{details.get('reason')}"
+                )),
+                details={
+                    "buy_enabled": details.get("buy_enabled"),
+                    "sell_enabled": details.get("sell_enabled"),
+                    "source_pair": details.get("source_pair"),
+                },
+            ))
+            return
+        mapping = {
+            "recoverable_breaker_triggered": (["TRIGGERED", "EXITING"], "warning"),
+            "integrity_failure_exit_then_latch": (["TRIGGERED", "EXITING"], "critical"),
+            "recoverable_exit_complete": (["EXIT_COMPLETE"], "info"),
+            "recoverable_exit_critical_delay": ("EXIT_DELAY", "critical"),
+            "recoverable_reentry_ready": ("REENTRY", "info"),
+            "recoverable_reentry_complete": ("RECOVERED", "info"),
+            "portfolio_reentry_committed": ("RECOVERED", "info"),
+            "circuit_breaker_complete": ("LATCHED", "critical"),
+            "circuit_breaker_action_failed": ("ACTION_FAILED", "critical"),
+        }
+        if audit_event not in mapping:
+            return
+        transitions, severity = mapping[audit_event]
+        if isinstance(transitions, str):
+            transitions = [transitions]
+        recovery = details.get("recovery") if isinstance(details.get("recovery"), dict) else {}
+        bot = str(details.get("bot") or ",".join(details.get("bots", [])))
+        pair = str(details.get("pair") or "")
+        mechanism = str(recovery.get("mechanism") or recovery.get("previous_mechanism") or (
+            "infrastructure_integrity_breaker" if "circuit" in audit_event or "integrity" in audit_event
+            else details.get("mechanism") or "infrastructure_integrity_breaker"
+        ))
+        final_phase = str(recovery.get("phase") or "")
+        if audit_event == "recoverable_reentry_complete" and final_phase == "REENTRY":
+            transitions = ["REENTRY"]
+        if audit_event == "recoverable_exit_complete" and final_phase in {"COOLDOWN", "LATCHED"}:
+            transitions.append(final_phase)
+        reason = str(details.get("reason") or recovery.get("reason") or audit_event)
+        contract = getattr(self, "state", {}).get("v22_observation", {})
+        correlation = str(recovery.get("triggered_at") or details.get("reason") or audit_event)
+        for transition in transitions:
+            phase_to = final_phase if transition == "EXIT_COMPLETE" and final_phase else transition
+            manual_action = transition == "LATCHED" or (
+                transition == "REENTRY" and not bool(getattr(self, "auto_reentry_enabled", False))
+            )
+            event = build_event(
+                source="dca-live-guard", strategy="dca", bot=bot, pair=pair,
+                mechanism=mechanism, transition=transition, reason=reason,
+                severity=severity, phase_from="ACTIVE" if transition == "TRIGGERED" else "",
+                phase_to=phase_to,
+                action="cancel_orders_and_flatten" if transition in {"TRIGGERED", "EXITING", "LATCHED"} else audit_event,
+                trigger_value=recovery.get("trigger_value"),
+                release_sha256=str(contract.get("release_sha256", "")),
+                model_sha256=str(contract.get("model_sha256", "")),
+                requires_manual_action=manual_action,
+                correlation_id=correlation,
+            )
+            append_event(path, event)
 
     def _notify(self, message: str) -> None:
-        token = os.getenv("TELEGRAM_TOKEN", "").strip()
-        chat_id = os.getenv("ADMIN_USER_ID", "").strip()
-        if not token or not chat_id:
-            return
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": message},
-                timeout=15,
-            ).raise_for_status()
-        except Exception as exc:
-            LOG.error("Telegram alert failed: %s", exc)
+        # Telegram delivery is intentionally centralized in dca-live-report.
+        # Guards only persist auditable events and must never hold the Hermes or
+        # channel bot token.
+        LOG.warning("guard notification queued through audit event: %s", message)
 
     def _database(self, bot_name: str) -> Optional[Path]:
         exact = self.bots_path / "instances" / bot_name / "data" / f"{bot_name}.sqlite"
@@ -702,6 +785,7 @@ class Guard:
         return {"healthy": healthy, "reason": contract.get("reason"),
                 "schema": contract.get("schema"),
                 "release_sha256": contract.get("release_sha256"),
+                "model_sha256": contract.get("model_sha256"),
                 "execution_authorized": bool(contract.get("execution_authorized", False)),
                 "model_version": contract.get("model_version"),
                 "generated_at": contract.get("generated_at"), "pairs": mapped}
@@ -772,6 +856,9 @@ class Guard:
     ) -> None:
         macro = self._macro_gate()
         v21 = self._v21_gate()
+        previous_aggregate = self.state.get("gate_aggregate", {})
+        previous_macro = previous_aggregate.get("macro", {})
+        previous_bots = previous_aggregate.get("bots", {})
         aggregate = {"macro": macro, "v22": v21, "bots": {}}
         for bot_name, snapshot in snapshots.items():
             bot_state = self.state.get("bots", {}).get(bot_name, {})
@@ -796,7 +883,37 @@ class Guard:
             aggregate["bots"][bot_name] = {
                 "pair": pair, "buy_enabled": buy_enabled,
                 "sell_enabled": sell_enabled, "reasons": reasons,
+                "fomc_buy_enabled": bool(macro["buy_enabled"]),
+                "fomc_sell_enabled": bool(macro["sell_enabled"]),
+                "v22_buy_enabled": bool(technical["buy_enabled"]),
+                "v22_event_id": technical.get("event_id"),
             }
+            previous_bot = previous_bots.get(bot_name, {})
+            if (
+                previous_macro.get("buy_enabled") != macro.get("buy_enabled")
+                or previous_macro.get("sell_enabled") != macro.get("sell_enabled")
+                or previous_macro.get("healthy") != macro.get("healthy")
+            ):
+                self._audit(
+                    "fomc_gate_transition", bot=bot_name, pair=pair,
+                    buy_enabled=macro["buy_enabled"], sell_enabled=macro["sell_enabled"],
+                    reason=macro["reason"],
+                    correlation_id="|".join(macro.get("active_lease_ids", []))
+                    or f"fomc:{macro['buy_enabled']}:{macro['sell_enabled']}:{macro['reason']}",
+                )
+            if (
+                previous_bot.get("v22_buy_enabled") != technical.get("buy_enabled")
+                or previous_bot.get("v22_event_id") != technical.get("event_id")
+            ):
+                self._audit(
+                    "v22_gate_transition", bot=bot_name, pair=pair,
+                    buy_enabled=technical["buy_enabled"], sell_enabled=True,
+                    reason=technical["reason"], probability=technical.get("probability"),
+                    source_pair=technical.get("source_pair"),
+                    release_sha256=v21.get("release_sha256", ""),
+                    model_sha256=v21.get("model_sha256", ""),
+                    correlation_id=technical.get("event_id") or "",
+                )
             if not risk_actions_enabled:
                 continue
             try:
@@ -1344,10 +1461,14 @@ class Guard:
         )
         if state.get("scope") == "portfolio":
             gates_allow = gates_allow and portfolio_all_gates
+        previous_phase = state["phase"]
         state = advance_recovery(
             state, now=now, healthy=underlying_healthy and no_runtime_risk,
             gates_allow_reentry=gates_allow,
         )
+        if state["phase"] == REENTRY and previous_phase != REENTRY:
+            self._audit("recoverable_reentry_ready", bot=bot_name, pair=pair,
+                        recovery=state)
         if state.get("reentry_allowed"):
             target_quote = side_budget()
             amount = ((target_quote / mark) / step).to_integral_value(rounding=ROUND_DOWN) * step
@@ -1462,6 +1583,7 @@ class Guard:
             snapshot.update({
                 "equity": str(equity), "peak_equity": str(peak),
                 "drawdown_pct": str(drawdown),
+                "executor_counts": self._executor_counts(Path(snapshot["database"])),
             })
             bot_state["peak_equity"] = str(peak)
             bot_state["latest"] = snapshot
@@ -1590,12 +1712,16 @@ class Guard:
                 and all(state.get("scope") == "portfolio" for state in portfolio_states)
                 and all(state.get("reentry_filled") for state in portfolio_states)
             ):
-                for bot_name in snapshots:
+                for bot_name, snapshot in snapshots.items():
                     state = normalize_state(self.state["bots"][bot_name]["recovery"])
-                    self.state["bots"][bot_name]["recovery"] = mark_reentry_complete(
+                    committed = mark_reentry_complete(
                         state, now=now, baseline=state["reentry_baseline"],
                     )
-                self._audit("portfolio_reentry_committed", bots=sorted(snapshots))
+                    self.state["bots"][bot_name]["recovery"] = committed
+                    self._audit(
+                        "portfolio_reentry_committed", bot=bot_name,
+                        pair=snapshot["pair"], recovery=committed,
+                    )
         self.state["last_success_at"] = now
         self.state.pop("last_monitor_error", None)
         self.state.pop("first_failure_at", None)

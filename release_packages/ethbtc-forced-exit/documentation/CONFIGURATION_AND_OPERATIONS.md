@@ -2,7 +2,11 @@
 
 ## 容器职责
 
-不新增服务：`grid-live-guard` 是唯一 v22 producer，加载模型、行情和连续状态并发布合同；Grid 直接消费。`dca-live-guard` 通过只读共享目录消费同一合同，不加载模型。
+当前 OCI 已使用 v22 `live` 模式。`grid-live-guard` 在现有容器内作为唯一 v22
+producer 加载模型、行情和连续状态，发布有执行权的合同；Grid 直接消费，
+`dca-live-guard` 通过只读共享目录映射消费且不加载模型。当前模型身份见
+[ONLINE_MODELS.md](ONLINE_MODELS.md)，容器链路见
+[CONTAINERS_AND_SIGNAL_FLOW.md](CONTAINERS_AND_SIGNAL_FLOW.md)。
 
 生产中不得同时运行第二个 v22 producer。完成切换后 v21 producer 必须关闭，不能作为故障回退。
 
@@ -11,6 +15,8 @@
 合同包含 `package_id`、执行策略版本、release/model/feature/strategy/data哈希、生成时间、有效期、审批回执哈希、激活时间和逐资产信号。
 
 每对包含 `risk_off_active`、`recommended_buy_enabled`、实际 `buy_enabled`、`force_exit`、概率、fold-local阈值、模型周、转换、原因和事件ID。DCA 必须逐事件验证 FDUSD→USDT 映射一致。
+
+完整 schema、授权计算、FOMC合同、恢复状态、Telegram事件及线上阻塞判定见 [CONTRACTS_AND_RUNTIME_FLOW.md](CONTRACTS_AND_RUNTIME_FLOW.md)。当前是 live 模式；若 `execution_authorized=false`，必须 Fail-Closed，不能继续 legacy 交易。
 
 ## 风控开关
 
@@ -25,7 +31,7 @@
 
 ## 观察与审批
 
-观察模式真实刷新行情、概率、阈值和拟执行数量，但不修改 controller、不撤单、不成交。每个 release 至少观察24小时，要求合同持续新鲜、BTC/ETH覆盖完整、Grid/DCA事件一致、零完整性错误、行情可用率至少99.9%、归属数量不越界。
+观察模式真实刷新行情、概率、阈值和拟执行数量，但不修改 controller、不撤单、不成交。默认每个 release 至少观察24小时，要求合同持续新鲜、BTC/ETH覆盖完整、Grid/DCA事件一致、零完整性错误、行情可用率至少99.9%、归属数量不越界。2026-08-09 首次 live 切换由操作人显式豁免了时长条件：实际观察71875秒；其他观察检查和账户预检没有豁免。该历史豁免不自动适用于后续 release。
 
 审批 CLI 绑定 release 与模型哈希、观察报告、账户预检、审批者和未来分钟边界。观察未满、报告失败、当前周到期或哈希变化时拒绝生成授权。
 
@@ -44,4 +50,3 @@ Grid/DCA、BTC/ETH 分页展示各自权益，不使用组合权益冒充单对�
 ## 回滚
 
 先撤销授权并保持双侧关闭，再取消订单、复核和清理归属库存。回滚镜像不得自动恢复 v21、ROC、SQZMOM或旧周。只有新的有效周、完整预检和新审批完成后才可重新入场。
-

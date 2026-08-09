@@ -28,6 +28,10 @@ from ethbtc_forced_exit_contract import (
     load_runtime_contract as load_runtime_v22_contract,
 )
 from risk_recovery import EMERGENCY_ESCALATION_SECONDS, EXITING
+try:
+    from telegram_notifications import append_event, build_event
+except ModuleNotFoundError:
+    from live_guard.telegram_notifications import append_event, build_event
 
 try:
     from live_guard.dca_live_guard import BinanceEmergencyClient, DockerEmergencyClient
@@ -112,6 +116,7 @@ class Guard:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.state_dir / "guard_state.json"
         self.audit_path = self.state_dir / "risk_audit.jsonl"
+        self.notification_path = self.state_dir / "telegram_events.jsonl"
         self.interval = max(2, int(os.getenv("GRID_LIVE_GUARD_INTERVAL", "10")))
         self.fail_closed_seconds = max(
             20, int(os.getenv("GRID_LIVE_FAIL_CLOSED_SECONDS", "60"))
@@ -293,6 +298,60 @@ class Guard:
                 "event": event,
                 **details,
             }, default=str) + "\n")
+        self._emit_notification(event, details)
+
+    def _emit_notification(self, audit_event: str, details: Dict[str, Any]) -> None:
+        if audit_event == "grid_xgboost_risk_gate_transition":
+            gate = details.get("gate") if isinstance(details.get("gate"), dict) else {}
+            if not details.get("runtime_healthy"):
+                append_event(self.notification_path, build_event(
+                    source="grid-live-guard", strategy="grid",
+                    bot=PORTFOLIOS["FDUSD"].bot_name, pair="BTC-FDUSD,ETH-FDUSD",
+                    mechanism="infrastructure_integrity_breaker", transition="TRIGGERED",
+                    reason=str(details.get("reason") or "v22 runtime contract unhealthy"),
+                    severity="critical", phase_to="FAIL_CLOSED",
+                    action="ordinary_orders_blocked",
+                    release_sha256=str(gate.get("release_sha256", "")),
+                    model_sha256=str(gate.get("model_sha256", "")),
+                    correlation_id=str(gate.get("generated_at") or details.get("reason")),
+                ))
+            previous = details.get("previous_event_ids", {})
+            for pair, item in gate.get("pairs", {}).items():
+                if previous.get(pair) == item.get("event_id"):
+                    continue
+                active = bool(item.get("risk_off_active"))
+                append_event(self.notification_path, build_event(
+                    source="grid-live-guard", strategy="grid",
+                    bot=PORTFOLIOS["FDUSD"].bot_name, pair=str(pair),
+                    mechanism="v22_weekly_buy_gate",
+                    transition="TRIGGERED" if active else "RECOVERED",
+                    reason=str(item.get("reason") or item.get("transition") or "v22 state changed"),
+                    severity="warning" if active else "info",
+                    phase_from="ACTIVE" if active else "EXITING",
+                    phase_to="EXITING" if active else "ACTIVE",
+                    action="cancel_and_market_exit" if active else "await_all_gates_then_reentry",
+                    trigger_value=item.get("probability"), threshold=item.get("entry_threshold"),
+                    release_sha256=str(gate.get("release_sha256", "")),
+                    model_sha256=str(gate.get("model_sha256", "")),
+                    correlation_id=str(item.get("event_id", "")),
+                ))
+            return
+        if audit_event not in {
+            "grid_circuit_breaker_complete", "grid_circuit_breaker_action_failed",
+        }:
+            return
+        failed = audit_event.endswith("action_failed")
+        append_event(self.notification_path, build_event(
+            source="grid-live-guard", strategy="grid",
+            bot=str(details.get("bot", "")), pair="BTC-FDUSD,ETH-FDUSD",
+            mechanism="infrastructure_integrity_breaker",
+            transition="ACTION_FAILED" if failed else "LATCHED",
+            reason=str(details.get("reason") or details.get("error") or audit_event),
+            severity="critical", phase_to="LATCHED",
+            action="manual_recovery_required" if not failed else "fail_closed_retry",
+            requires_manual_action=not failed,
+            correlation_id=str(details.get("reason") or audit_event),
+        ))
 
     def verify_shadow_exchange_ready(self, pairs: list[str]) -> dict:
         if self.emergency_exchange is None:

@@ -17,10 +17,14 @@ MECHANISMS = (
 def test_release_family_contains_complete_utf8_mechanism_documentation() -> None:
     expected = {
         "README.md",
+        "ONLINE_MODELS.md",
         "RISK_MECHANISMS.md",
         "V22_WEEKLY_MODEL.md",
         "FORCED_EXIT_AND_RECOVERY.md",
         "CONFIGURATION_AND_OPERATIONS.md",
+        "CONTAINERS_AND_SIGNAL_FLOW.md",
+        "CONTRACTS_AND_RUNTIME_FLOW.md",
+        "TELEGRAM_NOTIFICATIONS.md",
     }
     assert {path.name for path in DOCUMENTATION.glob("*.md")} == expected
     content = "\n".join(
@@ -30,6 +34,52 @@ def test_release_family_contains_complete_utf8_mechanism_documentation() -> None
         assert mechanism in content
     assert "\ufffd" not in content
     assert "# 机制事件数" not in content
+
+
+def test_contract_document_covers_runtime_schemas_and_observation_boundary() -> None:
+    content = (DOCUMENTATION / "CONTRACTS_AND_RUNTIME_FLOW.md").read_text(
+        encoding="utf-8"
+    )
+    for schema in (
+        "ethbtc-forced-exit-live-contract-v1",
+        "ethbtc-forced-exit-authorization-v1",
+        "ethbtc-forced-exit-observer-status-v1",
+        "grid-fomc-gate-v1",
+        "ethbtc-telegram-event-v1",
+    ):
+        assert schema in content
+    assert "execution_authorized=false" in content
+    assert "ledger.halted=true" in content
+    assert "TEST_ONLY" in content
+
+
+def test_container_flow_document_describes_current_live_execution() -> None:
+    content = (DOCUMENTATION / "CONTAINERS_AND_SIGNAL_FLOW.md").read_text(
+        encoding="utf-8"
+    )
+    for container in (
+        "grid-live-fdusd-400",
+        "dca-live-btcusdt-200",
+        "dca-live-ethusdt-200",
+        "grid-live-guard",
+        "dca-live-guard",
+        "grid-live-fdusd-scheduler",
+        "dca-macro-gateway",
+        "dca-live-report",
+    ):
+        assert container in content
+    assert "OCI 已切换到 v22 live" in content
+    assert "唯一 v22 producer" in content
+    assert "execution_authorized=false" in content
+    assert "Fail-Closed" in content
+
+
+def test_online_model_document_binds_current_release_and_retired_fallbacks() -> None:
+    content = (DOCUMENTATION / "ONLINE_MODELS.md").read_text(encoding="utf-8")
+    assert "73f59befa431946889a8d5885d04a05adb43c8e81eeab604f1aa89e31f0e9d60" in content
+    assert "xgboost-grid-long-risk-gate-v22-weekly-250d" in content
+    assert "v21 producer 已关闭" in content
+    assert "禁止" in content and "SQZMOM" in content
 
 
 def test_stager_binds_and_copies_documentation() -> None:

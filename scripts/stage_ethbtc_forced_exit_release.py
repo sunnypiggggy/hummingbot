@@ -15,6 +15,11 @@ import joblib
 from ethbtc_forced_exit_contract import EXECUTION_POLICY_VERSION, MODEL_VERSION, PACKAGE_ID, sha256_file
 from xgboost_long_risk_gate_v22 import validate_weekly_bundle
 
+try:
+    from telegram_notifications import append_event, build_event
+except ModuleNotFoundError:
+    from live_guard.telegram_notifications import append_event, build_event
+
 
 def canonical_hash(value: object) -> str:
     raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -34,6 +39,10 @@ def main() -> int:
                         default=Path("release_packages/ethbtc-forced-exit"))
     parser.add_argument("--release-root", type=Path,
                         default=Path("release_packages/ethbtc-forced-exit/releases"))
+    parser.add_argument("--notification-events", type=Path, default=(
+        Path(os.environ["TELEGRAM_NOTIFICATION_EVENTS_PATH"])
+        if os.environ.get("TELEGRAM_NOTIFICATION_EVENTS_PATH") else None
+    ))
     args = parser.parse_args()
     source_lock_path = args.shadow_package / "shadow_lock.json"
     source_lock = json.loads(source_lock_path.read_text(encoding="utf-8"))
@@ -55,6 +64,25 @@ def main() -> int:
         raise RuntimeError("BTC/ETH signed week manifests differ")
     if weeks["BTC-FDUSD"][-1][1] != int(source_lock["effective_end"]):
         raise RuntimeError("lock effective_end does not match the signed model")
+    weekly_report = {}
+    for pair in ("BTC-FDUSD", "ETH-FDUSD"):
+        signed = bundle["pairs"][pair]["weeks"]
+        latest = signed[-1]
+        weekly_report[pair] = {
+            "weeks": len(signed),
+            "signed_coverage": [int(signed[0]["test_start"]), int(latest["test_end"])],
+            "latest_fold": int(latest["fold"]),
+            "training_label_ready_end": int(latest["last_label_ready_ts"]),
+            "development_end": int(latest["development_last_ts"]),
+            "calibration_start": int(latest["calibration_first_ts"]),
+            "calibration_rows": int(latest["calibration_rows"]),
+            "oos_start": int(latest["test_start"]),
+            "oos_end": int(latest["test_end"]),
+            "entry_threshold": float(latest["entry_threshold"]),
+            "entry_quantile": float(latest["entry_quantile"]),
+            "best_tree_count": int(latest["best_tree_count"]),
+            "fold_model_sha256": str(latest["model_sha256"]),
+        }
     execution_policy = json.loads(
         (args.lineage_package / "evidence/execution_policy.json").read_text(encoding="utf-8")
     )
@@ -132,6 +160,25 @@ def main() -> int:
         if staging.exists():
             shutil.rmtree(staging)
         raise
+    if args.notification_events is not None:
+        append_event(args.notification_events, build_event(
+            source="stage-ethbtc-forced-exit-release", strategy="grid+dca",
+            bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
+            pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT",
+            mechanism="parameter_update", transition="PARAMETER_CANDIDATE",
+            reason="v22 周模型生产候选已封包", severity="info",
+            action="render_analysis_then_observe_and_approve",
+            release_sha256=release_sha, model_sha256=source_lock["model_sha256"],
+            correlation_id=release_sha,
+            details={"report_request": "v22_360d", "release_path": str(target),
+                     "effective_start": identity["effective_start"],
+                     "effective_end": identity["effective_end"],
+                     "weekly_report": weekly_report,
+                     "feature_schema_sha256": identity["feature_schema_sha256"],
+                     "strategy_schema_sha256": identity["strategy_schema_sha256"],
+                     "training_data_sha256": identity["training_data_sha256"],
+                     "deployment_allowed": False},
+        ))
     print(json.dumps({"release": str(target), "release_sha256": release_sha,
                       "deployment_allowed": False}, indent=2))
     return 0

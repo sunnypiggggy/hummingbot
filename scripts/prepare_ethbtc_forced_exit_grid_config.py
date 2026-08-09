@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 from pathlib import Path
@@ -16,15 +17,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--backup", type=Path, required=True)
+    parser.add_argument("--production-lock", type=Path, required=True)
     parser.add_argument("--confirm", required=True)
     args = parser.parse_args()
     if args.confirm != CONFIRMATION:
         raise ValueError(f"explicit --confirm {CONFIRMATION} is required")
     original = args.config.read_text(encoding="utf-8")
+    production = json.loads(args.production_lock.read_text(encoding="utf-8"))
+    model_sha = str(production.get("model_sha256", ""))
+    feature_sha = str(production.get("feature_schema_sha256", ""))
+    if any(len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+           for value in (model_sha, feature_sha)):
+        raise ValueError("production lock is missing valid v22 model/feature hashes")
     lines = original.splitlines()
     replacements = {
         "technical_buy_gate_enabled": "true",
         "technical_buy_gate_file": "data/xgboost_risk_gate.json",
+        "technical_model_sha256": model_sha,
+        "technical_feature_sha256": feature_sha,
         "risk_auto_reentry_enabled": "true",
     }
     seen: set[str] = set()

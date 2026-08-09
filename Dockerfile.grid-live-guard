@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt -r /tmp/requirements-gri
 COPY scripts /app
 COPY live_guard/dca_live_guard.py /app/dca_live_guard.py
 COPY live_guard/grid_live_guard.py /app/grid_live_guard.py
+COPY live_guard/telegram_notifications.py /app/telegram_notifications.py
 
 ENV PYTHONPATH=/app \
     OPENBLAS_NUM_THREADS=1 \

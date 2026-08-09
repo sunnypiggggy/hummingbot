@@ -190,6 +190,26 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy._place_grids({"BTC-FDUSD": Decimal("40000")})
         self.assertEqual([Decimal("10")], submitted)
 
+    def test_grid_inventory_cap_keeps_nearest_affordable_buy_level(self):
+        strategy = self.strategy()
+        strategy.config.trading_pairs = ["BTC-FDUSD"]
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.config.min_order_quote = Decimal("5.25")
+        strategy.ledgers = {"BTC-FDUSD": strategy.ledgers["BTC-FDUSD"]}
+        strategy.grid_states = {"BTC-FDUSD": GridState(
+            lower=Decimal("37000"), upper=Decimal("41000"),
+            levels=[Decimal("37000"), Decimal("38000"), Decimal("39000"), Decimal("41000")],
+        )}
+        submitted = []
+        strategy.buy = lambda exchange, pair, amount, order_type, price: (
+            submitted.append((price, amount * price)) or "buy"
+        )
+        strategy.sell = lambda *args, **kwargs: "sell"
+
+        strategy._place_grids({"BTC-FDUSD": Decimal("40000")})
+
+        self.assertEqual([(Decimal("39000"), Decimal("10"))], submitted)
+
     def test_cost_floor_relaxes_to_break_even_after_24_hours(self):
         strategy = self.strategy()
         strategy.excess_inventory_started_at["BTC-FDUSD"] = (

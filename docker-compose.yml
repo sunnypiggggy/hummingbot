@@ -157,6 +157,9 @@ services:
     env_file:
       - .env.control
     environment:
+      # Notification and Hermes credentials are not available to event producers.
+      TELEGRAM_TOKEN: ""
+      ADMIN_USER_ID: ""
       BOTS_PATH: /workspace/bots
       GRID_LIVE_FDUSD_STATE_PATH: /workspace/state
       GRID_LIVE_MACRO_STATE_PATH: /workspace/macro/state.json
@@ -209,6 +212,8 @@ services:
     env_file:
       - .env.control
     environment:
+      TELEGRAM_TOKEN: ""
+      ADMIN_USER_ID: ""
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
       BOTS_PATH: /workspace/bots
       GRID_LIVE_STATE_PATH: /workspace/state
@@ -217,7 +222,9 @@ services:
       GRID_DOCKER_SOCKET: /var/run/docker.sock
       GRID_XGBOOST_GATE_DISTRIBUTION_SECONDS: "30"
       GRID_LIVE_GUARD_INTERVAL: "${GRID_LIVE_GUARD_INTERVAL:-2}"
-      GRID_V21_IN_GUARD_ENABLED: "${GRID_V21_IN_GUARD_ENABLED:-true}"
+      # v22 is the sole production producer.  Keep the retired v21 producer
+      # explicitly disabled so a missing shell-level variable cannot revive it.
+      GRID_V21_IN_GUARD_ENABLED: "false"
       # Explicit operator interlock. Set true only when the reviewed OCI rollout
       # is approved; false remains fail-closed for ordinary BUY orders.
       GRID_V21_LIVE_AUTHORIZED: "${GRID_V21_LIVE_AUTHORIZED:-false}"
@@ -225,7 +232,7 @@ services:
       GRID_V21_CANDLE_PATH: /workspace/v21-candles
       GRID_V21_SEED_CANDLE_PATH: /workspace/research-candles
       GRID_V22_IN_GUARD_ENABLED: "true"
-      GRID_V22_EXECUTION_MODE: "${GRID_V22_EXECUTION_MODE:-observe}"
+      GRID_V22_EXECUTION_MODE: "live"
       GRID_V22_PACKAGE_PATH: /workspace/v22-package
       GRID_V22_CANDLE_PATH: /workspace/technical-candles
       GRID_V22_SEED_CANDLE_PATH: /workspace/research-candles
@@ -269,6 +276,8 @@ services:
     env_file:
       - .env.control
     environment:
+      TELEGRAM_TOKEN: ""
+      ADMIN_USER_ID: ""
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
       BOTS_PATH: /workspace/bots
       DCA_LIVE_STATE_PATH: /workspace/state
@@ -321,11 +330,32 @@ services:
     environment:
       BOTS_PATH: /workspace/bots
       DCA_LIVE_STATE_PATH: /workspace/state
+      GRID_LIVE_STATE_PATH: /workspace/grid
+      ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
       DCA_LIVE_REPORT_INTERVAL: "300"
+      TELEGRAM_NOTIFY_ENABLED: "${TELEGRAM_NOTIFY_ENABLED:-false}"
+      TELEGRAM_PROFIT_REPORT_ENABLED: "${TELEGRAM_PROFIT_REPORT_ENABLED:-true}"
+      TELEGRAM_NOTIFY_BOT_TOKEN_FILE: /run/secrets/telegram_notify_bot_token
+      TELEGRAM_NOTIFY_CHANNEL_ID: "${TELEGRAM_NOTIFY_CHANNEL_ID:-}"
+      TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED: "${TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED:-true}"
+      TELEGRAM_ALERT_FOMC_GATE_ENABLED: "${TELEGRAM_ALERT_FOMC_GATE_ENABLED:-true}"
+      TELEGRAM_ALERT_STRATEGY_LOSS_BREAKER_ENABLED: "${TELEGRAM_ALERT_STRATEGY_LOSS_BREAKER_ENABLED:-true}"
+      TELEGRAM_ALERT_STRATEGY_DRAWDOWN_BREAKER_ENABLED: "${TELEGRAM_ALERT_STRATEGY_DRAWDOWN_BREAKER_ENABLED:-true}"
+      TELEGRAM_ALERT_PORTFOLIO_LOSS_BREAKER_ENABLED: "${TELEGRAM_ALERT_PORTFOLIO_LOSS_BREAKER_ENABLED:-true}"
+      TELEGRAM_ALERT_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED: "${TELEGRAM_ALERT_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED:-true}"
+      TELEGRAM_ALERT_POSITION_PROTECTION_ENABLED: "${TELEGRAM_ALERT_POSITION_PROTECTION_ENABLED:-true}"
+      XGBOOST_NUM_THREADS: "2"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
     command: ["python", "/app/dca_live_report.py"]
     volumes:
       - ./api-files/bots:/workspace/bots:ro
       - ./dca-live-data:/workspace/state
+      - ./grid-live-fdusd-data:/workspace/grid:ro
+      - ./release_packages/ethbtc-forced-exit:/workspace/releases:ro
+    secrets:
+      - telegram_notify_bot_token
     healthcheck:
       test:
         - CMD
@@ -394,3 +424,5 @@ secrets:
     file: "${DCA_BINANCE_EMERGENCY_CREDENTIALS_PATH:-/home/ubuntu/secrets/dca_binance_emergency_credentials.json}"
   grid_binance_emergency_credentials:
     file: "${GRID_BINANCE_EMERGENCY_CREDENTIALS_PATH:-/home/ubuntu/secrets/grid_binance_emergency_credentials.json}"
+  telegram_notify_bot_token:
+    file: "${TELEGRAM_NOTIFY_BOT_TOKEN_PATH:-/home/ubuntu/secrets/telegram_notify_bot_token}"

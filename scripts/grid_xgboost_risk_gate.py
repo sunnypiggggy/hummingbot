@@ -245,7 +245,12 @@ def load_runtime_xgboost_gate(
         # Transitional reader: observation keeps the existing v21 contract in
         # force; after the atomic activation boundary this same file becomes
         # the sole v22 forced-exit contract. There is no fallback once switched.
-        from ethbtc_forced_exit_contract import load_runtime_contract
+        try:
+            # Hummingbot loads strategy helpers from the ``scripts`` package.
+            from scripts.ethbtc_forced_exit_contract import load_runtime_contract
+        except ImportError:
+            # Guard/scheduler images copy helpers directly into /app.
+            from ethbtc_forced_exit_contract import load_runtime_contract
         return load_runtime_contract(path, now=observed, max_age_seconds=max_age_seconds)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))

@@ -446,7 +446,7 @@ class GridLiveSafetyTest(unittest.TestCase):
             "BTC": "0.002", "ETH": "0.05",
         }}}}
         guard.save = lambda: None
-        guard.quantity_step = lambda pair: Decimal("0.000001")
+        guard.market_filter = lambda pair: (Decimal("0.000001"), Decimal("5"))
         orders = []
         guard.emergency_exchange = type("Exchange", (), {
             "market_order": lambda self, pair, side, amount: (

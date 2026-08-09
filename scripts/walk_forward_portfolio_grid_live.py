@@ -56,6 +56,10 @@ from scripts.risk_recovery import (
     advance_recovery, active_state, mark_exit_complete, mark_reentry_complete,
     normalize_state, trigger_state,
 )
+try:
+    from scripts.telegram_notifications import append_event, build_event
+except ModuleNotFoundError:
+    from live_guard.telegram_notifications import append_event, build_event
 
 RUNTIME_STATE_SCHEMA_VERSION = 8
 
@@ -421,6 +425,10 @@ class LivePortfolioGrid(StrategyV2Base):
         if transition != self.macro_transition_key:
             self.macro_transition_key = transition
             state = "PAUSED" if paused else "ACTIVE"
+            self._record_runtime_event(
+                "fomc_gate_transition", paused=paused, healthy=healthy,
+                reason=reason, active_lease_ids=lease_ids,
+            )
             self.notify(
                 f"FOMC MACRO GATE {state}: healthy={healthy} "
                 f"leases={','.join(lease_ids) or 'none'} reason={reason}"
@@ -535,7 +543,10 @@ class LivePortfolioGrid(StrategyV2Base):
         for ledger in self.ledgers.values():
             ledger.halted = True
         self.pending_flatten.update(self.config.trading_pairs)
-        self._record_runtime_event("integrity_failure_latched", reason=reason)
+        self._record_runtime_event(
+            "integrity_failure_latched", reason=reason,
+            recovery=self.portfolio_recovery,
+        )
         self.notify(f"GRID INTEGRITY FAILURE LATCHED: {reason}")
 
     def _poll_parameter_update(self) -> None:
@@ -605,9 +616,20 @@ class LivePortfolioGrid(StrategyV2Base):
                 ))
             buy_budget = min(buy_limits)
             if lower_levels and self.technical_buy_enabled_by_pair.get(pair, False):
-                order_quote = buy_budget / Decimal(len(lower_levels))
+                # Do not silently disable BUY when the position-protection
+                # budget is valid in aggregate but splitting it across every
+                # grid level would put each order below MIN_NOTIONAL.  Prefer
+                # the closest levels and never exceed the existing cap.
+                affordable_levels = int(buy_budget // self.config.min_order_quote)
+                selected_lower_levels = sorted(lower_levels, reverse=True)[
+                    :affordable_levels
+                ]
+                order_quote = (
+                    buy_budget / Decimal(len(selected_lower_levels))
+                    if selected_lower_levels else Decimal("0")
+                )
                 if order_quote >= self.config.min_order_quote:
-                    for level in lower_levels:
+                    for level in selected_lower_levels:
                         order_id = self.buy(self.config.exchange, pair, order_quote / level,
                                             OrderType.LIMIT_MAKER, level)
                         ledger.open_order_ids.add(order_id)
@@ -652,6 +674,7 @@ class LivePortfolioGrid(StrategyV2Base):
         owned = self._owned_active_orders(active_orders)
         action_pending = False
         for pair, ledger in self.ledgers.items():
+            was_pending = pair in self.pending_inventory_exit
             extra = max(ledger.inventory_delta(), Decimal("0"))
             if extra <= 0:
                 self.excess_inventory_started_at[pair] = None
@@ -660,6 +683,11 @@ class LivePortfolioGrid(StrategyV2Base):
                 if order_id is not None and order_id not in active_ids:
                     self.inventory_exit_order_ids.pop(pair, None)
                     ledger.open_order_ids.discard(order_id)
+                if was_pending:
+                    self._record_runtime_event(
+                        "position_protection_recovered", pair=pair,
+                        reason="managed excess inventory cleared",
+                    )
                 continue
             if self.excess_inventory_started_at.get(pair) is None:
                 self.excess_inventory_started_at[pair] = self.current_timestamp
@@ -694,6 +722,7 @@ class LivePortfolioGrid(StrategyV2Base):
             self._record_runtime_event(
                 "inventory_48h_excess_taker_exit",
                 pair=pair, amount=str(extra), excess_quote=str(extra * price),
+                reason="managed excess inventory exceeded maximum hold time",
             )
             action_pending = True
         return action_pending
@@ -749,6 +778,10 @@ class LivePortfolioGrid(StrategyV2Base):
                     trigger_value=(pair_pnl if pair_loss_tripped else pair_drawdown),
                     signal_price=prices[pair], reason=reason,
                 )
+                self._record_runtime_event(
+                    "risk_breaker_triggered", pair=pair,
+                    recovery=self.pair_recovery[pair],
+                )
                 self.notify(
                     f"PAIR BREAKER {pair}: equity={pair_equity:.2f} "
                     f"peak={ledger.peak_equity:.2f} {reason}"
@@ -789,6 +822,10 @@ class LivePortfolioGrid(StrategyV2Base):
                 signal_price={pair: str(prices[pair]) for pair in self.config.trading_pairs},
                 reason=reason,
             )
+            self._record_runtime_event(
+                "risk_breaker_triggered", pair=",".join(self.config.trading_pairs),
+                recovery=self.portfolio_recovery,
+            )
             self.notify(
                 f"PORTFOLIO BREAKER: equity={total:.2f} "
                 f"peak={self.peak_equity:.2f} {reason}"
@@ -817,6 +854,9 @@ class LivePortfolioGrid(StrategyV2Base):
                         "attempts": int(state.get("exit_attempts", 0)),
                         "last_fill": state.get("last_exit_fill", {}),
                     },
+                )
+                self._record_runtime_event(
+                    "risk_exit_complete", pair=pair, recovery=completed_state,
                 )
                 if state is self.portfolio_recovery:
                     if all(
@@ -858,12 +898,18 @@ class LivePortfolioGrid(StrategyV2Base):
                 and self.technical_buy_enabled_by_pair.get(pair, False)
                 and getattr(self.config, "risk_auto_reentry_enabled", False)
             )
+            previous_phase = state.get("phase")
             state = advance_recovery(
                 state, now=self.current_timestamp,
                 healthy=gates_healthy and not active_owned,
                 gates_allow_reentry=gates_allow,
             )
             self.pair_recovery[pair] = state
+            if state.get("phase") != previous_phase:
+                self._record_runtime_event(
+                    "risk_phase_transition", pair=pair,
+                    phase_from=previous_phase, recovery=state,
+                )
             if state.get("reentry_allowed"):
                 if self._reenter_pair(pair, prices[pair]):
                     self.pair_recovery[pair] = mark_reentry_complete(
@@ -872,6 +918,10 @@ class LivePortfolioGrid(StrategyV2Base):
                     )
                     self.ledgers[pair].halted = False
                     self.ledgers[pair].episode_equity_baseline = self.ledgers[pair].equity(prices[pair])
+                    self._record_runtime_event(
+                        "risk_reentry_complete", pair=pair,
+                        recovery=self.pair_recovery[pair],
+                    )
         portfolio = self.portfolio_recovery
         if portfolio.get("phase") != ACTIVE:
             any_blocked = True
@@ -880,12 +930,18 @@ class LivePortfolioGrid(StrategyV2Base):
                 and all(self.technical_buy_enabled_by_pair.values())
                 and getattr(self.config, "risk_auto_reentry_enabled", False)
             )
+            previous_phase = portfolio.get("phase")
             portfolio = advance_recovery(
                 portfolio, now=self.current_timestamp,
                 healthy=gates_healthy and not active_owned,
                 gates_allow_reentry=gates_allow,
             )
             self.portfolio_recovery = portfolio
+            if portfolio.get("phase") != previous_phase:
+                self._record_runtime_event(
+                    "risk_phase_transition", pair=",".join(self.config.trading_pairs),
+                    phase_from=previous_phase, recovery=portfolio,
+                )
             if portfolio.get("reentry_allowed"):
                 completed = all(self._reenter_pair(pair, prices[pair]) for pair in self.config.trading_pairs)
                 if completed:
@@ -894,6 +950,10 @@ class LivePortfolioGrid(StrategyV2Base):
                     )
                     self.portfolio_recovery = mark_reentry_complete(
                         portfolio, now=self.current_timestamp, baseline={"equity": equity},
+                    )
+                    self._record_runtime_event(
+                        "risk_reentry_complete", pair=",".join(self.config.trading_pairs),
+                        recovery=self.portfolio_recovery,
                     )
                     self.portfolio_tripped = False
                     self.peak_equity = equity
@@ -948,12 +1008,76 @@ class LivePortfolioGrid(StrategyV2Base):
         return unknown_side_state
 
     def _record_runtime_event(self, event: str, **details: Any) -> None:
+        occurred_at = datetime.now(timezone.utc).isoformat()
         self.runtime_events.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": occurred_at,
             "event": event,
             **details,
         })
         self.runtime_events = self.runtime_events[-100:]
+        self._append_notification_event(event, occurred_at, details)
+
+    def _append_notification_event(
+        self, runtime_event: str, occurred_at: str, details: Mapping[str, Any],
+    ) -> None:
+        recovery = details.get("recovery") if isinstance(details.get("recovery"), Mapping) else {}
+        mapping = {
+            "risk_breaker_triggered": (str(recovery.get("mechanism", "")), ["TRIGGERED", "EXITING"], "warning"),
+            "risk_exit_complete": (str(recovery.get("mechanism", "")), ["EXIT_COMPLETE", str(recovery.get("phase", ""))], "info"),
+            "risk_phase_transition": (str(recovery.get("mechanism", "")), str(recovery.get("phase", "")), "info"),
+            "risk_reentry_complete": (str(recovery.get("previous_mechanism", "")), "RECOVERED", "info"),
+            "inventory_48h_excess_taker_exit": ("position_protection", "TRIGGERED", "warning"),
+            "position_protection_recovered": ("position_protection", "RECOVERED", "info"),
+            # The producer Guard already emits the v22/integrity trigger.  The
+            # strategy owns execution lifecycle notifications from EXITING on.
+            "v22_forced_exit_triggered": ("v22_weekly_buy_gate", "EXITING", "warning"),
+            "xgboost_buy_gate_recovered_immediate_refresh": ("v22_weekly_buy_gate", "RECOVERED", "info"),
+            "fomc_gate_transition": ("fomc_gate", "TRIGGERED" if details.get("paused") else "RECOVERED", "warning" if details.get("paused") else "info"),
+            "integrity_failure_latched": ("infrastructure_integrity_breaker", "EXITING", "critical"),
+        }
+        mapped = mapping.get(runtime_event)
+        if not mapped or not mapped[0]:
+            return
+        mechanism, transitions, severity = mapped
+        if isinstance(transitions, str):
+            transitions = [transitions]
+        pair = str(details.get("pair") or ",".join(self.config.trading_pairs))
+        reason = str(details.get("reason") or recovery.get("reason") or runtime_event)
+        signal = self.technical_signal_by_pair.get(pair, {}) if pair in self.technical_signal_by_pair else {}
+        correlation = str(
+            signal.get("event_id") or recovery.get("triggered_at")
+            or f"{runtime_event}:{pair}:{reason}"
+        )
+        target = Path(self.config.runtime_state_file).parent / "telegram_events.jsonl"
+        for transition in dict.fromkeys(value for value in transitions if value):
+            manual_action = transition == "LATCHED" or (
+                transition == "REENTRY"
+                and not bool(getattr(self.config, "risk_auto_reentry_enabled", False))
+            )
+            event_details = dict(details)
+            if mechanism == "fomc_gate" and details.get("paused") is not None:
+                event_details.update({
+                    "buy_enabled": not bool(details.get("paused")),
+                    "sell_enabled": not bool(details.get("paused")),
+                })
+            notification = build_event(
+                source="grid-live-strategy", strategy="grid",
+                bot="walk-forward-portfolio-grid-fdusd", pair=pair,
+                mechanism=mechanism, transition=transition, reason=reason,
+                severity=severity,
+                phase_from=str(details.get("phase_from") or ("ACTIVE" if transition == "TRIGGERED" else "")),
+                phase_to=str(recovery.get("phase") or transition),
+                action="cancel_orders_and_flatten" if transition in {"TRIGGERED", "EXITING", "LATCHED"} else runtime_event,
+                trigger_value=recovery.get("trigger_value") or details.get("excess_quote"),
+                model_sha256=str(
+                    signal.get("model_sha256")
+                    or getattr(self.config, "technical_model_sha256", "")
+                ),
+                requires_manual_action=manual_action,
+                occurred_at=occurred_at, correlation_id=correlation,
+                details=event_details,
+            )
+            append_event(target, notification)
 
     def _owned_order_ids(self) -> set[str]:
         return set().union(*(ledger.open_order_ids for ledger in self.ledgers.values()))
