@@ -1,4 +1,8 @@
-"""Mobile PNG/PDF renderer for hash-bound v22 parameter evidence."""
+"""Mobile PNG renderer for hash-bound v22 model-update evidence.
+
+The legacy Grid-only branch can still emit its historical missing-evidence
+PDF, while every v22 model update emits photos only.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +27,11 @@ except ModuleNotFoundError:
     from live_guard.telegram_notifications import (
         report_font, render_analysis_pdf, sha256_file,
     )
+
+try:
+    from render_v22_backtest_png_windows import build_report as build_v22_png_windows
+except ModuleNotFoundError:
+    from scripts.render_v22_backtest_png_windows import build_report as build_v22_png_windows
 
 
 WIDTH, HEIGHT = 1440, 2400
@@ -50,6 +59,18 @@ def _resolve_release(root: Path, event: Mapping[str, Any]) -> Path:
 
 def _read_summary(root: Path) -> dict[str, Any]:
     return json.loads((root / "evidence/summary.json").read_text(encoding="utf-8"))
+
+
+def _signed_start(root: Path) -> int:
+    candidates = (
+        root / "shadow_package/shadow_lock.json",
+        root / "inputs/frozen_v22/shadow_package/shadow_lock.json",
+    )
+    for path in candidates:
+        if path.is_file():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return int(value["effective_start"])
+    raise FileNotFoundError("v22 signed effective_start is missing")
 
 
 def _series(root: Path, strategy: str, pair: str) -> list[dict[str, float]]:
@@ -206,7 +227,7 @@ def render_360_card(root: Path, strategy: str, pair: str, symbol: str,
 def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
                                 output_root: Path) -> list[dict[str, Any]]:
     request = str(event.get("details", {}).get("report_request", ""))
-    if request not in {"v22_360d", "grid_360d"}:
+    if request not in {"v22_png_windows", "v22_360d", "grid_360d"}:
         return []
     directory = output_root / str(event["event_id"])
     directory.mkdir(parents=True, exist_ok=True)
@@ -246,54 +267,29 @@ def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
     summary = _read_summary(release_root)
     evidence_model = str(summary.get("frozen_inputs", {}).get("model_sha256", ""))
     requested_model = str(event.get("model_sha256", ""))
-    if requested_model and requested_model != evidence_model:
-        render_analysis_pdf({
-            "title": "v22 参数分析报告", "report_id": report_id,
-            "status": event.get("transition"), "generated_at": event.get("occurred_at"),
-            "release_sha256": event.get("release_sha256"),
-            "model_sha256": requested_model, "evidence_complete": False,
-            "conclusion": "候选模型哈希没有匹配的360天回放证据",
-            "sections": [{"title": "哈希核验", "text": (
-                f"requested={requested_model}; evidence={evidence_model}。不生成PNG。"
-            )}, {"title": "训练/校准/样本外窗口", "text": json.dumps(
-                event.get("details", {}).get("weekly_report", {}), ensure_ascii=False,
-            )}],
-        }, pdf)
-        return [{"path": str(pdf), "kind": "document", "sha256": sha256_file(pdf),
-                 "caption": "v22参数分析PDF（模型证据不匹配）",
-                 "evidence_complete": False}]
+    manifest = build_v22_png_windows(
+        release_root / "evidence", directory,
+        signed_start=_signed_start(release_root),
+        production_model_sha256=requested_model or evidence_model,
+        evidence_model_sha256=evidence_model,
+    )
+    labels = {
+        "360d": "过去360天",
+        "2026_jan_feb": "2026年1–2月重点窗口",
+        "2026_may_june": "2026年5–6月重点窗口",
+    }
     attachments: list[dict[str, Any]] = []
-    audits = []
-    for strategy, pair, symbol, initial in PAIR_SPECS:
-        target = directory / f"{strategy}_{pair.replace('-', '').lower()}_360d.png"
-        audit = render_360_card(release_root, strategy, pair, symbol, initial, target)
-        audits.append({"strategy": strategy, "pair": pair, **audit})
-        attachments.append({"path": str(target), "kind": "photo",
-                            "sha256": audit["png_sha256"],
-                            "caption": f"{strategy.upper()} {pair}｜360天v22阴影审计"})
-    render_analysis_pdf({
-        "title": "ethbtc-forced-exit 参数分析报告", "report_id": report_id,
-        "status": event.get("transition"), "generated_at": event.get("occurred_at"),
-        "parameter_version": event.get("details", {}).get("parameter_version"),
-        "release_sha256": event.get("release_sha256"),
-        "model_sha256": requested_model or evidence_model, "evidence_complete": True,
-        "conclusion": event.get("reason"),
-        "sections": [
-            {"title": "完整性", "text": "四个机器人分别计算，不合并权益。无签名模型区间按Fail-Closed纯现金展示。"},
-            {"title": "训练/校准/样本外窗口", "text": json.dumps(
-                event.get("details", {}).get("weekly_report", {}), ensure_ascii=False,
-            )},
-            {"title": "模型与数据哈希", "text": json.dumps({
-                key: event.get("details", {}).get(key) for key in (
-                    "feature_schema_sha256", "strategy_schema_sha256", "training_data_sha256",
-                )
-            }, ensure_ascii=False)},
-            {"title": "360天回放", "text": json.dumps(audits, ensure_ascii=False)},
-            {"title": "逐机器人收益/回撤/成交", "text": json.dumps(
-                summary.get("metrics", []), ensure_ascii=False,
-            )},
-        ],
-    }, pdf)
-    attachments.insert(0, {"path": str(pdf), "kind": "document",
-                           "sha256": sha256_file(pdf), "caption": "参数分析PDF"})
+    for image in manifest["images"]:
+        attachments.append({
+            "path": image["path"],
+            "kind": "photo",
+            "sha256": image["sha256"],
+            "caption": (
+                f"{image['strategy'].upper()} {image['pair']}｜"
+                f"{labels[image['window']]}｜单机器人权益"
+            ),
+            "evidence_complete": bool(image.get("evidence")),
+        })
+    if len(attachments) != 12 or any(item["kind"] != "photo" for item in attachments):
+        raise RuntimeError("v22 update report must contain four robots x three PNG windows")
     return attachments

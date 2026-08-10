@@ -1,6 +1,8 @@
 import sys
 import tempfile
 import unittest
+import json
+import time
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -80,38 +82,80 @@ class GridGuardShadowTest(unittest.TestCase):
         atomic_json.assert_not_called()
 
     def test_shadow_preflight_uses_no_fill_test_orders(self):
-        guard = Guard.__new__(Guard)
-        guard.emergency_exchange = Mock()
-        guard.emergency_exchange.open_orders.return_value = []
-        guard.emergency_exchange.account_balances.return_value = {
-            "BTC": {"total": Decimal("0.002")},
-            "ETH": {"total": Decimal("0.05")},
-        }
-        guard.manifest = {"reservations": {"FDUSD": {"base": {
-            "BTC": "0.002", "ETH": "0.05",
-        }}}}
-        guard.emergency_exchange._signed.side_effect = [
-            {
-                "enableWithdrawals": False,
-                "ipRestrict": True,
-                "enableFutures": False,
-                "enableMargin": False,
-            },
-            [{"makerCommission": "0", "takerCommission": "0.001"}],
-            {},
-            [{"makerCommission": "0", "takerCommission": "0.001"}],
-            {},
-        ]
-        result = guard.verify_shadow_exchange_ready(["BTC-FDUSD", "ETH-FDUSD"])
-        self.assertTrue(result["test_order_no_fill"])
-        self.assertEqual(5, guard.emergency_exchange._signed.call_count)
-        self.assertEqual(
-            {"BTC-FDUSD": 0, "ETH-FDUSD": 0},
-            result["open_order_counts"],
-        )
-        test_calls = guard.emergency_exchange._signed.call_args_list[2::2]
-        self.assertTrue(all(call.args[1] == "/api/v3/order/test" for call in test_calls))
-        self.assertEqual("0.001", result["commissions"]["BTC-FDUSD"]["taker_fee"])
+        with tempfile.TemporaryDirectory() as directory:
+            guard = Guard.__new__(Guard)
+            guard.emergency_exchange = Mock()
+            guard.emergency_exchange.open_orders.return_value = []
+            guard.emergency_exchange.account_balances.return_value = {
+                "BTC": {"total": Decimal("0.002")},
+                "ETH": {"total": Decimal("0.05")},
+            }
+            guard.inventory_ledger = Mock()
+            guard.inventory_ledger.status_path = Path(directory) / "account_inventory_status.json"
+            guard.inventory_ledger.status_path.write_text(json.dumps({
+                "schema": "account-inventory-status-v2",
+                "generated_at": time.time(),
+                "healthy": True,
+                "assets": {
+                    "BTC": {"ownership_deficit": "0", "owners": {
+                        "grid:grid-live-fdusd-400": "0",
+                        "dca:dca-live-btcusdt-200": "0.0015",
+                    }},
+                    "ETH": {"ownership_deficit": "0", "owners": {
+                        "grid:grid-live-fdusd-400": "0",
+                        "dca:dca-live-ethusdt-200": "0.05",
+                    }},
+                },
+            }), encoding="utf-8")
+            guard.emergency_exchange._signed.side_effect = [
+                {
+                    "enableWithdrawals": False,
+                    "ipRestrict": True,
+                    "enableFutures": False,
+                    "enableMargin": False,
+                },
+                [{"makerCommission": "0", "takerCommission": "0.001"}],
+                {},
+                [{"makerCommission": "0", "takerCommission": "0.001"}],
+                {},
+            ]
+            result = guard.verify_shadow_exchange_ready(["BTC-FDUSD", "ETH-FDUSD"])
+            self.assertTrue(result["test_order_no_fill"])
+            self.assertEqual(5, guard.emergency_exchange._signed.call_count)
+            self.assertEqual(
+                {"BTC-FDUSD": 0, "ETH-FDUSD": 0},
+                result["open_order_counts"],
+            )
+            self.assertEqual(
+                "shared_account_inventory_v2",
+                result["ownership_coverage"]["BTC-FDUSD"]["source"],
+            )
+            self.assertTrue(result["ownership_coverage"]["BTC-FDUSD"]["covered"])
+            test_calls = guard.emergency_exchange._signed.call_args_list[2::2]
+            self.assertTrue(all(call.args[1] == "/api/v3/order/test" for call in test_calls))
+            self.assertEqual("0.001", result["commissions"]["BTC-FDUSD"]["taker_fee"])
+
+    def test_shadow_preflight_rejects_stale_shared_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guard = Guard.__new__(Guard)
+            guard.emergency_exchange = Mock()
+            guard.emergency_exchange.open_orders.return_value = []
+            guard.emergency_exchange.account_balances.return_value = {}
+            guard.inventory_ledger = Mock()
+            guard.inventory_ledger.status_path = Path(directory) / "account_inventory_status.json"
+            guard.inventory_ledger.status_path.write_text(json.dumps({
+                "schema": "account-inventory-status-v2",
+                "generated_at": time.time() - 31,
+                "healthy": True,
+                "assets": {},
+            }), encoding="utf-8")
+            guard.emergency_exchange._signed.side_effect = [
+                {"enableWithdrawals": False, "ipRestrict": True,
+                 "enableFutures": False, "enableMargin": False},
+                [{"makerCommission": "0", "takerCommission": "0.001"}], {},
+            ]
+            with self.assertRaisesRegex(RuntimeError, "shared inventory status is stale"):
+                guard.verify_shadow_exchange_ready(["BTC-FDUSD"])
 
     def test_shadow_trip_only_audits_would_trip(self):
         with tempfile.TemporaryDirectory() as directory:

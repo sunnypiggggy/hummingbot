@@ -1,0 +1,40 @@
+{
+  "schema": "ethbtc-forced-exit-retrain-verification-v1",
+  "package_id": "ethbtc-forced-exit",
+  "mode": "real_market_data_retrain_reproducibility_check",
+  "release_sha256": "b21c3fa8bc97a9c97d071d1b79d8e9496aa1dd404e827a1a78ac9ceae373b873",
+  "source_release_sha256": "73f59befa431946889a8d5885d04a05adb43c8e81eeab604f1aa89e31f0e9d60",
+  "model_version": "xgboost-grid-long-risk-gate-v22-weekly-250d",
+  "model_sha256": "0d9e455af31f81f89d83d42bd531a4d349b8d0fc24117f16d9570d63cee912cf",
+  "production_model_sha256": "0d9e455af31f81f89d83d42bd531a4d349b8d0fc24117f16d9570d63cee912cf",
+  "byte_for_byte_match": true,
+  "fold": 38,
+  "training_cutoff": 1786287600,
+  "effective_start": 1786287600,
+  "effective_end": 1786892400,
+  "feature_schema_sha256": "1fdc99293e83bd00b68b18174f3dc4f854f5b972c294f8c64e13ad26e8498da1",
+  "strategy_schema_sha256": "6c2afa89b1fa6d2838062871fd7222da95c1bef2ce4599a525dbee98d6b7fd5e",
+  "training_data_sha256": "4320ec8e2111fd59455fcc17c900216bcbe28fe54449f204412752e5ac1343d3",
+  "xgb_threads": 2,
+  "pairs": {
+    "BTC-FDUSD": {
+      "entry_threshold": 0.039184775203466415,
+      "entry_quantile": 0.98,
+      "best_tree_count": 1,
+      "calibration_rows": 241,
+      "week_model_sha256": "12655fae29c528b0e5ec04096e6d125ef4917880a276dfdf4d08f347f8811854"
+    },
+    "ETH-FDUSD": {
+      "entry_threshold": 0.1550473302602768,
+      "entry_quantile": 0.985,
+      "best_tree_count": 371,
+      "calibration_rows": 241,
+      "week_model_sha256": "f02e1326fe3da5995bc48105ad833f1e4bbb13d8d26c1dcc2d121afc61d56ad3"
+    }
+  },
+  "deployment_allowed": false,
+  "production_switch_performed": false,
+  "current_trading_interrupted": false,
+  "next_scheduled_candidate_training_bjt": "2026-08-16T10:00:00+08:00",
+  "note": "This is an independent reproducibility retrain of the active signed week using real Binance candle history. It does not create or approve a future week."
+}

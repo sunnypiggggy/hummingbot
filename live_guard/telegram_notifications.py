@@ -552,7 +552,7 @@ class TelegramOutbox:
                         event["severity"] = "critical"
                         event["transition"] = "REPORT_EVIDENCE_MISSING"
                         event["reason"] = (
-                            f"{event.get('reason', '')}; 360天/PDF证据生成失败："
+                            f"{event.get('reason', '')}; 360天或重点窗口PNG证据生成失败："
                             f"{type(exc).__name__}: {exc}"
                         )
                         event.setdefault("details", {})["evidence_complete"] = False

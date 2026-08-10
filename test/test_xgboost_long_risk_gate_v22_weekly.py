@@ -20,6 +20,7 @@ import grid_xgboost_shadow_gate_v22 as contract  # noqa: E402
 import ethbtc_forced_exit_contract as live_contract  # noqa: E402
 import retrain_xgboost_long_risk_gate_250d_v19 as research  # noqa: E402
 import xgboost_long_risk_gate_v22 as v22  # noqa: E402
+from build_xgboost_v22_shadow_signal import load_state  # noqa: E402
 
 
 RESULT = ROOT / "results/backtests/xgboost_grid_long_risk_gate_v22_weekly_250d"
@@ -34,6 +35,66 @@ def test_v22_embeds_weekly_probability_semantics_and_denies_fallback() -> None:
     assert spec["model_rollover"]["missing_week"] == "fail_closed"
     assert spec["model_rollover"]["previous_week_fallback"] is False
     assert spec["model_rollover"]["v21_final_refit_fallback"] is False
+
+
+def test_signed_contiguous_rollover_preserves_state_when_training_policy_hash_changes(
+    tmp_path: Path,
+) -> None:
+    predecessor_lock = "a" * 64
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "schema": v22.STATE_SCHEMA,
+        "model_version": v22.MODEL_VERSION,
+        "model_sha256": "b" * 64,
+        "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "d" * 64,
+        "candidate_lock_sha256": predecessor_lock,
+        "training_data_sha256": "e" * 64,
+        "manifest_effective_end": 100,
+        "pairs": {"BTC-FDUSD": {"gate_state": {"active": True}}},
+    }), encoding="utf-8")
+    expected = {
+        "model_sha256": "f" * 64,
+        "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "1" * 64,
+        "candidate_lock_sha256": "2" * 64,
+        "training_data_sha256": "3" * 64,
+        "manifest_effective_end": 200,
+    }
+
+    loaded = load_state(
+        state_path, expected, rollover_from_lock_sha256=predecessor_lock,
+    )
+
+    assert loaded["pairs"]["BTC-FDUSD"]["gate_state"]["active"] is True
+    assert loaded["strategy_schema_sha256"] == "1" * 64
+    assert loaded["rollover_strategy_changed"] is True
+
+
+def test_rollover_with_changed_strategy_still_requires_exact_predecessor(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "schema": v22.STATE_SCHEMA,
+        "model_version": v22.MODEL_VERSION,
+        "model_sha256": "b" * 64,
+        "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "d" * 64,
+        "candidate_lock_sha256": "a" * 64,
+        "training_data_sha256": "e" * 64,
+        "manifest_effective_end": 100,
+        "pairs": {},
+    }), encoding="utf-8")
+    expected = {
+        "model_sha256": "f" * 64,
+        "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "1" * 64,
+        "candidate_lock_sha256": "2" * 64,
+        "training_data_sha256": "3" * 64,
+        "manifest_effective_end": 200,
+    }
+
+    with pytest.raises(ValueError, match="state hash/manifest mismatch"):
+        load_state(state_path, expected, rollover_from_lock_sha256="9" * 64)
 
 
 def test_frozen_weekly_bundle_is_contiguous_and_hash_locked() -> None:

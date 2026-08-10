@@ -1,0 +1,59 @@
+{
+  "schema": "ethbtc-oci-source-archive-validation-v1",
+  "generated_at": "2026-08-10T04:05:21.3896815Z",
+  "archive_sha256": "5d7905a550ae114bf94db9ee40ccab7f853b4b5b7255be578abeb848e92500d1",
+  "integrity": "PASS",
+  "oci_source_match": true,
+  "archive_files": 855,
+  "repository_files": 850,
+  "compose_services": 6,
+  "secrets_included": false,
+  "telegram_contract": {
+    "photos": 12,
+    "documents": 0,
+    "mobile_png_dimensions": "1440x2400"
+  },
+  "tests": {
+    "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test/test_telegram_notifications.py test/test_telegram_compose.py",
+    "passed": 23,
+    "failed": 0,
+    "archive_unchanged_after_tests": true
+  },
+  "image_builds": [
+    {
+      "dockerfile": "Dockerfile.dca-live-guard",
+      "result": "PASS",
+      "image_sha256": "11bcd36b9e79a61622ae634728d3b11fe4b2370d56eb860ad8bc6918430efe1e"
+    },
+    {
+      "dockerfile": "Dockerfile.grid-live-guard",
+      "result": "PASS",
+      "image_sha256": "cadb51499480ccbeba92becf59c6a164d2c0a83653db4d01d5395181b5add8ee"
+    },
+    {
+      "dockerfile": "Dockerfile.grid-live-fdusd-scheduler",
+      "result": "PASS",
+      "image_sha256": "27665aac5fba93e476b517d65df8f384a41a21d15370c69cddc8bbe92ea1ec02"
+    }
+  ],
+  "transport_archive_sha256": "b4835009be6ad6aad908e907557fde9a7e4e40af7fb8a2bdc980bc7852f59175",
+  "production_containers": [
+    {
+      "name": "grid-live-guard",
+      "container_id_prefix": "298a0a7f706f",
+      "status_after_validation": "healthy"
+    },
+    {
+      "name": "dca-live-guard",
+      "container_id_prefix": "1b37890fbc6a",
+      "status_after_validation": "healthy"
+    },
+    {
+      "name": "dca-live-report",
+      "container_id_prefix": "97f34c0678e9",
+      "status_after_validation": "healthy"
+    }
+  ],
+  "production_containers_restarted": false,
+  "trading_switches_changed": false
+}

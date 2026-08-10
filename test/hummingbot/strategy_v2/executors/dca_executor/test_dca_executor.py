@@ -48,6 +48,25 @@ class TestDCAExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.set_loggers(loggers=[executor.logger()])
         return executor
 
+    def test_shutdown_retry_seconds_is_validated(self):
+        base = {
+            "id": "shutdown-retry",
+            "timestamp": 123,
+            "side": TradeType.BUY,
+            "connector_name": "binance",
+            "trading_pair": "ETH-USDT",
+            "amounts_quote": [Decimal("10")],
+            "prices": [Decimal("100")],
+        }
+        config = DCAExecutorConfig(**base)
+        self.assertEqual(1.0, config.shutdown_retry_seconds)
+        config = DCAExecutorConfig(**base, shutdown_retry_seconds=0.2)
+        self.assertEqual(0.2, config.shutdown_retry_seconds)
+        with self.assertRaises(ValueError):
+            DCAExecutorConfig(**base, shutdown_retry_seconds=0.1)
+        with self.assertRaises(ValueError):
+            DCAExecutorConfig(**base, shutdown_retry_seconds=5.1)
+
     @patch.object(DCAExecutor, "get_price", MagicMock(return_value=Decimal("120")))
     async def test_control_task_open_orders(self):
         config = DCAExecutorConfig(id="test", timestamp=123, side=TradeType.BUY, connector_name="binance",

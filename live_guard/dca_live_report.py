@@ -729,7 +729,7 @@ class ParameterReportWorker:
     @staticmethod
     def _requires_report(event: Mapping[str, Any]) -> bool:
         return str(event.get("details", {}).get("report_request", "")) in {
-            "v22_360d", "grid_360d",
+            "v22_png_windows", "v22_360d", "grid_360d",
         }
 
     def schedule(self, event: dict[str, Any]) -> list[dict[str, Any]]:
@@ -767,8 +767,8 @@ class ParameterReportWorker:
                     source="dca-live-report", strategy=str(event.get("strategy", "")),
                     bot=str(event.get("bot", "")), pair=str(event.get("pair", "")),
                     mechanism="parameter_update", transition="REPORT_EVIDENCE_MISSING",
-                    reason="360天PNG证据缺失或哈希不匹配；未伪造图片，参数流程沿用原有门槛",
-                    severity="critical", action="review_attached_missing-evidence_pdf",
+                    reason="360天或重点窗口PNG证据缺失；未伪造图片，参数流程沿用原有门槛",
+                    severity="critical", action="review_missing_png_evidence",
                     release_sha256=str(event.get("release_sha256", "")),
                     model_sha256=str(event.get("model_sha256", "")),
                     parameter_sha256=str(event.get("parameter_sha256", "")),
@@ -788,7 +788,7 @@ class ParameterReportWorker:
                 source="dca-live-report", strategy=str(event.get("strategy", "")),
                 bot=str(event.get("bot", "")), pair=str(event.get("pair", "")),
                 mechanism="parameter_update", transition="REPORT_EVIDENCE_MISSING",
-                reason=("360天PNG/PDF证据生成失败；参数更新仍仅受原有交易门槛控制："
+                reason=("360天或重点窗口PNG证据生成失败；参数更新仍仅受原有交易门槛控制："
                         f"{type(exc).__name__}: {exc}"),
                 severity="critical", action="notify_missing_evidence_without_fabrication",
                 release_sha256=str(event.get("release_sha256", "")),
