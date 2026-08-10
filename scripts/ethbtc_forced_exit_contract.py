@@ -129,6 +129,34 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
         if not isinstance(raw_pairs, Mapping) or set(raw_pairs) != set(REQUIRED_PAIRS):
             raise ValueError("contract must contain exactly BTC-FDUSD and ETH-FDUSD")
         pairs: dict[str, dict[str, Any]] = {}
+        source_healthy = payload.get("source_healthy") is True
+        if not source_healthy:
+            if payload.get("execution_authorized") is not False:
+                raise ValueError("unhealthy contract cannot retain execution authorization")
+            for pair in REQUIRED_PAIRS:
+                item = dict(raw_pairs[pair])
+                if item.get("pair") != pair or item.get("source_pair") != pair:
+                    raise ValueError(f"{pair} contract mapping mismatch")
+                if not valid_sha256(item.get("event_id")):
+                    raise ValueError(f"{pair} event id is invalid")
+                if any(item.get(field) is not None for field in (
+                    "probability", "entry_threshold", "week_start", "week_end",
+                )):
+                    raise ValueError(f"{pair} unhealthy contract contains unsigned model values")
+                if int(item.get("signal_ts", -1)) != int(generated.timestamp()):
+                    raise ValueError(f"{pair} unhealthy contract signal timestamp mismatch")
+                if (item.get("risk_off_active") is not True
+                        or item.get("recommended_buy_enabled") is not False
+                        or item.get("buy_enabled") is not False
+                        or item.get("force_exit") is not True
+                        or item.get("transition") != "fail_closed"):
+                    raise ValueError(f"{pair} unhealthy contract is not fail-closed")
+                pairs[pair] = item
+            return {
+                **payload, "pairs": pairs, "runtime_gate_healthy": False,
+                "runtime_age_seconds": max(0, int(age)),
+                "reason": payload.get("reason", "source_unhealthy"),
+            }
         for pair in REQUIRED_PAIRS:
             item = dict(raw_pairs[pair])
             if item.get("pair") != pair or item.get("source_pair") != pair:
@@ -156,7 +184,6 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
             if bool(item.get("force_exit")) != bool(authorized and risk_off):
                 raise ValueError(f"{pair} force-exit state mismatch")
             pairs[pair] = item
-        source_healthy = bool(payload.get("source_healthy"))
         return {
             **payload, "pairs": pairs,
             "runtime_gate_healthy": source_healthy,

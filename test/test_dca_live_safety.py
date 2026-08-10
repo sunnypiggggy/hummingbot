@@ -97,6 +97,12 @@ class FakeEmergencyExchange:
         self.open_order_values = []
         return []
 
+    def account_balances(self):
+        return {
+            "BTC": {"free": Decimal("10"), "locked": Decimal("0"), "total": Decimal("10")},
+            "ETH": {"free": Decimal("10"), "locked": Decimal("0"), "total": Decimal("10")},
+        }
+
     def market_order(self, pair, side, amount):
         self.orders.append((pair, side, amount))
         return {
@@ -454,7 +460,9 @@ class DcaLiveSafetyTest(unittest.TestCase):
             guard.audit_path = Path(directory) / "audit.jsonl"
             guard.state = {"bots": {}}
             guard._notify = lambda message: None
-            guard._flatten = lambda snapshot, bot_name="": {"status": "not_required"}
+            guard._flatten = lambda snapshot, bot_name="": {
+                "status": "dust", "remaining_base": "0", "exit_complete": True,
+            }
             guard._snapshot = lambda bot_name, pair: {
                 "pair": pair, "net_base": "0", "mark_price": "65000"
             }
@@ -544,7 +552,9 @@ class DcaLiveSafetyTest(unittest.TestCase):
             guard.audit_path = Path(directory) / "audit.jsonl"
             guard.state = {"bots": {}}
             guard._notify = lambda message: None
-            guard._flatten = lambda snapshot, bot_name="": {"status": "not_required"}
+            guard._flatten = lambda snapshot, bot_name="": {
+                "status": "dust", "remaining_base": "0", "exit_complete": True,
+            }
             guard._snapshot = lambda bot_name, pair: {
                 "pair": pair, "net_base": "0", "mark_price": "65000"
             }

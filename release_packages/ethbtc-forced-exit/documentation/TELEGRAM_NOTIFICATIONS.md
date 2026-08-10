@@ -84,6 +84,13 @@ PNG；Grid 参数候选只生成两张 Grid PNG。候选与激活在同一 Grid 
 耗时回放/渲染由报告服务内的持久化、低优先级、单工作进程执行，XGBoost、
 OpenBLAS、OMP 和 MKL 线程上限为 2，不阻塞五分钟采集、四小时调度或 outbox。
 
+v22 周模型候选通过硬校验后，频道还会发送 `MODEL_APPROVAL_PENDING`，包含
+release/model 哈希、12小时默认审批截止时间、当前结论和可复制到 Hermes 私聊的提示词。
+提示词要求明确选择批准或拒绝，并说明无人拒绝且全部硬门槛持续通过时默认批准。
+候选训练、PNG/PDF 渲染、频道发送和审批等待不改变当前 release、当前授权或交易合同；
+只有未来周边界的原子部署指针切换才使新模型生效。硬校验失败发送
+`MODEL_UPDATE_BLOCKED`，且绝不因超时自动放行。
+
 ## Hermes 恢复提示
 
 事件进入 `LATCHED`，或在 `REENTRY` 因自动重入开关关闭需要人工处理时，频道

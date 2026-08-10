@@ -1,0 +1,37 @@
+{
+  "schema": "grid-dca-risk-scenario-v1",
+  "scenario_id": "aug10-inventory-redacted",
+  "api_key": "scenario-key",
+  "api_secret": "scenario-secret",
+  "balances": {
+    "BTC": {"free": "0.00305462", "locked": "0"},
+    "ETH": {"free": "0.0528", "locked": "0"},
+    "USDT": {"free": "357.25140790", "locked": "0"},
+    "FDUSD": {"free": "439.73760569", "locked": "0"},
+    "BNB": {"free": "0.10000000", "locked": "0"}
+  },
+  "prices": {
+    "BTCUSDT": "65247.10",
+    "ETHUSDT": "1925.00",
+    "BTCFDUSD": "65247.10",
+    "ETHFDUSD": "1925.00"
+  },
+  "filters": {
+    "BTCUSDT": {"lot_step": "0.00001", "market_step": "0", "min_notional": "5"},
+    "ETHUSDT": {"lot_step": "0.0001", "market_step": "0.0001", "min_notional": "5"},
+    "BTCFDUSD": {"lot_step": "0.00001", "market_step": "0.00001", "min_notional": "5"},
+    "ETHFDUSD": {"lot_step": "0.0001", "market_step": "0.0001", "min_notional": "5"}
+  },
+  "faults": {
+    "POST /api/v3/order": [
+      {
+        "status": "FILLED", "commission": "0.00012469",
+        "commission_asset": "BNB", "drop_response": true
+      }
+    ],
+    "POST telegram": [
+      {"status": 429}
+    ]
+  },
+  "control": {"containers": [], "bots": []}
+}

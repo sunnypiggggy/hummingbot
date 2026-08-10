@@ -1,0 +1,8 @@
+{
+  "schema": "dca-managed-inventory-v1",
+  "source_preflight_sha256": "redacted-stable-source",
+  "pairs": {
+    "BTC-USDT": {"managed_base": "0.001499762327138578"},
+    "ETH-USDT": {"managed_base": "0.050528420907064937"}
+  }
+}

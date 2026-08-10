@@ -1,0 +1,137 @@
+name: hummingbot-risk-scenarios
+
+services:
+  scenario-init:
+    image: python:3.12-slim
+    command: ["sh", "-c", "cp -a /fixtures/. /scenario/ && mkdir -p /scenario/account-inventory"]
+    volumes:
+      - ./test/fixtures/risk_scenarios/aug10_runtime:/fixtures:ro
+      - risk-scenario-data:/scenario
+    networks: [risk-scenario]
+
+  binance-sim:
+    image: python:3.12-slim
+    command:
+      - python
+      - /sim/risk_scenario_server.py
+      - --scenario
+      - /fixtures/aug10_inventory.json
+      - --port
+      - "8080"
+    volumes:
+      - ./test/support:/sim:ro
+      - ./test/fixtures/risk_scenarios:/fixtures:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/scenario/state', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks: [risk-scenario]
+
+  grid-guard-scenario:
+    build:
+      context: .
+      dockerfile: Dockerfile.grid-live-guard
+    image: hummingbot/grid-live-guard:scenario
+    command: ["python", "/app/grid_live_guard.py", "--scenario-smoke"]
+    environment:
+      GUARD_SCENARIO_MODE: "true"
+      GUARD_SCENARIO_ID: aug10-container-replay
+      BINANCE_API_BASE_URL: http://binance-sim:8080
+      GRID_LIVE_STATE_PATH: /scenario/grid
+      GRID_LIVE_RESERVATIONS: /scenario/grid/capital_reservations.json
+      ACCOUNT_INVENTORY_LEDGER_PATH: /scenario/account-inventory
+      GRID_BINANCE_EMERGENCY_CREDENTIALS_FILE: /scenario-secret/scenario_credentials.json
+      GRID_LIVE_TRADING_ENABLED: "false"
+      GRID_LIVE_GUARD_SHADOW: "true"
+      GRID_V21_IN_GUARD_ENABLED: "false"
+      GRID_V22_IN_GUARD_ENABLED: "false"
+      GRID_DOCKER_SOCKET: /scenario/no-docker.sock
+      HUMMINGBOT_API_URL: http://binance-sim:8080
+      USERNAME: scenario
+      PASSWORD: scenario
+    volumes:
+      - risk-scenario-data:/scenario
+      - ./test/fixtures/risk_scenarios:/scenario-secret:ro
+    depends_on:
+      scenario-init: {condition: service_completed_successfully}
+      binance-sim: {condition: service_healthy}
+    networks: [risk-scenario]
+
+  dca-guard-scenario:
+    build:
+      context: .
+      dockerfile: Dockerfile.dca-live-guard
+    image: hummingbot/dca-live-guard:scenario
+    command: ["python", "/app/dca_live_guard.py", "--scenario-inventory-cycles", "3"]
+    environment:
+      GUARD_SCENARIO_MODE: "true"
+      GUARD_SCENARIO_ID: aug10-container-replay
+      GUARD_SCENARIO_CYCLE_SECONDS: "15.1"
+      BINANCE_API_BASE_URL: http://binance-sim:8080
+      DCA_LIVE_STATE_PATH: /scenario/dca
+      GRID_ACCOUNT_INVENTORY_STATE_PATH: /scenario/grid/guard_state.json
+      GRID_ACCOUNT_INVENTORY_RESERVATIONS_PATH: /scenario/grid/capital_reservations.json
+      ACCOUNT_INVENTORY_LEDGER_PATH: /scenario/account-inventory
+      ACCOUNT_INVENTORY_UNATTRIBUTED_AUTO_LIQUIDATE_ENABLED: "true"
+      ACCOUNT_INVENTORY_CONFIRMATION_CYCLES: "3"
+      ACCOUNT_INVENTORY_CONFIRMATION_SECONDS: "30"
+      ACCOUNT_INVENTORY_BOOTSTRAP_BTC_CAP: "0.0015548576728614218"
+      ACCOUNT_INVENTORY_BOOTSTRAP_ETH_CAP: "0.002271579092935063"
+      DCA_BINANCE_EMERGENCY_CREDENTIALS_FILE: /scenario-secret/scenario_credentials.json
+      DCA_DOCKER_SOCKET: /scenario/no-docker.sock
+      DCA_LIVE_TRADING_ENABLED: "false"
+      HUMMINGBOT_API_URL: http://binance-sim:8080
+      USERNAME: scenario
+      PASSWORD: scenario
+    volumes:
+      - risk-scenario-data:/scenario
+      - ./test/fixtures/risk_scenarios:/scenario-secret:ro
+    depends_on:
+      scenario-init: {condition: service_completed_successfully}
+      binance-sim: {condition: service_healthy}
+      grid-guard-scenario: {condition: service_completed_successfully}
+    networks: [risk-scenario]
+
+  sqlite-lock-scenario:
+    image: python:3.12-slim
+    command:
+      - python
+      - /sim/sqlite_lock_holder.py
+      - /scenario/account-inventory/account_inventory.sqlite
+      - --seconds
+      - "8"
+    volumes:
+      - risk-scenario-data:/scenario
+      - ./test/support:/sim:ro
+    depends_on:
+      grid-guard-scenario: {condition: service_completed_successfully}
+    networks: [risk-scenario]
+
+  report-scenario:
+    image: hummingbot/dca-live-guard:scenario
+    command: ["python", "/app/dca_live_report.py", "--once", "--bots-path", "/scenario/bots", "--output-dir", "/scenario/dca"]
+    environment:
+      GUARD_SCENARIO_MODE: "true"
+      GUARD_SCENARIO_ID: aug10-container-replay
+      TELEGRAM_API_BASE_URL: http://binance-sim:8080
+      TELEGRAM_NOTIFY_ENABLED: "true"
+      TELEGRAM_NOTIFY_BOT_TOKEN_FILE: /scenario-secret/scenario_telegram_token
+      TELEGRAM_NOTIFY_CHANNEL_ID: scenario-channel
+      TELEGRAM_PROFIT_REPORT_ENABLED: "false"
+      DCA_LIVE_STATE_PATH: /scenario/dca
+      GRID_LIVE_STATE_PATH: /scenario/grid
+      ETHBTC_RELEASE_FAMILY_PATH: /scenario/releases
+    volumes:
+      - risk-scenario-data:/scenario
+      - ./test/fixtures/risk_scenarios:/scenario-secret:ro
+    depends_on:
+      dca-guard-scenario: {condition: service_completed_successfully}
+    networks: [risk-scenario]
+
+networks:
+  risk-scenario:
+    internal: true
+
+volumes:
+  risk-scenario-data:

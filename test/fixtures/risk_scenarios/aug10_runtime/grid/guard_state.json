@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "bots": {
+    "grid-live-fdusd-400": {
+      "latest": {
+        "observed_at": 0,
+        "database_event_at": 1786300000,
+        "pairs": {
+          "BTC-FDUSD": {"net_base": "-0.00156"},
+          "ETH-FDUSD": {"net_base": "-0.052"}
+        }
+      }
+    }
+  }
+}

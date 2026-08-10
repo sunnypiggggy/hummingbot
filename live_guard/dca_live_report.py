@@ -20,6 +20,11 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 try:
+    from runtime_endpoints import OFFICIAL_BINANCE_API, binance_api_base
+except ModuleNotFoundError:
+    from live_guard.runtime_endpoints import OFFICIAL_BINANCE_API, binance_api_base
+
+try:
     from telegram_notifications import (
         TelegramChannelClient, TelegramOutbox, append_event, build_event,
         format_event, render_mobile_profit_card,
@@ -40,7 +45,7 @@ except ModuleNotFoundError:  # Repository import; container copies it to /app.
     from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE
 
 
-BINANCE_API = "https://api.binance.com"
+BINANCE_API = OFFICIAL_BINANCE_API
 SCALE = Decimal("1000000")
 WINDOW_DAYS = 7
 MAX_PUBLIC_FILLS = 2_000
@@ -528,7 +533,7 @@ class DcaLiveReportCollector:
         pair: str, start: datetime, end: datetime
     ) -> list[dict[str, Any]]:
         response = requests.get(
-            f"{BINANCE_API}/api/v3/klines",
+            f"{binance_api_base()}/api/v3/klines",
             params={
                 "symbol": pair.replace("-", ""),
                 "interval": "15m",

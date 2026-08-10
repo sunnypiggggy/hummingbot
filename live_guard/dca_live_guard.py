@@ -14,6 +14,7 @@ import sqlite3
 import statistics
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -37,6 +38,26 @@ from ethbtc_forced_exit_contract import (
     SCHEMA as V22_CONTRACT_SCHEMA,
     load_runtime_contract as load_runtime_v22_contract,
 )
+try:
+    from account_inventory import (
+        UnifiedInventoryLedger, api_key_fingerprint, canonical_sha256,
+        liquidation_identity, ownership_from_documents,
+    )
+    from emergency_execution import execute_market_liquidation, verify_market_liquidation
+    from runtime_endpoints import (
+        OFFICIAL_BINANCE_API, binance_api_base, guarded_endpoint, scenario_mode,
+    )
+except ModuleNotFoundError:
+    from live_guard.account_inventory import (
+        UnifiedInventoryLedger, api_key_fingerprint, canonical_sha256,
+        liquidation_identity, ownership_from_documents,
+    )
+    from live_guard.emergency_execution import (
+        execute_market_liquidation, verify_market_liquidation,
+    )
+    from live_guard.runtime_endpoints import (
+        OFFICIAL_BINANCE_API, binance_api_base, guarded_endpoint, scenario_mode,
+    )
 from risk_recovery import (
     ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
     EMERGENCY_ESCALATION_SECONDS, EXIT_CRITICAL_SECONDS,
@@ -50,7 +71,7 @@ except ModuleNotFoundError:
 
 
 LOG = logging.getLogger("dca-live-guard")
-BINANCE_API = "https://api.binance.com"
+BINANCE_API = OFFICIAL_BINANCE_API
 V21_PAIR_MAP = {"BTC-USDT": "BTC-FDUSD", "ETH-USDT": "ETH-FDUSD"}
 V22_PAIR_MAP = V21_PAIR_MAP
 
@@ -67,7 +88,11 @@ class BinanceEmergencyClient:
             raise ValueError("Binance emergency credentials are incomplete")
         self.api_key = api_key
         self.api_secret = api_secret.encode()
-        self.base_url = base_url.rstrip("/")
+        self.base_url = guarded_endpoint(
+            base_url, official=BINANCE_API, purpose="Binance signed API"
+        )
+        if scenario_mode() and not api_key.startswith("scenario-"):
+            raise RuntimeError("scenario mode refuses non-scenario Binance credentials")
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": api_key})
         self.time_offset_ms = 0
@@ -143,20 +168,57 @@ class BinanceEmergencyClient:
             }
         return result
 
-    def market_order(self, pair: str, side: str, amount: Decimal) -> dict:
+    def order_by_client_id(self, pair: str, client_order_id: str) -> Optional[dict]:
+        try:
+            value = self._signed(
+                "GET", "/api/v3/order",
+                {"symbol": self.symbol(pair), "origClientOrderId": client_order_id},
+            )
+        except RuntimeError as exc:
+            if "-2013" in str(exc):
+                return None
+            raise
+        if not isinstance(value, dict):
+            return None
+        if Decimal(str(value.get("executedQty", "0"))) > 0 and not value.get("fills"):
+            value = dict(value)
+            value["fills"] = self.order_trades(pair, str(value.get("orderId", "")))
+        return value
+
+    def order_trades(self, pair: str, order_id: str) -> list[dict]:
+        if not order_id:
+            return []
         value = self._signed(
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": self.symbol(pair),
-                "side": side,
-                "type": "MARKET",
-                "quantity": format(amount, "f"),
-                "newOrderRespType": "FULL",
-            },
+            "GET", "/api/v3/myTrades",
+            {"symbol": self.symbol(pair), "orderId": order_id},
         )
-        if not isinstance(value, dict) or value.get("status") != "FILLED":
-            raise RuntimeError(f"Binance emergency market order was not FILLED: {value}")
+        if not isinstance(value, list):
+            return []
+        return [{
+            "price": str(row.get("price", "0")),
+            "qty": str(row.get("qty", "0")),
+            "commission": str(row.get("commission", "0")),
+            "commissionAsset": str(row.get("commissionAsset", "")),
+        } for row in value if isinstance(row, dict)]
+
+    def market_order(
+        self, pair: str, side: str, amount: Decimal,
+        client_order_id: str = "",
+    ) -> dict:
+        parameters = {
+            "symbol": self.symbol(pair),
+            "side": side,
+            "type": "MARKET",
+            "quantity": format(amount, "f"),
+            "newOrderRespType": "FULL",
+        }
+        if client_order_id:
+            parameters["newClientOrderId"] = client_order_id
+        value = self._signed(
+            "POST", "/api/v3/order", parameters,
+        )
+        if not isinstance(value, dict) or not value.get("status"):
+            raise RuntimeError(f"Binance emergency market order response is invalid: {value}")
         return value
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -291,6 +353,35 @@ class Guard:
         self.notification_path = self.state_dir / "telegram_events.jsonl"
         self.telemetry_path = self.state_dir / "dca_macro_telemetry.json"
         self.managed_inventory_path = self.state_dir / "managed_inventory.json"
+        self.grid_inventory_state_path = Path(os.getenv(
+            "GRID_ACCOUNT_INVENTORY_STATE_PATH", "/workspace/grid/guard_state.json"
+        ))
+        self.grid_reservations_path = Path(os.getenv(
+            "GRID_ACCOUNT_INVENTORY_RESERVATIONS_PATH",
+            "/workspace/grid/capital_reservations.json",
+        ))
+        self.inventory_ledger = UnifiedInventoryLedger(Path(os.getenv(
+            "ACCOUNT_INVENTORY_LEDGER_PATH", "/workspace/account-inventory"
+        )))
+        self.inventory_confirmation_cycles = max(
+            3, int(os.getenv("ACCOUNT_INVENTORY_CONFIRMATION_CYCLES", "3"))
+        )
+        self.inventory_confirmation_seconds = max(
+            30, int(os.getenv("ACCOUNT_INVENTORY_CONFIRMATION_SECONDS", "30"))
+        )
+        self.unattributed_auto_liquidate = _env_enabled(
+            "ACCOUNT_INVENTORY_UNATTRIBUTED_AUTO_LIQUIDATE_ENABLED", False
+        )
+        self.inventory_ledger.set_bootstrap_caps({
+            "BTC": os.getenv(
+                "ACCOUNT_INVENTORY_BOOTSTRAP_BTC_CAP",
+                "0.001554857672861421803102676728",
+            ),
+            "ETH": os.getenv(
+                "ACCOUNT_INVENTORY_BOOTSTRAP_ETH_CAP",
+                "0.00227157909293506300096269939",
+            ),
+        })
         self.interval = max(2, int(os.getenv("DCA_LIVE_GUARD_INTERVAL", "10")))
         self.fail_closed_seconds = max(20, int(os.getenv("DCA_LIVE_FAIL_CLOSED_SECONDS", "60")))
         self.v21_gate_path = Path(os.getenv(
@@ -342,6 +433,12 @@ class Guard:
             if secret_path.exists()
             else None
         )
+        self.inventory_account_fingerprint = (
+            api_key_fingerprint(self.emergency_exchange.api_key)
+            if self.emergency_exchange is not None else "unavailable"
+        )
+        if self.emergency_exchange is not None:
+            self.inventory_ledger.bind_account(self.inventory_account_fingerprint)
         docker_socket = os.getenv("DCA_DOCKER_SOCKET", "/var/run/docker.sock")
         self.emergency_docker = (
             DockerEmergencyClient(docker_socket)
@@ -375,6 +472,7 @@ class Guard:
                     "covered": managed > 0 and managed <= available,
                 }
             self.state["ownership_preflight"] = coverage
+        self._migrate_incomplete_latched_inventory()
         self._save()
 
     def _load_state(self) -> Dict[str, Any]:
@@ -400,6 +498,334 @@ class Guard:
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.state, indent=2, sort_keys=True), encoding="utf-8")
         temporary.replace(self.state_path)
+
+    @staticmethod
+    def _read_json(path: Path) -> Dict[str, Any]:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError(f"inventory evidence is not an object: {path}")
+        return value
+
+    def _migrate_incomplete_latched_inventory(self) -> None:
+        """Do not keep claiming an integrity exit completed when startup stock remains.
+
+        The migration intentionally does not submit an order.  Existing latches
+        are marked for manual exit because this rollout was approved to clear
+        only unattributed inventory.
+        """
+        if not self.managed_inventory_path.exists():
+            return
+        managed = self._read_json(self.managed_inventory_path)
+        for pair, spec in LIVE_PAIRS.items():
+            bot = self.state.get("bots", {}).get(spec.bot_name)
+            if not isinstance(bot, dict):
+                continue
+            recovery = normalize_state(bot.get("recovery"))
+            flatten = bot.get("flatten_response", {})
+            if not (
+                recovery.get("phase") == LATCHED
+                and bot.get("action_complete") is True
+                and isinstance(flatten, dict)
+                and flatten.get("status") == "not_required"
+                and recovery.get("exit_completed_at") is None
+            ):
+                continue
+            target = Decimal(str(
+                bot.get("managed_base_target")
+                or managed.get("pairs", {}).get(pair, {}).get("managed_base", "0")
+            ))
+            remaining = max(
+                target + Decimal(str(bot.get("latest", {}).get("net_base", "0"))),
+                Decimal("0"),
+            )
+            if remaining <= 0:
+                continue
+            recovery["remaining_base"] = {pair: str(remaining)}
+            recovery["exit_completed_at"] = None
+            bot.update({
+                "action_complete": False,
+                "manual_exit_required": True,
+                "exit_status": "pending_manual_existing_dca_inventory",
+                "recovery": recovery,
+            })
+
+    def _inventory_evidence(self) -> tuple[dict[str, dict[str, Decimal]], str, bool]:
+        reservations = self._read_json(self.grid_reservations_path)
+        grid_state = self._read_json(self.grid_inventory_state_path)
+        managed = self._read_json(self.managed_inventory_path)
+        ownership = ownership_from_documents(
+            reservations=reservations, grid_state=grid_state,
+            managed_inventory=managed, dca_state=self.state,
+        )
+        running = {}
+        for name in ("grid-live-fdusd-400", *[spec.bot_name for spec in LIVE_PAIRS.values()]):
+            running[name] = bool(
+                self.emergency_docker and self.emergency_docker.matching_containers(name)
+            )
+        now = time.time()
+        grid_latest = next(iter(grid_state.get("bots", {}).values()), {}).get("latest", {})
+        timestamps = [float(grid_latest.get("observed_at") or 0)]
+        timestamps.extend(
+            float(self.state.get("bots", {}).get(spec.bot_name, {}).get("latest", {}).get("observed_at") or 0)
+            for spec in LIVE_PAIRS.values()
+        )
+        # A stopped bot has immutable trade evidence; a running bot requires a
+        # fresh monitor snapshot before an account-wide reconciliation is safe.
+        sources_healthy = all(
+            (not running[name]) or (timestamps[index] > 0 and now - timestamps[index] < 30)
+            for index, name in enumerate(running)
+        )
+        evidence = {
+            "ownership": {
+                asset: {key: str(value) for key, value in owners.items()}
+                for asset, owners in ownership.items()
+            },
+            "reservations_generated_at": reservations.get("generated_at"),
+            "managed_source_sha256": managed.get("source_preflight_sha256"),
+            "grid_database_event_at": grid_latest.get("database_event_at"),
+            "dca_database_event_at": {
+                spec.bot_name: self.state.get("bots", {}).get(spec.bot_name, {}).get(
+                    "latest", {}
+                ).get("database_event_at")
+                for spec in LIVE_PAIRS.values()
+            },
+            "running": running,
+        }
+        return ownership, canonical_sha256(evidence), sources_healthy
+
+    def _inventory_event(
+        self, *, transition: str, asset: str, reason: str,
+        severity: str, action: str, correlation_id: str,
+        details: Dict[str, Any],
+    ) -> None:
+        event = build_event(
+            source="dca-live-guard", strategy="account", bot="shared-binance-spot",
+            pair=f"{asset}-USDT", mechanism="account_inventory",
+            transition=transition, reason=reason, severity=severity,
+            phase_from="", phase_to=transition, action=action,
+            correlation_id=correlation_id, details=details,
+        )
+        if self.inventory_ledger.stage_event(event["event_id"], transition, event):
+            append_event(self.notification_path, event)
+            self.inventory_ledger.mark_event_delivered(event["event_id"])
+
+    def _flush_inventory_events(self) -> int:
+        delivered = 0
+        for row in self.inventory_ledger.pending_events():
+            append_event(self.notification_path, row["payload"])
+            self.inventory_ledger.mark_event_delivered(row["event_id"])
+            delivered += 1
+        return delivered
+
+    def _idempotent_market_order(
+        self, pair: str, side: str, amount: Decimal, client_order_id: str,
+    ) -> dict:
+        existing = None
+        if hasattr(self.emergency_exchange, "order_by_client_id"):
+            existing = self.emergency_exchange.order_by_client_id(pair, client_order_id)
+        if isinstance(existing, dict) and existing.get("status") == "FILLED":
+            return existing
+        try:
+            return self.emergency_exchange.market_order(
+                pair, side, amount, client_order_id
+            )
+        except TypeError:
+            # Compatibility for unit-test fakes. Production clients always
+            # accept the deterministic client id.
+            return self.emergency_exchange.market_order(pair, side, amount)
+        except Exception:
+            if hasattr(self.emergency_exchange, "order_by_client_id"):
+                existing = self.emergency_exchange.order_by_client_id(pair, client_order_id)
+                if isinstance(existing, dict) and existing.get("status") == "FILLED":
+                    return existing
+            raise
+
+    def _liquidate_unattributed(self, asset: str, row: Dict[str, Any], evidence: str) -> None:
+        pair = f"{asset}-USDT"
+        holder = f"dca-live-guard:unattributed:{asset}"
+        with self.inventory_ledger.lease(asset, holder, ttl_seconds=45):
+            related_pairs = (f"{asset}-USDT", f"{asset}-FDUSD")
+            for related in related_pairs:
+                orders = self.emergency_exchange.open_orders(related)
+                if orders:
+                    self.emergency_exchange.cancel_all_orders(related)
+                    return
+            balances = self.emergency_exchange.account_balances()
+            actual_free = balances.get(asset, {}).get("free", Decimal("0"))
+            owned = Decimal(str(row["owned_total"]))
+            self.inventory_ledger.assert_exit_allowed(
+                asset=asset,
+                exchange_total=balances.get(asset, {}).get("total", Decimal("0")),
+            )
+            live_unattributed = max(
+                balances.get(asset, {}).get("total", Decimal("0")) - owned,
+                Decimal("0"),
+            )
+            quantity = min(live_unattributed, actual_free)
+            bootstrap_cap = self.inventory_ledger.bootstrap_cap(asset)
+            if bootstrap_cap is not None:
+                quantity = min(quantity, bootstrap_cap)
+            step, minimum_notional = self._lot_filter(pair)
+            mark = self._price(pair)
+            intended = live_unattributed
+            if bootstrap_cap is not None:
+                intended = min(intended, bootstrap_cap)
+            if actual_free + step < intended and intended * mark >= minimum_notional:
+                raise RuntimeError(
+                    f"unattributed {asset} is locked or unavailable: "
+                    f"intended={intended};free={actual_free}"
+                )
+            amount = (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if amount <= 0 or amount * mark < minimum_notional:
+                dust_quantity = max(quantity, Decimal("0"))
+                job_id, client_order_id = liquidation_identity(
+                    asset, "unattributed_dust", dust_quantity, evidence
+                )
+                self.inventory_ledger.start_job(
+                    job_id=job_id, asset=asset, scope="unattributed_dust",
+                    pair=pair, requested_quantity=dust_quantity,
+                    client_order_id=client_order_id,
+                )
+                self.inventory_ledger.finish_job(
+                    job_id, status="DUST", error=(
+                        f"rounded_quantity={amount};notional={amount * mark};"
+                        f"minimum_notional={minimum_notional}"
+                    ),
+                    consume_bootstrap_asset=asset if bootstrap_cap is not None else "",
+                )
+                self._inventory_event(
+                    transition="INVENTORY_LIQUIDATION_COMPLETED", asset=asset,
+                    reason="unattributed_inventory_below_exchange_minimum",
+                    severity="info", action="record_dust_no_order",
+                    correlation_id=job_id,
+                    details={
+                        "quantity": str(dust_quantity), "dust": True,
+                        "rounded_quantity": str(amount),
+                        "notional": str(amount * mark),
+                        "minimum_notional": str(minimum_notional),
+                    },
+                )
+                return
+            job_id, client_order_id = liquidation_identity(
+                asset, "unattributed", amount, evidence
+            )
+            job = self.inventory_ledger.start_job(
+                job_id=job_id, asset=asset, scope="unattributed", pair=pair,
+                requested_quantity=amount, client_order_id=client_order_id,
+            )
+            if job.get("status") == "COMPLETED":
+                if not self.inventory_ledger.completed_job_verified(job):
+                    raise RuntimeError(
+                        f"completed inventory job {job_id} lacks mandatory verification"
+                    )
+                return
+            self._inventory_event(
+                transition="INVENTORY_LIQUIDATION_STARTED", asset=asset,
+                reason="confirmed_unattributed_inventory", severity="warning",
+                action="market_sell_to_usdt", correlation_id=job_id,
+                details={"quantity": str(amount), "client_order_id": client_order_id},
+            )
+            try:
+                before_total = balances.get(asset, {}).get("total", Decimal("0"))
+                response = execute_market_liquidation(
+                    exchange=self.emergency_exchange,
+                    ledger=self.inventory_ledger, job_id=job_id, pair=pair,
+                    side="SELL", target_quantity=amount,
+                    client_order_id=client_order_id, step_size=step,
+                    minimum_notional=minimum_notional, mark_price=mark,
+                    lease_asset=asset, lease_holder=holder,
+                )
+                verification = verify_market_liquidation(
+                    exchange=self.emergency_exchange, pair=pair,
+                    response=response, requested_quantity=amount,
+                    before_total=before_total, step_size=step,
+                    minimum_notional=minimum_notional, mark_price=mark,
+                    ledger=self.inventory_ledger, lease_asset=asset,
+                    lease_holder=holder,
+                )
+                metrics = self._emergency_fill_metrics(pair, "SELL", response)
+                self.inventory_ledger.finish_job(
+                    job_id, status="COMPLETED",
+                    exchange_order_id=str(response.get("orderId", "")),
+                    executed_quantity=response.get("executedQty", "0"),
+                    quote_quantity=response.get("cummulativeQuoteQty", "0"),
+                    fee_quote=metrics.get("fee_quote", "0"),
+                    fee_details=metrics.get("fee_details", []),
+                    verification=verification,
+                    consume_bootstrap_asset=asset if bootstrap_cap is not None else "",
+                )
+            except Exception as exc:
+                self.inventory_ledger.finish_job(
+                    job_id, status="FAILED", error=repr(exc)
+                )
+                self._inventory_event(
+                    transition="INVENTORY_LIQUIDATION_FAILED", asset=asset,
+                    reason=repr(exc), severity="critical",
+                    action="fail_closed_retry", correlation_id=job_id,
+                    details={"quantity": str(amount)},
+                )
+                raise
+            self._inventory_event(
+                transition="INVENTORY_LIQUIDATION_COMPLETED", asset=asset,
+                reason="unattributed_inventory_converted_to_usdt",
+                severity="info", action="verify_balance_and_dust",
+                correlation_id=job_id,
+                details={
+                    "quantity": response.get("executedQty", "0"),
+                    "quote_quantity": response.get("cummulativeQuoteQty", "0"),
+                    "fee_quote": metrics.get("fee_quote", "0"),
+                    "fee_details": metrics.get("fee_details", []),
+                    "order_id": response.get("orderId", ""),
+                    "verification": verification,
+                },
+            )
+
+    def _reconcile_account_inventory(self, *, risk_actions_enabled: bool) -> dict[str, Any]:
+        if self.emergency_exchange is None:
+            raise RuntimeError("shared inventory reconciliation requires emergency exchange")
+        self._flush_inventory_events()
+        ownership, evidence, sources_healthy = self._inventory_evidence()
+        pairs = ("BTC-USDT", "ETH-USDT", "BTC-FDUSD", "ETH-FDUSD")
+        order_counts = {
+            pair: len(self.emergency_exchange.open_orders(pair)) for pair in pairs
+        }
+        status = self.inventory_ledger.reconcile(
+            account_fingerprint=self.inventory_account_fingerprint,
+            balances=self.emergency_exchange.account_balances(), ownership=ownership,
+            evidence_sha256=evidence, open_order_counts=order_counts,
+            sources_healthy=sources_healthy,
+            confirmation_cycles=self.inventory_confirmation_cycles,
+            confirmation_seconds=self.inventory_confirmation_seconds,
+        )
+        self.state["account_inventory"] = {
+            "healthy": status["healthy"], "evidence_sha256": evidence,
+            "status_path": str(self.inventory_ledger.status_path),
+        }
+        for asset, row in status["assets"].items():
+            deficit = Decimal(row["ownership_deficit"])
+            unattributed = Decimal(row["unattributed"])
+            if deficit > 0:
+                self._inventory_event(
+                    transition="INVENTORY_OWNERSHIP_DEFICIT", asset=asset,
+                    reason="strategy_ownership_exceeds_exchange_balance",
+                    severity="critical", action="fail_closed_no_liquidation",
+                    correlation_id=f"deficit:{asset}:{evidence}", details=row,
+                )
+                continue
+            if unattributed > 0:
+                self._inventory_event(
+                    transition="INVENTORY_UNATTRIBUTED_DETECTED", asset=asset,
+                    reason="exchange_balance_exceeds_all_strategy_ownership",
+                    severity="warning", action="await_three_confirmations",
+                    correlation_id=f"unattributed:{asset}:{evidence}:{unattributed}",
+                    details=row,
+                )
+            if (
+                risk_actions_enabled and self.unattributed_auto_liquidate
+                and row["confirmation"]["confirmed"] and unattributed > 0
+            ):
+                self._liquidate_unattributed(asset, row, evidence)
+        return status
 
     def _audit(self, event: str, **details: Any) -> None:
         record = {"timestamp": datetime.now(timezone.utc).isoformat(), "event": event, **details}
@@ -524,7 +950,7 @@ class Guard:
     @staticmethod
     def _price(pair: str) -> Decimal:
         response = requests.get(
-            f"{BINANCE_API}/api/v3/ticker/price",
+            f"{binance_api_base()}/api/v3/ticker/price",
             params={"symbol": pair.replace("-", "")},
             timeout=15,
         )
@@ -534,7 +960,7 @@ class Guard:
     @staticmethod
     def _lot_filter(pair: str) -> tuple[Decimal, Decimal]:
         response = requests.get(
-            f"{BINANCE_API}/api/v3/exchangeInfo",
+            f"{binance_api_base()}/api/v3/exchangeInfo",
             params={"symbol": pair.replace("-", "")},
             timeout=15,
         )
@@ -543,6 +969,8 @@ class Guard:
         # MARKET_LOT_SIZE is authoritative for the forced-exit/re-entry market
         # orders. Some symbols expose a different market step than LOT_SIZE.
         lot = filters.get("MARKET_LOT_SIZE") or filters["LOT_SIZE"]
+        if Decimal(str(lot.get("stepSize", "0"))) <= 0:
+            lot = filters["LOT_SIZE"]
         notional = filters.get("NOTIONAL") or filters["MIN_NOTIONAL"]
         return Decimal(str(lot["stepSize"])), Decimal(str(notional["minNotional"]))
 
@@ -957,7 +1385,7 @@ class Guard:
     def _market_telemetry(pair: str) -> Dict[str, float]:
         symbol = pair.replace("-", "")
         book = requests.get(
-            f"{BINANCE_API}/api/v3/ticker/bookTicker",
+            f"{binance_api_base()}/api/v3/ticker/bookTicker",
             params={"symbol": symbol},
             timeout=15,
         )
@@ -967,7 +1395,7 @@ class Guard:
         ask = float(book_value["askPrice"])
         mid = (bid + ask) / 2
         klines = requests.get(
-            f"{BINANCE_API}/api/v3/klines",
+            f"{binance_api_base()}/api/v3/klines",
             params={"symbol": symbol, "interval": "1m", "limit": 31},
             timeout=15,
         )
@@ -1057,7 +1485,7 @@ class Guard:
         temporary.replace(self.telemetry_path)
 
     @staticmethod
-    def _emergency_fill_metrics(pair: str, side: str, response: dict) -> Dict[str, str]:
+    def _emergency_fill_metrics(pair: str, side: str, response: dict) -> Dict[str, Any]:
         executed = Decimal(str(response.get("executedQty", "0")))
         quote = Decimal(str(response.get("cummulativeQuoteQty", "0")))
         if executed <= 0:
@@ -1066,10 +1494,15 @@ class Guard:
         base_delta = executed if side == "BUY" else -executed
         quote_cashflow = -quote if side == "BUY" else quote
         fee_quote = Decimal("0")
+        fee_details = []
         for fill in response.get("fills", []):
             commission = Decimal(str(fill.get("commission", "0")))
             asset = str(fill.get("commissionAsset", ""))
             fill_price = Decimal(str(fill.get("price", "0")))
+            fee_details.append({
+                "asset": asset, "commission": str(commission),
+                "fill_price": str(fill_price),
+            })
             if asset == quote_asset:
                 fee_quote += commission
             elif asset == base_asset:
@@ -1081,29 +1514,139 @@ class Guard:
             "base_delta": str(base_delta),
             "quote_cashflow": str(quote_cashflow),
             "fee_quote": str(fee_quote),
+            "fee_details": fee_details,
         }
 
     def _flatten(self, snapshot: Dict[str, Any], bot_name: str = "") -> Dict[str, Any]:
         pair = snapshot["pair"]
-        net_base = Decimal(snapshot["net_base"])
-        if net_base == 0:
-            return {"status": "not_required"}
-        side = "SELL" if net_base > 0 else "BUY"
+        owned = (
+            self._owned_base(bot_name, snapshot)
+            if bot_name else max(Decimal(snapshot["net_base"]), Decimal("0"))
+        )
         step_size, minimum_notional = self._lot_filter(pair)
-        amount = (abs(net_base) / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
         mark_price = Decimal(snapshot["mark_price"])
+        amount = (owned / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
         if amount <= 0 or amount * mark_price < minimum_notional:
-            return {"status": "dust", "side": side, "amount": str(amount),
-                    "notional": str(amount * mark_price)}
+            return {
+                "status": "dust", "side": "SELL", "amount": str(amount),
+                "notional": str(amount * mark_price), "remaining_base": str(owned),
+                "exit_complete": True,
+            }
         if self.emergency_exchange is None:
             raise RuntimeError("independent Binance emergency client is unavailable")
-        response = self.emergency_exchange.market_order(pair, side, amount)
-        metrics = self._emergency_fill_metrics(pair, side, response)
+        base_asset = pair.split("-", 1)[0]
+        digest = canonical_sha256({
+            "bot": bot_name, "pair": pair, "amount": str(amount),
+            "triggered_at": getattr(self, "state", {}).get("bots", {}).get(bot_name, {}).get("tripped_at"),
+        })
+        client_order_id = f"inv-{digest[:24]}"
+        ledger = getattr(self, "inventory_ledger", None)
+        lease_holder = f"dca-live-guard:{bot_name}"
+        lease = ledger.lease(base_asset, lease_holder, ttl_seconds=45) if ledger else nullcontext()
+        job_id = digest
+        with lease:
+            if ledger:
+                balances = self.emergency_exchange.account_balances()
+                total = balances.get(base_asset, {}).get("total", Decimal("0"))
+                free = balances.get(base_asset, {}).get("free", Decimal("0"))
+                if owned > total + step_size:
+                    raise RuntimeError(
+                        f"DCA owned {base_asset} {owned} exceeds exchange total {total}"
+                    )
+                if free + step_size < amount:
+                    raise RuntimeError(
+                        f"DCA owned {base_asset} is locked or not currently sellable"
+                    )
+                ledger.assert_exit_allowed(
+                    asset=base_asset, exchange_total=total,
+                    owner_key=f"dca:{bot_name}", requested_quantity=amount,
+                    tolerance=step_size,
+                )
+                job = ledger.start_job(
+                    job_id=job_id, asset=base_asset, scope=f"dca:{bot_name}",
+                    pair=pair, requested_quantity=amount,
+                    client_order_id=client_order_id,
+                )
+                if job.get("status") == "COMPLETED":
+                    if not ledger.completed_job_verified(job):
+                        raise RuntimeError(
+                            f"completed DCA liquidation job {job_id} lacks verification"
+                        )
+                    executed = Decimal(str(job.get("executed_quantity") or "0"))
+                    remaining = max(owned - executed, Decimal("0"))
+                    bot = self.state["bots"].setdefault(bot_name, {})
+                    adjustments = bot.setdefault("emergency_adjustments", [])
+                    if not any(
+                        str(row.get("client_order_id", "")) == client_order_id
+                        for row in adjustments
+                    ):
+                        adjustments.append({
+                            "recorded_at": datetime.now(timezone.utc).isoformat(),
+                            "pair": pair, "side": "SELL",
+                            "client_order_id": client_order_id,
+                            "order_id": str(job.get("exchange_order_id") or ""),
+                            "executed_qty": str(executed),
+                            "cummulative_quote_qty": str(job.get("quote_quantity") or "0"),
+                            "base_delta": str(-executed),
+                            "quote_cashflow": str(job.get("quote_quantity") or "0"),
+                            "fee_quote": str(job.get("fee_quote") or "0"),
+                            "recovered_from_shared_ledger": True,
+                        })
+                        self._save()
+                    return {
+                        "status": "filled", "side": "SELL", "amount": str(amount),
+                        "order_id": str(job.get("exchange_order_id") or ""),
+                        "executed_qty": str(executed), "remaining_base": str(remaining),
+                        "exit_complete": remaining * mark_price < minimum_notional,
+                        "client_order_id": client_order_id,
+                    }
+            try:
+                if ledger:
+                    response = execute_market_liquidation(
+                        exchange=self.emergency_exchange, ledger=ledger,
+                        job_id=job_id, pair=pair, side="SELL",
+                        target_quantity=amount, client_order_id=client_order_id,
+                        step_size=step_size, minimum_notional=minimum_notional,
+                        mark_price=mark_price, lease_asset=base_asset,
+                        lease_holder=lease_holder,
+                    )
+                    verification = verify_market_liquidation(
+                        exchange=self.emergency_exchange, pair=pair,
+                        response=response, requested_quantity=amount,
+                        before_total=total, step_size=step_size,
+                        minimum_notional=minimum_notional,
+                        mark_price=mark_price,
+                        ledger=ledger, lease_asset=base_asset,
+                        lease_holder=lease_holder,
+                    )
+                else:
+                    response = self._idempotent_market_order(
+                        pair, "SELL", amount, client_order_id
+                    )
+                    verification = None
+                metrics = self._emergency_fill_metrics(pair, "SELL", response)
+                if ledger:
+                    ledger.finish_job(
+                        job_id, status="COMPLETED",
+                        exchange_order_id=str(response.get("orderId", "")),
+                        executed_quantity=response.get("executedQty", "0"),
+                        quote_quantity=response.get("cummulativeQuoteQty", "0"),
+                        fee_quote=metrics.get("fee_quote", "0"),
+                        fee_details=metrics.get("fee_details", []),
+                        verification=verification,
+                    )
+            except Exception as exc:
+                if ledger:
+                    ledger.finish_job(job_id, status="FAILED", error=repr(exc))
+                raise
+        executed = Decimal(str(response.get("executedQty", "0")))
+        remaining = max(owned - executed, Decimal("0"))
         if bot_name:
             adjustment = {
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
                 "pair": pair,
-                "side": side,
+                "side": "SELL",
+                "client_order_id": client_order_id,
                 "order_id": str(response.get("orderId", "")),
                 "executed_qty": str(response.get("executedQty", "0")),
                 "cummulative_quote_qty": str(
@@ -1111,16 +1654,27 @@ class Guard:
                 ),
                 **metrics,
             }
-            self.state["bots"].setdefault(bot_name, {}).setdefault(
+            adjustments = self.state["bots"].setdefault(bot_name, {}).setdefault(
                 "emergency_adjustments", []
-            ).append(adjustment)
+            )
+            if not any(
+                str(row.get("client_order_id", "")) == client_order_id
+                for row in adjustments
+            ):
+                adjustments.append(adjustment)
             self._save()
         return {
             "status": "filled",
-            "side": side,
+            "side": "SELL",
             "amount": str(amount),
             "order_id": str(response.get("orderId", "")),
             "executed_qty": str(response.get("executedQty", "0")),
+            "remaining_base": str(remaining),
+            "exit_complete": bool(
+                remaining <= 0 or remaining * mark_price < minimum_notional
+            ),
+            "client_order_id": client_order_id,
+            "verification": verification,
             **metrics,
         }
 
@@ -1370,7 +1924,19 @@ class Guard:
         if target <= 0:
             target = self._managed_base_target(str(snapshot["pair"]))
             bot["managed_base_target"] = str(target)
-        return max(target + Decimal(str(snapshot["net_base"])), Decimal("0"))
+        adjustments = Decimal("0")
+        for row in bot.get("emergency_adjustments", []):
+            if str(row.get("pair", "")) != str(snapshot["pair"]):
+                continue
+            if row.get("base_delta") is not None:
+                adjustments += Decimal(str(row["base_delta"]))
+            else:
+                executed = Decimal(str(row.get("executed_qty", "0")))
+                adjustments += executed if str(row.get("side", "")).upper() == "BUY" else -executed
+        return max(
+            target + Decimal(str(snapshot["net_base"])) + adjustments,
+            Decimal("0"),
+        )
 
     def _trigger_recoverable(
         self, bot_name: str, snapshot: Dict[str, Any], *, mechanism: str,
@@ -1516,6 +2082,8 @@ class Guard:
 
     def _trip(self, bot_name: str, reason: str, snapshot: Optional[Dict[str, Any]]) -> None:
         bot_state = self.state["bots"].setdefault(bot_name, {})
+        if bot_state.get("manual_exit_required"):
+            return
         if bot_state.get("action_complete"):
             return
         observed = time.time()
@@ -1546,13 +2114,26 @@ class Guard:
             if post_stop_snapshot is None:
                 raise RuntimeError("post-stop strategy inventory could not be read")
             flatten_response = self._flatten(post_stop_snapshot, bot_name)
+            if not bool(flatten_response.get("exit_complete")):
+                raise RuntimeError(
+                    f"DCA inventory exit remains incomplete: {flatten_response}"
+                )
             reconciled_snapshot = self._snapshot(bot_name, pair)
+            recovery = normalize_state(bot_state.get("recovery"))
+            recovery.update({
+                "exit_completed_at": time.time(),
+                "remaining_base": {
+                    pair: str(flatten_response.get("remaining_base", "0"))
+                },
+            })
             bot_state.update({
                 "action_complete": True,
+                "exit_status": "complete",
                 "stop_response": stop_response,
                 "flatten_response": flatten_response,
                 "post_stop_snapshot": post_stop_snapshot,
                 "reconciled_snapshot": reconciled_snapshot,
+                "recovery": recovery,
             })
             self._audit("circuit_breaker_complete", bot=bot_name, reason=reason,
                         snapshot=snapshot, post_stop_snapshot=post_stop_snapshot,
@@ -1571,10 +2152,11 @@ class Guard:
             self._save()
 
     def cycle(self, *, risk_actions_enabled: bool = True) -> None:
-        status_text = json.dumps(self.api.status(), ensure_ascii=True)
         snapshots: Dict[str, Dict[str, Any]] = {}
         now = time.time()
         self._observe_v22_contract(now)
+        self._reconcile_account_inventory(risk_actions_enabled=risk_actions_enabled)
+        status_text = json.dumps(self.api.status(), ensure_ascii=True)
         mechanisms = getattr(self, "mechanisms", {})
         for pair, spec in LIVE_PAIRS.items():
             if spec.bot_name not in status_text:
@@ -1612,7 +2194,10 @@ class Guard:
             bot_state["peak_equity"] = str(peak)
             bot_state["latest"] = snapshot
             if risk_actions_enabled and bot_state.get("tripped"):
-                if not bot_state.get("action_complete"):
+                if (
+                    not bot_state.get("action_complete")
+                    and not bot_state.get("manual_exit_required")
+                ):
                     self._trip(spec.bot_name, bot_state.get("trip_reason", "retry"), snapshot)
                 continue
             latest_stop = float(snapshot.get("latest_stop_loss_at", 0))
@@ -1783,6 +2368,23 @@ class Guard:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if "--scenario-inventory-cycles" in sys.argv[1:]:
+        if not scenario_mode():
+            raise RuntimeError("scenario inventory loop requires GUARD_SCENARIO_MODE=true")
+        index = sys.argv.index("--scenario-inventory-cycles")
+        cycles = int(sys.argv[index + 1])
+        sleep_seconds = float(os.getenv("GUARD_SCENARIO_CYCLE_SECONDS", "15.1"))
+        guard = Guard()
+        reports = []
+        for number in range(cycles):
+            reports.append(guard._reconcile_account_inventory(risk_actions_enabled=True))
+            if number + 1 < cycles:
+                time.sleep(sleep_seconds)
+        print(json.dumps({
+            "scenario_id": os.environ["GUARD_SCENARIO_ID"],
+            "cycles": cycles, "final": reports[-1],
+        }, default=str), flush=True)
+        return 0
     if "--emergency-stop-all" in sys.argv[1:]:
         guard = Guard()
         results = {

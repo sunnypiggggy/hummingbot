@@ -1,7 +1,9 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY scheduler/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY requirements-grid-xgboost.txt /tmp/requirements-grid-xgboost.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt -r /tmp/requirements-grid-xgboost.txt
+COPY scripts /app
 COPY scripts/grid_live_common.py /app/grid_live_common.py
 COPY scripts/grid_macro_gate.py /app/grid_macro_gate.py
 COPY scripts/grid_technical_gate.py /app/grid_technical_gate.py

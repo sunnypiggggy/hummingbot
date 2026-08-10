@@ -21,6 +21,11 @@ from zoneinfo import ZoneInfo
 import requests
 
 try:
+    from runtime_endpoints import telegram_api_base
+except ModuleNotFoundError:
+    from live_guard.runtime_endpoints import telegram_api_base
+
+try:
     from PIL import Image, ImageDraw, ImageFont
 except ModuleNotFoundError:  # Trading producers only need JSONL event helpers.
     Image = ImageDraw = ImageFont = None
@@ -40,6 +45,15 @@ MECHANISMS = (
 LIFECYCLE_TRANSITIONS = {
     "TRIGGERED", "EXITING", "EXIT_COMPLETE", "COOLDOWN", "REENTRY",
     "RECOVERED", "LATCHED", "EXIT_DELAY", "ACTION_FAILED",
+}
+INVENTORY_TRANSITIONS = {
+    "INVENTORY_UNATTRIBUTED_DETECTED",
+    "INVENTORY_LIQUIDATION_STARTED",
+    "INVENTORY_LIQUIDATION_COMPLETED",
+    "INVENTORY_LIQUIDATION_FAILED",
+    "INVENTORY_OWNERSHIP_DEFICIT",
+    "INVENTORY_RECONCILIATION_RECOVERED",
+    "INVENTORY_LIQUIDATION_FEE_RECONCILED",
 }
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MOBILE_CARD_SIZE = (1440, 2400)
@@ -77,13 +91,16 @@ def build_event(
     correlation_id: str = "", details: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     transition = transition.upper()
-    if transition not in LIFECYCLE_TRANSITIONS and transition not in {
+    if transition not in LIFECYCLE_TRANSITIONS and transition not in INVENTORY_TRANSITIONS and transition not in {
         "PARAMETER_CANDIDATE", "PARAMETER_ACTIVATED", "PARAMETER_RETAINED",
+        "MODEL_APPROVAL_PENDING", "MODEL_DEFAULT_APPROVED",
+        "MODEL_APPROVAL_REJECTED", "MODEL_UPDATE_BLOCKED",
         "REPORT_EVIDENCE_MISSING", "PROFIT_REPORT",
     }:
         raise ValueError(f"unsupported notification transition {transition!r}")
     if mechanism not in MECHANISMS and mechanism not in {
         "infrastructure_integrity_breaker", "parameter_update", "profit_report",
+        "account_inventory",
     }:
         raise ValueError(f"unsupported notification mechanism {mechanism!r}")
     occurred_at = occurred_at or datetime.now(timezone.utc).isoformat()
@@ -251,6 +268,49 @@ def explain_event(event: Mapping[str, Any]) -> str:
 
 
 def format_event(event: Mapping[str, Any]) -> str:
+    if event.get("mechanism") == "account_inventory":
+        details = event.get("details", {})
+        transition = str(event.get("transition", ""))
+        names = {
+            "INVENTORY_UNATTRIBUTED_DETECTED": "发现无归属库存",
+            "INVENTORY_LIQUIDATION_STARTED": "无归属库存开始清仓",
+            "INVENTORY_LIQUIDATION_COMPLETED": "无归属库存清仓完成",
+            "INVENTORY_LIQUIDATION_FAILED": "无归属库存清仓失败",
+            "INVENTORY_OWNERSHIP_DEFICIT": "库存归属缺口",
+            "INVENTORY_RECONCILIATION_RECOVERED": "库存归属恢复健康",
+            "INVENTORY_LIQUIDATION_FEE_RECONCILED": "清仓手续费复核完成",
+        }
+        lines = [
+            "🔐 统一库存风控事件",
+            f"状态：{names.get(transition, transition)}",
+            f"资产/交易对：{event.get('pair') or '-'}",
+            f"原因：{event.get('reason') or '-'}",
+            f"动作：{event.get('action') or '-'}",
+        ]
+        for label, key in (
+            ("数量", "quantity"), ("USDT到账", "quote_quantity"),
+            ("手续费", "fee_quote"), ("订单ID", "order_id"),
+        ):
+            if details.get(key) not in (None, ""):
+                lines.append(f"{label}：{details.get(key)}")
+        if details.get("fee_details"):
+            fees = ", ".join(
+                f"{row.get('commission')} {row.get('asset')}"
+                for row in details.get("fee_details", [])
+            )
+            lines.append(f"手续费资产明细：{fees}")
+        if details.get("confirmation"):
+            confirmation = details["confirmation"]
+            lines.append(
+                f"确认：{confirmation.get('cycles', 0)}/3，"
+                f"已确认={confirmation.get('confirmed', False)}"
+            )
+        lines.extend((
+            "影响：交易机器人保持停止和 LATCHED；本事件不会启动交易或解除其他风控。",
+            f"时间：{event.get('occurred_at')}",
+            f"事件ID：{str(event.get('event_id', ''))[:20]}",
+        ))
+        return "\n".join(lines)[:4096]
     if event.get("mechanism") == "profit_report":
         lines = [
             "📊 *Grid / DCA 每4小时策略归属 MTM*",
@@ -272,7 +332,7 @@ def format_event(event: Mapping[str, Any]) -> str:
         lines.extend(("", "_不同报价币种不折算、不合并；详见四张单机器人 PNG。_"))
         return MARKDOWN_MESSAGE_PREFIX + "\n".join(lines)[:4096]
     if event.get("mechanism") == "parameter_update":
-        return "\n".join([
+        lines = [
             "🧪 参数/模型更新报告",
             f"阶段：{event.get('transition')}",
             f"策略/交易对：{event.get('strategy')} / {event.get('pair')}",
@@ -281,7 +341,21 @@ def format_event(event: Mapping[str, Any]) -> str:
             f"模型：{event.get('model_sha256') or '-'}",
             f"参数：{event.get('parameter_sha256') or '-'}",
             f"事件ID：{str(event.get('event_id', ''))[:20]}",
-        ])[:4096]
+        ]
+        details = event.get("details", {})
+        if event.get("transition") == "MODEL_APPROVAL_PENDING":
+            deadline = details.get("review_deadline")
+            if deadline:
+                shown = datetime.fromtimestamp(int(deadline), timezone.utc).astimezone().isoformat()
+                lines.append(f"默认审批截止：{shown}")
+            lines.extend((
+                "默认行为：截止前无人拒绝且全部硬门槛持续通过，则自动批准；任一校验失败不会自动放行。",
+                "审批等待不影响当前模型交易，新模型仅在未来周边界原子切换。",
+                "",
+                "请在 Hermes 私聊中发送以下提示词：",
+                str(details.get("prompt") or "请检查该 v22 周模型候选并选择批准或拒绝。"),
+            ))
+        return "\n".join(lines)[:4096]
     severity = {"critical": "🔴", "warning": "🟠", "info": "🔵"}.get(
         str(event.get("severity", "warning")).lower(), "🟠"
     )
@@ -317,7 +391,7 @@ class TelegramChannelClient:
         token = token_file.read_text(encoding="utf-8").strip()
         if not token or not channel_id:
             raise ValueError("Telegram notification token and channel ID are required")
-        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.base_url = f"{telegram_api_base()}/bot{token}"
         self.channel_id = str(channel_id)
         self.session = session or requests.Session()
 

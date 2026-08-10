@@ -127,7 +127,8 @@ def test_compose_has_no_v22_service_and_dca_mount_is_read_only() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "grid-xgboost-v22:" not in compose
     assert "./grid-live-fdusd-data:/workspace/technical:ro" in compose
-    assert "./release_packages/ethbtc-forced-exit/current:/workspace/v22-package:ro" in compose
+    assert "./release_packages/ethbtc-forced-exit:/workspace/v22-family:ro" in compose
+    assert "GRID_V22_PACKAGE_PATH: /workspace/v22-family" in compose
     assert "DCA_V22_GATE_PATH: /workspace/technical/xgboost_risk_gate.json" in compose
 
 

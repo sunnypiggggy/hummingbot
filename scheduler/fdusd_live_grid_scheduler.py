@@ -10,6 +10,8 @@ import json
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -67,6 +69,16 @@ class Scheduler:
             os.getenv("GRID_LIVE_PARAMETER_UPDATES_ENABLED", "false").lower()
             == "true"
         )
+        self.v22_automation_enabled = (
+            os.getenv("V22_WEEKLY_AUTO_UPDATE_ENABLED", "true").lower() == "true"
+        )
+        self.v22_automation_interval = int(
+            os.getenv("V22_WEEKLY_AUTOMATION_INTERVAL_SECONDS", "60")
+        )
+        if not 30 <= self.v22_automation_interval <= 900:
+            raise ValueError("V22_WEEKLY_AUTOMATION_INTERVAL_SECONDS must be 30..900")
+        self._v22_process: subprocess.Popen | None = None
+        self._last_v22_start = 0.0
         self.reconcile_seconds = int(
             os.getenv("GRID_LIVE_GATE_RECONCILE_SECONDS", "5")
         )
@@ -138,6 +150,7 @@ class Scheduler:
     def reconcile(self) -> None:
         self.ensure_staging()
         self.publish_macro_gate()
+        self.reconcile_v22_automation()
         if not self.parameter_updates_enabled:
             self.ensure_fixed_selection()
             return
@@ -242,6 +255,27 @@ class Scheduler:
                      "candidate_and_activation_merged": True},
         ))
         LOG.warning("Published FDUSD parameter version %s to %d instance(s).", period, updated_instances)
+
+    def reconcile_v22_automation(self) -> None:
+        """Run weekly training out-of-process so trading gate refresh stays responsive."""
+        if not self.v22_automation_enabled:
+            return
+        if self._v22_process is not None:
+            code = self._v22_process.poll()
+            if code is None:
+                return
+            if code:
+                LOG.error("v22 weekly automation exited with status %s", code)
+            self._v22_process = None
+        now = time.time()
+        if now - self._last_v22_start < self.v22_automation_interval:
+            return
+        self._last_v22_start = now
+        self._v22_process = subprocess.Popen(
+            [sys.executable, "/app/v22_weekly_release_manager.py"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
 
     def ensure_fixed_selection(self) -> dict:
         selection = {

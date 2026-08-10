@@ -29,15 +29,15 @@ producer 加载模型、行情和连续状态，发布有执行权的合同；Gr
 
 其他关键配置：`GRID_V22_EXECUTION_MODE`、`GRID_V21_IN_GUARD_ENABLED`、`GRID_V22_PACKAGE_PATH`、`GRID_V22_AUTHORIZATION_PATH`、`DCA_V22_GATE_PATH`、`DCA_RISK_AUTO_REENTRY_ENABLED`，以及 Grid 策略配置 `risk_auto_reentry_enabled`。
 
-## 观察与审批
+## 周模型审批
 
-观察模式真实刷新行情、概率、阈值和拟执行数量，但不修改 controller、不撤单、不成交。默认每个 release 至少观察24小时，要求合同持续新鲜、BTC/ETH覆盖完整、Grid/DCA事件一致、零完整性错误、行情可用率至少99.9%、归属数量不越界。2026-08-09 首次 live 切换由操作人显式豁免了时长条件：实际观察71875秒；其他观察检查和账户预检没有豁免。该历史豁免不自动适用于后续 release。
+默认每周在旧周边界前13小时生成候选，随后进入12小时复核窗口。频道通知包含报告、截止时间和 Hermes 提示词；明确拒绝会终止候选，明确批准可提前完成审批，无操作时仅在所有硬门槛持续通过后默认批准。审批等待不修改当前 release 或 controller，不撤单、不成交，也不暂停当前模型交易。
 
-审批 CLI 绑定 release 与模型哈希、观察报告、账户预检、审批者和未来分钟边界。观察未满、报告失败、当前周到期或哈希变化时拒绝生成授权。
+关键配置为 `V22_WEEKLY_AUTO_UPDATE_ENABLED=true`、`V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS=43200`、`V22_WEEKLY_GENERATION_LEAD_SECONDS=46800`、`V22_WEEKLY_MINIMUM_RUNWAY_SECONDS=86400`。授权绑定 release、模型哈希、复核请求、账户预检、审批方式和未来周边界；完整性、连续性、资金归属、紧急通道或过滤器任一失败时拒绝默认通过。
 
 ## 原子切换
 
-切换前备份 Compose、环境、Guard状态、归属账本、机器人配置和数据库。关闭 v21 producer，将 v22 设置为 live 模式；先以未到激活时间的合同使普通 BUY Fail-Closed，再同批替换 Grid/DCA Guard 和加载新 Grid 配置。两个消费者在同一 `activate_at` 后执行。
+日常周切换不重启交易容器。候选批准后继续使用旧 release；到 `activate_at` 时，调度器原子替换发布族根目录的 `active_deployment.json`，该文件同时内嵌哈希绑定授权并引用不可变 release。Grid producer 每轮读取该单一指针，DCA 消费 Grid 发布的同一合同，因此不会先切模型后切授权，也不会因审批等待关闭当前交易。
 
 ## 激活后检查
 

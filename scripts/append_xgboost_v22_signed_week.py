@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-package", type=Path, default=DEFAULT_PACKAGE)
     parser.add_argument("--candle-dir", type=Path, required=True)
     parser.add_argument("--cutoff", required=True, help="UTC ISO timestamp or epoch seconds")
+    parser.add_argument("--training-cutoff",
+                        help="Training cutoff; defaults to the signed week start")
     parser.add_argument("--output-package", type=Path, required=True)
     parser.add_argument("--xgb-threads", type=int, default=2)
     return parser.parse_args()
@@ -49,6 +51,9 @@ def combined_candle_hash(directory: Path) -> str:
 
 def main() -> int:
     args = parse_args(); cutoff = parse_cutoff(args.cutoff)
+    training_cutoff = parse_cutoff(args.training_cutoff) if args.training_cutoff else cutoff
+    if training_cutoff > cutoff or cutoff - training_cutoff > 48 * 3600:
+        raise ValueError("training cutoff must be within 48h before the signed week start")
     source_lock_path = args.source_package / "shadow_lock.json"
     source_lock = json.loads(source_lock_path.read_text(encoding="utf-8"))
     source_model = Path(source_lock["model_path"])
@@ -61,7 +66,7 @@ def main() -> int:
     candles, quality = load_candles(args.candle_dir)
     for row in quality.itertuples(index=False):
         if int(row.missing_5m_rows) or int(row.invalid_ohlcv_rows): raise RuntimeError(f"{row.pair} candle quality failed")
-    if min(int(frame.timestamp.max()) for frame in candles.values()) < cutoff - 300:
+    if min(int(frame.timestamp.max()) for frame in candles.values()) < training_cutoff - 300:
         raise RuntimeError("candle history does not reach the requested weekly cutoff")
     panel = v19.prepare_panel(labels.relabel_panel(build_feature_panel(candles, horizon_hours=6), candles))
     tune.XGB_N_JOBS = int(args.xgb_threads)
@@ -69,10 +74,12 @@ def main() -> int:
     for pair in v22.PAIRS:
         item = bundle["pairs"][pair]
         frame = v19.target_frame(panel, str(item["target"]), pair)
-        model, calibration, audit = v19.fit_leakage_safe(frame, cutoff, item["config"], item["features"])
+        model, calibration, audit = v19.fit_leakage_safe(
+            frame, training_cutoff, item["config"], item["features"]
+        )
         threshold = float(calibration.probability.quantile(v22.GATES[pair].entry_quantile))
         model_hash = hashlib.sha256(bytes(model.get_booster().save_raw(raw_format="ubj"))).hexdigest()
-        item["weeks"].append({"fold": next_fold, "train_cutoff": cutoff, "test_start": cutoff,
+        item["weeks"].append({"fold": next_fold, "train_cutoff": training_cutoff, "test_start": cutoff,
             "test_end": cutoff + 7 * v19.DAY, "research_test_end": None,
             "entry_threshold": threshold, "calibration_threshold": threshold,
             "entry_quantile": v22.GATES[pair].entry_quantile, "execution_threshold_adjustment": 0.0,
@@ -82,6 +89,8 @@ def main() -> int:
             "calibration_first_ts": int(audit["calibration_first_ts"]),
             "calibration_rows": int(audit["calibration_rows"]), "model_sha256": model_hash,
             "model": model, "cached_probability_max_abs_error": None, "cached_threshold_abs_error": None})
+    bundle["strategy_spec"] = v22.strategy_spec()
+    bundle["strategy_schema_sha256"] = v22.strategy_schema_sha256()
     bundle["training_candle_sha256"] = combined_candle_hash(args.candle_dir)
     bundle["last_signed_week_cutoff"] = cutoff; v22.validate_weekly_bundle(bundle)
     model_dir = args.output_package / "models"; model_dir.mkdir(parents=True, exist_ok=True)
@@ -91,16 +100,17 @@ def main() -> int:
     staged_lock = {**source_lock, "model_path": target.as_posix(), "model_sha256": v19.sha256_file(target),
         "weeks_per_pair": next_fold, "effective_end": cutoff + 7 * v19.DAY,
         "training_candle_sha256": bundle["training_candle_sha256"],
+        "strategy_schema_sha256": bundle["strategy_schema_sha256"],
         "source_package_lock_sha256": v19.sha256_file(source_lock_path),
         "staged_for_review": True, "deployment_allowed": False, "promotion_authorized": False}
     for key in list(staged_lock):
         if key.startswith("application_"): staged_lock.pop(key)
     v19.atomic_json(args.output_package / "shadow_lock.json", staged_lock)
-    print(json.dumps({"fold": next_fold, "cutoff": cutoff, "valid_until": cutoff + 7 * v19.DAY,
+    print(json.dumps({"fold": next_fold, "cutoff": cutoff,
+        "training_cutoff": training_cutoff, "valid_until": cutoff + 7 * v19.DAY,
         "model_sha256": staged_lock["model_sha256"], "staged_for_review": True,
         "deployment_allowed": False}, indent=2)); return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

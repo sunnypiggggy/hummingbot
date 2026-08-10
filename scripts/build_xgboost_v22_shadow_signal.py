@@ -135,7 +135,8 @@ def produce_once(args: argparse.Namespace) -> dict[str, Any]:
     if sha256_file(model_path) != lock["model_sha256"]: raise ValueError("v22 model hash mismatch")
     bundle = joblib.load(model_path); validate_weekly_bundle(bundle)
     if feature_schema_sha256() != lock["feature_schema_sha256"]: raise ValueError("feature hash mismatch")
-    if strategy_schema_sha256() != lock["strategy_schema_sha256"]: raise ValueError("strategy hash mismatch")
+    if strategy_schema_sha256(bundle["strategy_spec"]) != lock["strategy_schema_sha256"]:
+        raise ValueError("strategy hash mismatch")
     ensure_live_cache(args.cache_dir, args.seed_cache_dir)
     if args.refresh_binance: refresh_binance_cache(args.cache_dir)
     candles = load_candles(args.cache_dir)

@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -29,6 +31,20 @@ from ethbtc_forced_exit_contract import (
 )
 from risk_recovery import EMERGENCY_ESCALATION_SECONDS, EXITING
 try:
+    from account_inventory import UnifiedInventoryLedger, api_key_fingerprint, canonical_sha256
+    from emergency_execution import execute_market_liquidation, verify_market_liquidation
+    from runtime_endpoints import OFFICIAL_BINANCE_API, binance_api_base, scenario_mode
+except ModuleNotFoundError:
+    from live_guard.account_inventory import (
+        UnifiedInventoryLedger, api_key_fingerprint, canonical_sha256,
+    )
+    from live_guard.emergency_execution import (
+        execute_market_liquidation, verify_market_liquidation,
+    )
+    from live_guard.runtime_endpoints import (
+        OFFICIAL_BINANCE_API, binance_api_base, scenario_mode,
+    )
+try:
     from telegram_notifications import append_event, build_event
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
@@ -40,7 +56,7 @@ except ImportError:  # Docker image layout
 
 
 LOG = logging.getLogger("grid-live-guard")
-BINANCE_API = "https://api.binance.com"
+BINANCE_API = OFFICIAL_BINANCE_API
 SCALE = Decimal("1000000")
 
 
@@ -117,6 +133,9 @@ class Guard:
         self.state_path = self.state_dir / "guard_state.json"
         self.audit_path = self.state_dir / "risk_audit.jsonl"
         self.notification_path = self.state_dir / "telegram_events.jsonl"
+        self.inventory_ledger = UnifiedInventoryLedger(Path(os.getenv(
+            "ACCOUNT_INVENTORY_LEDGER_PATH", "/workspace/account-inventory"
+        )))
         self.interval = max(2, int(os.getenv("GRID_LIVE_GUARD_INTERVAL", "10")))
         self.fail_closed_seconds = max(
             20, int(os.getenv("GRID_LIVE_FAIL_CLOSED_SECONDS", "60"))
@@ -209,6 +228,10 @@ class Guard:
             if secret_path.exists()
             else None
         )
+        if self.emergency_exchange is not None:
+            self.inventory_ledger.bind_account(
+                api_key_fingerprint(self.emergency_exchange.api_key)
+            )
         docker_socket = os.getenv("GRID_DOCKER_SOCKET", "/var/run/docker.sock")
         self.emergency_docker = (
             DockerEmergencyClient(docker_socket) if Path(docker_socket).exists() else None
@@ -304,16 +327,29 @@ class Guard:
         if audit_event == "grid_xgboost_risk_gate_transition":
             gate = details.get("gate") if isinstance(details.get("gate"), dict) else {}
             if not details.get("runtime_healthy"):
+                failure_reason = str(details.get("reason") or "v22 runtime contract unhealthy")
                 append_event(self.notification_path, build_event(
                     source="grid-live-guard", strategy="grid",
                     bot=PORTFOLIOS["FDUSD"].bot_name, pair="BTC-FDUSD,ETH-FDUSD",
                     mechanism="infrastructure_integrity_breaker", transition="TRIGGERED",
-                    reason=str(details.get("reason") or "v22 runtime contract unhealthy"),
+                    reason=failure_reason,
                     severity="critical", phase_to="FAIL_CLOSED",
                     action="ordinary_orders_blocked",
                     release_sha256=str(gate.get("release_sha256", "")),
                     model_sha256=str(gate.get("model_sha256", "")),
-                    correlation_id=str(gate.get("generated_at") or details.get("reason")),
+                    correlation_id=f"v22-integrity:{failure_reason}",
+                ))
+            elif details.get("previous_failure"):
+                append_event(self.notification_path, build_event(
+                    source="grid-live-guard", strategy="grid",
+                    bot=PORTFOLIOS["FDUSD"].bot_name, pair="BTC-FDUSD,ETH-FDUSD",
+                    mechanism="infrastructure_integrity_breaker", transition="RECOVERED",
+                    reason="v22 runtime contract integrity restored", severity="info",
+                    phase_from="FAIL_CLOSED", phase_to="ACTIVE",
+                    action="release_only_this_integrity_gate",
+                    release_sha256=str(gate.get("release_sha256", "")),
+                    model_sha256=str(gate.get("model_sha256", "")),
+                    correlation_id=f"v22-integrity-recovered:{details.get('previous_failure')}",
                 ))
             previous_states = details.get("previous_risk_off", {})
             for pair, item in gate.get("pairs", {}).items():
@@ -509,13 +545,17 @@ class Guard:
             for pair, value in gate.get("pairs", {}).items()
         }
         self.state["xgboost_risk_gate"] = gate
-        if previous_states != current_states or not healthy:
+        current_failure = None if healthy else str(runtime.get("reason") or "v22 runtime unhealthy")
+        previous_failure = self.state.get("v22_notification_failure")
+        self.state["v22_notification_failure"] = current_failure
+        if previous_states != current_states or current_failure != previous_failure:
             self.audit(
                 "grid_xgboost_risk_gate_transition",
                 previous_risk_off=previous_states,
                 current_risk_off=current_states,
                 runtime_healthy=healthy,
                 reason=runtime.get("reason"), gate=gate,
+                previous_failure=previous_failure,
             )
         return gate
 
@@ -526,7 +566,7 @@ class Guard:
 
     @staticmethod
     def price(pair: str) -> Decimal:
-        response = requests.get(f"{BINANCE_API}/api/v3/ticker/price",
+        response = requests.get(f"{binance_api_base()}/api/v3/ticker/price",
                                 params={"symbol": pair.replace("-", "")}, timeout=15)
         response.raise_for_status()
         return Decimal(str(response.json()["price"]))
@@ -534,7 +574,7 @@ class Guard:
     @staticmethod
     def market_filter(pair: str) -> tuple[Decimal, Decimal]:
         response = requests.get(
-            f"{BINANCE_API}/api/v3/exchangeInfo",
+            f"{binance_api_base()}/api/v3/exchangeInfo",
             params={"symbol": pair.replace("-", "")},
             timeout=15,
         )
@@ -544,6 +584,8 @@ class Guard:
             for item in response.json()["symbols"][0]["filters"]
         }
         lot = filters.get("MARKET_LOT_SIZE") or filters["LOT_SIZE"]
+        if Decimal(str(lot.get("stepSize", "0"))) <= 0:
+            lot = filters["LOT_SIZE"]
         notional = filters.get("NOTIONAL") or filters["MIN_NOTIONAL"]
         return Decimal(str(lot["stepSize"])), Decimal(str(notional["minNotional"]))
 
@@ -601,7 +643,7 @@ class Guard:
         }
 
     @staticmethod
-    def _emergency_fill_metrics(pair: str, side: str, response: dict) -> Dict[str, str]:
+    def _emergency_fill_metrics(pair: str, side: str, response: dict) -> Dict[str, Any]:
         executed = Decimal(str(response.get("executedQty", "0")))
         quote = Decimal(str(response.get("cummulativeQuoteQty", "0")))
         if executed <= 0:
@@ -610,10 +652,15 @@ class Guard:
         base_delta = executed if side == "BUY" else -executed
         quote_cashflow = -quote if side == "BUY" else quote
         fee_quote = Decimal("0")
+        fee_details = []
         for fill in response.get("fills", []):
             commission = Decimal(str(fill.get("commission", "0")))
             asset = str(fill.get("commissionAsset", ""))
             fill_price = Decimal(str(fill.get("price", "0")))
+            fee_details.append({
+                "asset": asset, "commission": str(commission),
+                "fill_price": str(fill_price),
+            })
             if asset == quote_asset:
                 fee_quote += commission
             elif asset == base_asset:
@@ -623,7 +670,29 @@ class Guard:
             "base_delta": str(base_delta),
             "quote_cashflow": str(quote_cashflow),
             "fee_quote": str(fee_quote),
+            "fee_details": fee_details,
         }
+
+    def _idempotent_market_order(
+        self, pair: str, side: str, amount: Decimal, client_order_id: str,
+    ) -> dict:
+        existing = None
+        if hasattr(self.emergency_exchange, "order_by_client_id"):
+            existing = self.emergency_exchange.order_by_client_id(pair, client_order_id)
+        if isinstance(existing, dict) and existing.get("status") == "FILLED":
+            return existing
+        try:
+            return self.emergency_exchange.market_order(
+                pair, side, amount, client_order_id
+            )
+        except TypeError:
+            return self.emergency_exchange.market_order(pair, side, amount)
+        except Exception:
+            if hasattr(self.emergency_exchange, "order_by_client_id"):
+                existing = self.emergency_exchange.order_by_client_id(pair, client_order_id)
+                if isinstance(existing, dict) and existing.get("status") == "FILLED":
+                    return existing
+            raise
 
     def flatten_deltas(self, key: str, snapshot: dict, bot: dict):
         portfolio = PORTFOLIOS[key]
@@ -655,19 +724,125 @@ class Guard:
             side = "SELL"
             if self.emergency_exchange is None:
                 raise RuntimeError("independent Binance emergency client is unavailable")
-            response = self.emergency_exchange.market_order(pair, side, amount)
-            metrics = self._emergency_fill_metrics(pair, side, response)
+            digest = canonical_sha256({
+                "bot": portfolio.bot_name, "pair": pair, "amount": str(amount),
+                "tripped_at": bot.get("tripped_at"),
+            })
+            client_order_id = f"inv-{digest[:24]}"
+            ledger = getattr(self, "inventory_ledger", None)
+            lease_holder = f"grid-live-guard:{portfolio.bot_name}"
+            lease = ledger.lease(
+                base_asset, lease_holder, ttl_seconds=45
+            ) if ledger else nullcontext()
+            with lease:
+                if ledger:
+                    job = ledger.start_job(
+                        job_id=digest, asset=base_asset,
+                        scope=f"grid:{portfolio.bot_name}", pair=pair,
+                        requested_quantity=amount,
+                        client_order_id=client_order_id,
+                    )
+                    if job.get("status") == "COMPLETED":
+                        if not ledger.completed_job_verified(job):
+                            raise RuntimeError(
+                                f"completed Grid liquidation job {digest} lacks verification"
+                            )
+                        executed = str(job.get("executed_quantity") or "0")
+                        adjustments = bot.setdefault("emergency_adjustments", [])
+                        if not any(
+                            str(row.get("client_order_id", "")) == client_order_id
+                            for row in adjustments
+                        ):
+                            adjustments.append({
+                                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                                "pair": pair, "side": "SELL",
+                                "client_order_id": client_order_id,
+                                "order_id": str(job.get("exchange_order_id") or ""),
+                                "executed_qty": executed,
+                                "cummulative_quote_qty": str(job.get("quote_quantity") or "0"),
+                                "base_delta": str(-Decimal(executed)),
+                                "quote_cashflow": str(job.get("quote_quantity") or "0"),
+                                "fee_quote": str(job.get("fee_quote") or "0"),
+                                "recovered_from_shared_ledger": True,
+                            })
+                            self.save()
+                        results[pair] = {
+                            "status": "filled", "order_id": job.get("exchange_order_id"),
+                            "executed_qty": job.get("executed_quantity"),
+                            "client_order_id": client_order_id,
+                        }
+                        continue
+                try:
+                    if ledger:
+                        balances = self.emergency_exchange.account_balances()
+                        before_total = balances.get(base_asset, {}).get(
+                            "total", Decimal("0")
+                        )
+                        if amount > before_total + step:
+                            raise RuntimeError(
+                                f"Grid owned {base_asset} {amount} exceeds exchange total {before_total}"
+                            )
+                        ledger.assert_exit_allowed(
+                            asset=base_asset, exchange_total=before_total,
+                            owner_key=f"grid:{portfolio.bot_name}",
+                            requested_quantity=amount, tolerance=step,
+                        )
+                        response = execute_market_liquidation(
+                            exchange=self.emergency_exchange, ledger=ledger,
+                            job_id=digest, pair=pair, side=side,
+                            target_quantity=amount,
+                            client_order_id=client_order_id,
+                            step_size=step, minimum_notional=minimum_notional,
+                            mark_price=mark, lease_asset=base_asset,
+                            lease_holder=lease_holder,
+                        )
+                        verification = verify_market_liquidation(
+                            exchange=self.emergency_exchange, pair=pair,
+                            response=response, requested_quantity=amount,
+                            before_total=before_total, step_size=step,
+                            minimum_notional=minimum_notional,
+                            mark_price=mark,
+                            ledger=ledger, lease_asset=base_asset,
+                            lease_holder=lease_holder,
+                        )
+                    else:
+                        response = self._idempotent_market_order(
+                            pair, side, amount, client_order_id
+                        )
+                        verification = None
+                    metrics = self._emergency_fill_metrics(pair, side, response)
+                    if ledger:
+                        ledger.finish_job(
+                            digest, status="COMPLETED",
+                            exchange_order_id=str(response.get("orderId", "")),
+                            executed_quantity=response.get("executedQty", "0"),
+                            quote_quantity=response.get("cummulativeQuoteQty", "0"),
+                            fee_quote=metrics.get("fee_quote", "0"),
+                            fee_details=metrics.get("fee_details", []),
+                            verification=verification,
+                        )
+                except Exception as exc:
+                    if ledger:
+                        ledger.finish_job(digest, status="FAILED", error=repr(exc))
+                    raise
             adjustment = {
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
                 "pair": pair,
                 "side": side,
+                "client_order_id": client_order_id,
                 "order_id": str(response.get("orderId", "")),
                 "executed_qty": str(response.get("executedQty", "0")),
                 "cummulative_quote_qty": str(response.get("cummulativeQuoteQty", "0")),
                 **metrics,
             }
-            bot.setdefault("emergency_adjustments", []).append(adjustment)
+            adjustments = bot.setdefault("emergency_adjustments", [])
+            if not any(
+                str(row.get("client_order_id", "")) == client_order_id
+                for row in adjustments
+            ):
+                adjustments.append(adjustment)
             results[pair] = {"status": "filled", **adjustment}
+            results[pair]["verification"] = verification
             self.save()
         return results
 
@@ -952,6 +1127,21 @@ class Guard:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO)
+    if "--scenario-smoke" in sys.argv[1:]:
+        if not scenario_mode():
+            raise RuntimeError("Grid scenario smoke requires GUARD_SCENARIO_MODE=true")
+        guard = Guard()
+        result = {
+            "scenario_id": os.environ["GUARD_SCENARIO_ID"],
+            "prices": {pair: str(guard.price(pair)) for pair in ("BTC-FDUSD", "ETH-FDUSD")},
+            "filters": {
+                pair: [str(value) for value in guard.market_filter(pair)]
+                for pair in ("BTC-FDUSD", "ETH-FDUSD")
+            },
+            "balances": guard.emergency_exchange.account_balances(),
+        }
+        print(json.dumps(result, default=str), flush=True)
+        return 0
     armed = os.getenv("GRID_LIVE_TRADING_ENABLED", "false").lower() == "true"
     shadow = os.getenv("GRID_LIVE_GUARD_SHADOW", "false").lower() == "true"
     if not armed and not shadow:

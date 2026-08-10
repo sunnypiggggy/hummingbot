@@ -106,6 +106,7 @@ def strategy_spec() -> dict[str, Any]:
         "probability_semantics": "weekly_walk_forward_model_with_fold_local_calibration_threshold",
         "model_rollover": {
             "calendar": "frozen_manifest_test_start_inclusive_test_end_exclusive",
+            "forward_staging": "train_cutoff_may_precede_test_start_by_at_most_48h",
             "gate_state_reset": False,
             "missing_week": "fail_closed",
             "previous_week_fallback": False,
@@ -126,8 +127,12 @@ def strategy_spec() -> dict[str, Any]:
     }
 
 
-def strategy_schema_sha256() -> str:
-    encoded = json.dumps(strategy_spec(), sort_keys=True, separators=(",", ":")).encode()
+def strategy_schema_sha256(spec: Mapping[str, Any] | None = None) -> str:
+    encoded = json.dumps(
+        strategy_spec() if spec is None else dict(spec),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -139,9 +144,13 @@ def feature_schema_sha256() -> str:
 def validate_weekly_bundle(bundle: Mapping[str, Any]) -> None:
     if bundle.get("schema") != MODEL_BUNDLE_SCHEMA or bundle.get("model_version") != MODEL_VERSION:
         raise ValueError("v22 weekly bundle schema/model mismatch")
-    if bundle.get("strategy_spec") != strategy_spec():
+    embedded_spec = bundle.get("strategy_spec")
+    current_spec = strategy_spec()
+    legacy_spec = json.loads(json.dumps(current_spec))
+    legacy_spec["model_rollover"].pop("forward_staging", None)
+    if embedded_spec not in (current_spec, legacy_spec):
         raise ValueError("v22 embedded strategy specification mismatch")
-    if bundle.get("strategy_schema_sha256") != strategy_schema_sha256():
+    if bundle.get("strategy_schema_sha256") != strategy_schema_sha256(embedded_spec):
         raise ValueError("v22 strategy hash mismatch")
     if bundle.get("feature_schema_sha256") != feature_schema_sha256():
         raise ValueError("v22 feature hash mismatch")
@@ -160,7 +169,8 @@ def validate_weekly_bundle(bundle: Mapping[str, Any]) -> None:
             start, end, cutoff = int(week["test_start"]), int(week["test_end"]), int(week["train_cutoff"])
             threshold = float(week["entry_threshold"])
             fold = int(week["fold"])
-            if start != cutoff or end <= start or not 0 <= threshold <= 1 or not math.isfinite(threshold):
+            if (cutoff > start or start - cutoff > 48 * 3600 or end <= start
+                    or not 0 <= threshold <= 1 or not math.isfinite(threshold)):
                 raise ValueError(f"{pair} invalid weekly boundary/threshold")
             if previous_end is not None and start != previous_end:
                 raise ValueError(f"{pair} weekly manifest is not contiguous")

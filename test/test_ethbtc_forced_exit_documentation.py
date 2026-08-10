@@ -25,6 +25,9 @@ def test_release_family_contains_complete_utf8_mechanism_documentation() -> None
         "CONTAINERS_AND_SIGNAL_FLOW.md",
         "CONTRACTS_AND_RUNTIME_FLOW.md",
         "TELEGRAM_NOTIFICATIONS.md",
+        "ACCOUNT_INVENTORY.md",
+        "REAL_SCENARIO_TESTING.md",
+        "train_xgboost_codex_historty.md",
     }
     assert {path.name for path in DOCUMENTATION.glob("*.md")} == expected
     content = "\n".join(

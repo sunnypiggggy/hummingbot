@@ -7,6 +7,9 @@ OCI 运维见 [TELEGRAM_NOTIFICATIONS.md](TELEGRAM_NOTIFICATIONS.md)。
 
 ## 文档索引
 
+- [ACCOUNT_INVENTORY.md](ACCOUNT_INVENTORY.md)：Grid/DCA 共享账户归属、事务租约、DCA 完整性清仓和无归属转 USDT。
+- [REAL_SCENARIO_TESTING.md](REAL_SCENARIO_TESTING.md)：隔离HTTP/容器故障注入、真实30秒确认、重启幂等和验收报告。
+
 - [ONLINE_MODELS.md](ONLINE_MODELS.md)：当前 OCI 实际启用的模型、release、哈希、周期、Grid/DCA映射和运行边界。
 - [CONTAINERS_AND_SIGNAL_FLOW.md](CONTAINERS_AND_SIGNAL_FLOW.md)：当前 v22 live 容器拓扑、唯一 producer、共享目录和交易链路。
 - [RISK_MECHANISMS.md](RISK_MECHANISMS.md)：Grid/DCA 七类风控、阈值、作用范围和开关。

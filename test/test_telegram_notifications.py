@@ -23,6 +23,7 @@ from live_guard.telegram_notifications import (
 )
 from live_guard.telegram_parameter_report import build_parameter_attachments
 from live_guard.dca_live_guard import Guard as DcaGuard
+from live_guard.grid_live_guard import Guard as GridGuard
 
 
 def event(**overrides):
@@ -226,6 +227,23 @@ def test_latched_prompt_contains_binding_but_no_secret_or_command():
     assert value["event_id"] in prompt
     assert "release=" in prompt and "model=" in prompt
     assert "Token" not in prompt and "reset --" not in prompt
+
+
+def test_grid_integrity_failure_uses_stable_event_id_across_contract_refreshes(tmp_path):
+    guard = GridGuard.__new__(GridGuard)
+    guard.notification_path = tmp_path / "events.jsonl"
+    details = {
+        "runtime_healthy": False,
+        "reason": "fail_closed:no signed weekly model covers BTC-FDUSD",
+        "gate": {"generated_at": "first", "release_sha256": "a" * 64,
+                 "model_sha256": "b" * 64, "pairs": {}},
+    }
+    guard._emit_notification("grid_xgboost_risk_gate_transition", details)
+    details["gate"]["generated_at"] = "second"
+    guard._emit_notification("grid_xgboost_risk_gate_transition", details)
+    rows = [json.loads(line) for line in guard.notification_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["event_id"] == rows[1]["event_id"]
 
 
 def test_risk_event_message_explains_cause_and_follow_up_impact_in_one_line():

@@ -1,0 +1,11 @@
+{
+  "schema": "grid-capital-reservations-v1",
+  "generated_at": "2026-08-10T00:00:00Z",
+  "portfolio": "FDUSD",
+  "prices": {"BTC-FDUSD": "65247.10", "ETH-FDUSD": "1925.00"},
+  "reservations": {
+    "FDUSD": {
+      "base": {"BTC": "0.00156", "ETH": "0.052"}
+    }
+  }
+}

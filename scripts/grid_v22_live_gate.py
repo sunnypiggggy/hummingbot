@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -29,9 +30,12 @@ except ModuleNotFoundError:  # Package import from the repository root/tests.
 
 
 CONFIRMATION = "PROMOTE-ETHBTC-FORCED-EXIT"
+AUTO_CONFIRMATION = "AUTO-PROMOTE-ETHBTC-FORCED-EXIT-AFTER-12H"
 
 
 def _resolve_package(package_dir: Path) -> tuple[Path, Path]:
+    if (package_dir / "current").exists() and (package_dir / "releases").is_dir():
+        package_dir = package_dir / "current"
     lock = package_dir / "shadow_package/shadow_lock.json"
     production = package_dir / "production_lock.json"
     if not lock.exists():
@@ -41,20 +45,39 @@ def _resolve_package(package_dir: Path) -> tuple[Path, Path]:
     return lock, production
 
 
-def _authorization(path: Path, production: dict[str, Any], observed: int) -> tuple[bool, dict[str, Any], str | None]:
-    if not path.is_file():
-        return False, {}, None
-    raw = path.read_bytes()
-    receipt = json.loads(raw.decode("utf-8"))
+def _authorization(source: Path | dict[str, Any], production: dict[str, Any],
+                   observed: int) -> tuple[bool, dict[str, Any], str | None]:
+    if isinstance(source, Path):
+        if not source.is_file():
+            return False, {}, None
+        raw = source.read_bytes()
+        receipt = json.loads(raw.decode("utf-8"))
+        receipt_hash = sha256_file(source)
+    else:
+        receipt = dict(source)
+        raw = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        receipt_hash = hashlib.sha256(raw).hexdigest()
     expected = {
         "schema": "ethbtc-forced-exit-authorization-v1",
         "package_id": PACKAGE_ID,
         "release_sha256": production["release_sha256"],
         "model_sha256": production["model_sha256"],
-        "confirmation": CONFIRMATION,
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("v22 authorization receipt does not match candidate")
+    confirmation = receipt.get("confirmation")
+    if confirmation not in {CONFIRMATION, AUTO_CONFIRMATION}:
+        raise ValueError("v22 authorization confirmation is invalid")
+    if confirmation == AUTO_CONFIRMATION:
+        if receipt.get("approval_mode") != "automatic_default_after_12h":
+            raise ValueError("automatic v22 authorization mode is invalid")
+        started = int(receipt.get("review_started_at", 0))
+        deadline = int(receipt.get("review_deadline", 0))
+        approved = int(receipt.get("approved_at", 0))
+        if deadline - started < 12 * 60 * 60 or approved < deadline:
+            raise ValueError("automatic v22 authorization did not complete the 12h review")
+        if not receipt.get("approval_request_sha256"):
+            raise ValueError("automatic v22 authorization lacks review request hash")
     activation = int(receipt["activate_at"])
     if activation % 60 or activation < int(receipt["approved_at"]):
         raise ValueError("v22 authorization activation boundary is invalid")
@@ -62,7 +85,28 @@ def _authorization(path: Path, production: dict[str, Any], observed: int) -> tup
         raise ValueError("v22 authorization starts after signed coverage")
     if not receipt.get("observation_report_sha256") or not receipt.get("preflight_sha256"):
         raise ValueError("v22 authorization lacks observation/preflight evidence")
-    return observed >= activation, receipt, sha256_file(path)
+    return observed >= activation, receipt, receipt_hash
+
+
+def _active_deployment(package_dir: Path, authorization_path: Path) -> tuple[Path, Path | dict[str, Any]]:
+    pointer_path = package_dir / "active_deployment.json"
+    if not pointer_path.is_file():
+        return package_dir, authorization_path
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    if (pointer.get("schema") != "ethbtc-forced-exit-active-deployment-v1"
+            or pointer.get("package_id") != PACKAGE_ID):
+        raise ValueError("invalid v22 active deployment pointer")
+    release_sha = str(pointer.get("release_sha256", ""))
+    receipt = pointer.get("authorization")
+    if not isinstance(receipt, dict):
+        raise ValueError("v22 active deployment has no embedded authorization")
+    raw = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    if hashlib.sha256(raw).hexdigest() != pointer.get("authorization_sha256"):
+        raise ValueError("v22 active deployment authorization hash mismatch")
+    release = package_dir / "releases" / release_sha
+    if not release.is_dir():
+        raise FileNotFoundError("v22 active deployment release is missing")
+    return release, receipt
 
 
 class V22LiveGateProducer:
@@ -80,7 +124,10 @@ class V22LiveGateProducer:
 
     def produce(self, observed_at: int | None = None) -> dict[str, Any]:
         observed = int(observed_at if observed_at is not None else time.time())
-        lock_path, production_path = _resolve_package(self.package_dir)
+        active_package, authorization = _active_deployment(
+            self.package_dir, self.authorization_path,
+        )
+        lock_path, production_path = _resolve_package(active_package)
         production = json.loads(production_path.read_text(encoding="utf-8"))
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
         metadata = {
@@ -107,7 +154,7 @@ class V22LiveGateProducer:
                 state=self.shadow_state, refresh_binance=self.refresh_binance,
             ))
             authorized, receipt, receipt_hash = _authorization(
-                self.authorization_path, production, observed,
+                authorization, production, observed,
             )
             source_healthy = bool(shadow.get("source_healthy"))
             pairs = {}

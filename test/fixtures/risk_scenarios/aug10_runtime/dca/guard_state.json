@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "armed": true,
+  "last_success_at": 0,
+  "bots": {
+    "dca-live-btcusdt-200": {
+      "pair": "BTC-USDT",
+      "managed_base_target": "0.001499762327138578",
+      "tripped": true,
+      "action_complete": true,
+      "flatten_response": {"status": "not_required"},
+      "latest": {"net_base": "0", "observed_at": 0},
+      "recovery": {"phase": "LATCHED", "exit_completed_at": null}
+    },
+    "dca-live-ethusdt-200": {
+      "pair": "ETH-USDT",
+      "managed_base_target": "0.050528420907064937",
+      "tripped": true,
+      "action_complete": true,
+      "flatten_response": {"status": "not_required"},
+      "latest": {"net_base": "0", "observed_at": 0},
+      "recovery": {"phase": "LATCHED", "exit_completed_at": null}
+    }
+  }
+}

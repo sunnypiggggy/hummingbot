@@ -14,10 +14,12 @@ import requests
 from PIL import Image, ImageDraw
 
 try:
+    from runtime_endpoints import binance_api_base
     from telegram_notifications import (
         report_font, render_analysis_pdf, sha256_file,
     )
 except ModuleNotFoundError:
+    from live_guard.runtime_endpoints import binance_api_base
     from live_guard.telegram_notifications import (
         report_font, render_analysis_pdf, sha256_file,
     )
@@ -86,7 +88,7 @@ def _binance_hourly(symbol: str, start: int, end: int) -> list[tuple[int, float]
     cursor = start
     while cursor < end:
         response = requests.get(
-            "https://api.binance.com/api/v3/klines",
+            f"{binance_api_base()}/api/v3/klines",
             params={"symbol": symbol, "interval": "1h", "startTime": cursor * 1000,
                     "endTime": end * 1000, "limit": 1000}, timeout=25,
         )

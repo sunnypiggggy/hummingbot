@@ -17,6 +17,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import grid_xgboost_shadow_gate_v22 as contract  # noqa: E402
+import ethbtc_forced_exit_contract as live_contract  # noqa: E402
 import retrain_xgboost_long_risk_gate_250d_v19 as research  # noqa: E402
 import xgboost_long_risk_gate_v22 as v22  # noqa: E402
 
@@ -79,3 +80,23 @@ def test_failed_contract_is_buy_disabled_for_both_pairs(tmp_path: Path) -> None:
     assert all(loaded["pairs"][pair]["buy_enabled"] is False for pair in v22.PAIRS)
     assert all(loaded["pairs"][pair]["long"]["risk_off_active"] is True for pair in v22.PAIRS)
 
+
+def test_failed_live_contract_preserves_primary_reason_without_float_none(tmp_path: Path) -> None:
+    now = int(datetime.now(timezone.utc).timestamp())
+    path = tmp_path / "failed-live.json"
+    value = live_contract.failed_contract(
+        generated_at=now,
+        reason="no signed weekly model covers current signal",
+        metadata={
+            "release_sha256": "a" * 64, "model_sha256": "b" * 64,
+            "feature_schema_sha256": "c" * 64, "strategy_schema_sha256": "d" * 64,
+            "training_data_sha256": "e" * 64,
+        },
+    )
+    live_contract.atomic_json(path, value)
+    loaded = live_contract.load_runtime_contract(
+        path, now=datetime.fromtimestamp(now, timezone.utc),
+    )
+    assert loaded["runtime_gate_healthy"] is False
+    assert loaded["reason"] == "no signed weekly model covers current signal"
+    assert all(item["force_exit"] for item in loaded["pairs"].values())

@@ -122,5 +122,6 @@ coverage.xml
 #ops/dca-macro/*_secrets.json
 /results/
 /.staging/
+account-inventory-data/
 .pytest_*
 

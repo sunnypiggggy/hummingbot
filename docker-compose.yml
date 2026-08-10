@@ -164,10 +164,25 @@ services:
       GRID_LIVE_FDUSD_STATE_PATH: /workspace/state
       GRID_LIVE_MACRO_STATE_PATH: /workspace/macro/state.json
       GRID_LIVE_GATE_RECONCILE_SECONDS: "5"
+      V22_WEEKLY_AUTO_UPDATE_ENABLED: "${V22_WEEKLY_AUTO_UPDATE_ENABLED:-true}"
+      V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS: "${V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS:-43200}"
+      V22_WEEKLY_GENERATION_LEAD_SECONDS: "${V22_WEEKLY_GENERATION_LEAD_SECONDS:-46800}"
+      V22_WEEKLY_MINIMUM_RUNWAY_SECONDS: "${V22_WEEKLY_MINIMUM_RUNWAY_SECONDS:-86400}"
+      V22_WEEKLY_AUTOMATION_INTERVAL_SECONDS: "60"
+      V22_WEEKLY_XGB_THREADS: "2"
+      ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
+      V22_WEEKLY_WORK_PATH: /workspace/weekly
+      V22_WEEKLY_CANDLE_PATH: /workspace/weekly/candles
+      DCA_LIVE_STATE_PATH: /workspace/dca-state
+      GRID_V22_AUTHORIZATION_PATH: /workspace/state/ethbtc_forced_exit_authorization.json
+      TELEGRAM_NOTIFICATION_EVENTS_PATH: /workspace/state/telegram_events.jsonl
     volumes:
       - ./api-files/bots:/workspace/bots
       - ./grid-live-fdusd-data:/workspace/state
       - ./dca-macro-data:/workspace/macro:ro
+      - ./dca-live-data:/workspace/dca-state:ro
+      - ./release_packages/ethbtc-forced-exit:/workspace/releases
+      - ./results/ethbtc_forced_exit_weekly:/workspace/weekly
     depends_on:
       - hummingbot-api
     healthcheck:
@@ -233,7 +248,7 @@ services:
       GRID_V21_SEED_CANDLE_PATH: /workspace/research-candles
       GRID_V22_IN_GUARD_ENABLED: "true"
       GRID_V22_EXECUTION_MODE: "live"
-      GRID_V22_PACKAGE_PATH: /workspace/v22-package
+      GRID_V22_PACKAGE_PATH: /workspace/v22-family
       GRID_V22_CANDLE_PATH: /workspace/technical-candles
       GRID_V22_SEED_CANDLE_PATH: /workspace/research-candles
       GRID_V22_AUTHORIZATION_PATH: /workspace/state/ethbtc_forced_exit_authorization.json
@@ -244,11 +259,13 @@ services:
       GRID_RISK_PORTFOLIO_LOSS_BREAKER_ENABLED: "${GRID_RISK_PORTFOLIO_LOSS_BREAKER_ENABLED:-true}"
       GRID_RISK_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED: "${GRID_RISK_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED:-true}"
       GRID_RISK_POSITION_PROTECTION_ENABLED: "${GRID_RISK_POSITION_PROTECTION_ENABLED:-true}"
+      ACCOUNT_INVENTORY_LEDGER_PATH: /workspace/account-inventory
     volumes:
       - ./api-files/bots:/workspace/bots
       - ./grid-live-fdusd-data:/workspace/state
+      - ./account-inventory-data:/workspace/account-inventory
       - ./results/backtests/xgboost_grid_long_risk_gate_v21_250d/shadow_package:/workspace/package:ro
-      - ./release_packages/ethbtc-forced-exit/current:/workspace/v22-package:ro
+      - ./release_packages/ethbtc-forced-exit:/workspace/v22-family:ro
       - ./results/ethbtc_forced_exit_weekly/candles:/workspace/research-candles:ro
       - grid-live-guard-technical-candles:/workspace/v21-candles
       - grid-live-guard-technical-candles:/workspace/technical-candles
@@ -301,10 +318,20 @@ services:
       DCA_PORTFOLIO_DRAWDOWN_LIMIT_PCT: "${DCA_PORTFOLIO_DRAWDOWN_LIMIT_PCT:-0.08}"
       DCA_BINANCE_EMERGENCY_CREDENTIALS_FILE: /run/secrets/dca_binance_emergency_credentials
       DCA_DOCKER_SOCKET: /var/run/docker.sock
+      ACCOUNT_INVENTORY_LEDGER_PATH: /workspace/account-inventory
+      GRID_ACCOUNT_INVENTORY_STATE_PATH: /workspace/grid/guard_state.json
+      GRID_ACCOUNT_INVENTORY_RESERVATIONS_PATH: /workspace/grid/capital_reservations.json
+      ACCOUNT_INVENTORY_UNATTRIBUTED_AUTO_LIQUIDATE_ENABLED: "true"
+      ACCOUNT_INVENTORY_CONFIRMATION_CYCLES: "3"
+      ACCOUNT_INVENTORY_CONFIRMATION_SECONDS: "30"
+      ACCOUNT_INVENTORY_BOOTSTRAP_BTC_CAP: "0.001554857672861421803102676728"
+      ACCOUNT_INVENTORY_BOOTSTRAP_ETH_CAP: "0.00227157909293506300096269939"
     volumes:
       - ./api-files/bots:/workspace/bots:ro
       - ./dca-live-data:/workspace/state
       - ./grid-live-fdusd-data:/workspace/technical:ro
+      - ./grid-live-fdusd-data:/workspace/grid:ro
+      - ./account-inventory-data:/workspace/account-inventory
       - ./dca-macro-data:/workspace/macro:ro
       - /var/run/docker.sock:/var/run/docker.sock
     secrets:
@@ -336,6 +363,7 @@ services:
       DCA_LIVE_STATE_PATH: /workspace/state
       GRID_LIVE_STATE_PATH: /workspace/grid
       ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
+      ACCOUNT_INVENTORY_LEDGER_PATH: /workspace/account-inventory
       DCA_LIVE_REPORT_INTERVAL: "300"
       TELEGRAM_NOTIFY_BOT_TOKEN_FILE: /run/secrets/telegram_notify_bot_token
       TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED: "${TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED:-true}"
@@ -355,6 +383,7 @@ services:
       - ./dca-live-data:/workspace/state
       - ./grid-live-fdusd-data:/workspace/grid:ro
       - ./release_packages/ethbtc-forced-exit:/workspace/releases:ro
+      - ./account-inventory-data:/workspace/account-inventory:ro
     secrets:
       - telegram_notify_bot_token
     healthcheck:
