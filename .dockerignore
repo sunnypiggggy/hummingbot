@@ -5,6 +5,13 @@
 /condor-files
 /dca-live-data
 /dca-macro-data
+/account-inventory-data
+/grid-live-fdusd-data
+/portfolio-grid-data
+/portfolio-grid-fdusd-data
+/release_packages
+/.deploy-backups
+/deploy-backups
 /build
 /dist
 /.git

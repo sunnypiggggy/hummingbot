@@ -1,0 +1,26 @@
+{
+  "schema": "ethbtc-forced-exit-active-deployment-v1",
+  "package_id": "ethbtc-forced-exit",
+  "release_sha256": "b21c3fa8bc97a9c97d071d1b79d8e9496aa1dd404e827a1a78ac9ceae373b873",
+  "activated_at": 1786325192,
+  "authorization": {
+    "schema": "ethbtc-forced-exit-authorization-v1",
+    "package_id": "ethbtc-forced-exit",
+    "release_sha256": "b21c3fa8bc97a9c97d071d1b79d8e9496aa1dd404e827a1a78ac9ceae373b873",
+    "model_sha256": "0d9e455af31f81f89d83d42bd531a4d349b8d0fc24117f16d9570d63cee912cf",
+    "operator": "sunny-explicit-resume-all",
+    "confirmation": "PROMOTE-ETHBTC-FORCED-EXIT",
+    "approval_mode": "manual_hermes",
+    "approved_at": 1786325064,
+    "activate_at": 1786325160,
+    "effective_end": 1786892400,
+    "review_started_at": 1786290241,
+    "review_deadline": 1786333441,
+    "approval_request_sha256": "7b1624bc91ef97e9c7afd551f2f9120374aafd970be702058e2e214dab67864c",
+    "observation_report_sha256": "c4fd4493b58e7f1375fb2c3d1a391c17384a3b098921356fe676a2b1b0f44f3e",
+    "preflight_sha256": "f9e6295540efb59644cb21261390067a4201db9d7fc65490878ee99f9c5d119f",
+    "auto_reentry_authorized": true,
+    "consumed": false
+  },
+  "authorization_sha256": "eb8d49ff5a2124bb692cee55ecda0ad157e9e121c73c2fa7a59d0426686ade75"
+}

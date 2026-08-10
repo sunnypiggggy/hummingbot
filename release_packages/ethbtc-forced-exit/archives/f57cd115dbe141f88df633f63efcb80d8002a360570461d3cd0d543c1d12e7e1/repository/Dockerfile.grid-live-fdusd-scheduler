@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY scheduler/requirements.txt /tmp/requirements.txt
+COPY requirements-grid-xgboost.txt /tmp/requirements-grid-xgboost.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt -r /tmp/requirements-grid-xgboost.txt
+COPY scripts /app
+COPY scripts/grid_live_common.py /app/grid_live_common.py
+COPY scripts/grid_macro_gate.py /app/grid_macro_gate.py
+COPY scripts/grid_technical_gate.py /app/grid_technical_gate.py
+COPY scripts/grid_xgboost_risk_gate.py /app/grid_xgboost_risk_gate.py
+COPY scripts/risk_recovery.py /app/risk_recovery.py
+COPY scripts/ethbtc_forced_exit_contract.py /app/ethbtc_forced_exit_contract.py
+COPY scripts/validate_grid_live.py /app/validate_grid_live.py
+COPY scripts/fdusd_live_grid_optimizer.py /app/fdusd_live_grid_optimizer.py
+COPY scripts/walk_forward_portfolio_grid_live.py /app/walk_forward_portfolio_grid_live.py
+COPY scripts/prepare_fdusd_live_grid.py /app/prepare_fdusd_live_grid.py
+COPY scripts/deploy_fdusd_live_grid.py /app/deploy_fdusd_live_grid.py
+COPY scripts/refresh_fdusd_live_preflight.py /app/refresh_fdusd_live_preflight.py
+COPY live_guard/telegram_notifications.py /app/telegram_notifications.py
+COPY scheduler/fdusd_live_grid_scheduler.py /app/fdusd_live_grid_scheduler.py
+CMD ["python", "/app/fdusd_live_grid_scheduler.py"]

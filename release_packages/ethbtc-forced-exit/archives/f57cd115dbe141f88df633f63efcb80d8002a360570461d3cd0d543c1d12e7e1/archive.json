@@ -1,0 +1,48 @@
+{
+  "schema": "ethbtc-oci-source-archive-v1",
+  "package_id": "ethbtc-forced-exit",
+  "archive_scope": "authoritative OCI Grid/DCA source, tests, release family, runtime configuration and build dependency closure",
+  "source_paths": [
+    "Dockerfile.dca-live-guard",
+    "Dockerfile.grid-live-guard",
+    "Dockerfile.dca-live-runtime",
+    "Dockerfile.grid-live-fdusd-scheduler",
+    "docker-compose.yml",
+    "telegram-notify.env",
+    "requirements-grid-xgboost.txt",
+    "pyproject.toml",
+    "setup.py",
+    "live_guard",
+    "scheduler",
+    "scripts",
+    "test",
+    "controllers/market_making",
+    "conf/controllers",
+    "hummingbot/strategy_v2/executors/dca_executor",
+    "release_packages/ethbtc-forced-exit"
+  ],
+  "repository_file_count": 852,
+  "excluded_runtime_paths": [
+    "api-files",
+    "dca-live-data",
+    "grid-live-fdusd-data",
+    "account-inventory-data",
+    "dca-macro-data",
+    "mcp-files",
+    "secrets",
+    ".env",
+    ".env.control"
+  ],
+  "compose_services": [
+    "emqx",
+    "postgres",
+    "hummingbot-api",
+    "dca-live-guard",
+    "dca-live-report",
+    "hummingbot-mcp"
+  ],
+  "compose_service_count": 6,
+  "telegram_model_binary_attachment_allowed": false,
+  "release_model_binary_snapshot_included": true,
+  "deployment_authority_granted": false
+}
