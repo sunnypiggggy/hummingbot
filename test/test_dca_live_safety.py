@@ -22,7 +22,9 @@ from dca_live_common import (  # noqa: E402
     validate_config,
     validate_exchange_filters,
 )
-from dca_live_guard import BinanceEmergencyClient, Guard  # noqa: E402
+from dca_live_guard import (  # noqa: E402
+    BinanceEmergencyClient, Guard, _read_retry_session,
+)
 from macro_control.telemetry import build_sanitized_snapshot  # noqa: E402
 from deploy_dca_live import (  # noqa: E402
     ApiClient,
@@ -181,6 +183,14 @@ class CanaryTests(unittest.TestCase):
 
 
 class DcaLiveSafetyTest(unittest.TestCase):
+    def test_http_retry_policy_never_replays_trading_writes(self):
+        session = _read_retry_session()
+        retry = session.get_adapter("https://").max_retries
+        self.assertEqual(2, retry.total)
+        self.assertEqual(frozenset({"GET"}), retry.allowed_methods)
+        self.assertNotIn("POST", retry.allowed_methods)
+        self.assertNotIn("DELETE", retry.allowed_methods)
+
     def test_cancel_all_orders_treats_binance_already_clear_as_idempotent_success(self):
         client = BinanceEmergencyClient("key", "secret")
         client.session = FakeSession()
@@ -319,6 +329,90 @@ class DcaLiveSafetyTest(unittest.TestCase):
             )
 
             self.assertEqual("applied", result["status"])
+            profile = guard.api.controller_updates[0][2]
+            self.assertFalse(profile["macro_buy_enabled"])
+            self.assertFalse(profile["macro_sell_enabled"])
+
+    def test_controller_profile_prefers_live_yaml_over_stale_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Path(directory) / "instances" / "bot"
+            database = instance / "data" / "bot.sqlite"
+            database.parent.mkdir(parents=True)
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE Controllers (id TEXT, timestamp FLOAT, config JSON)"
+            )
+            connection.execute(
+                "INSERT INTO Controllers VALUES (?, ?, ?)",
+                (
+                    "dca_btcusdt_live_200",
+                    1,
+                    json.dumps({
+                        "macro_buy_enabled": False,
+                        "macro_sell_enabled": False,
+                        "macro_decision_id": "stale-database",
+                    }),
+                ),
+            )
+            connection.commit()
+            connection.close()
+            config = instance / "conf" / "controllers" / "dca_btcusdt_live_200.yml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                "macro_buy_enabled: true\n"
+                "macro_sell_enabled: true\n"
+                "macro_decision_id: live-yaml\n",
+                encoding="utf-8",
+            )
+
+            controller, profile = Guard._controller_profile(database)
+
+            self.assertEqual("dca_btcusdt_live_200", controller)
+            self.assertTrue(profile["macro_buy_enabled"])
+            self.assertTrue(profile["macro_sell_enabled"])
+            self.assertEqual("live-yaml", profile["macro_decision_id"])
+
+    def test_aggregate_gate_corrects_live_yaml_even_when_database_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Path(directory) / "instances" / "bot"
+            database = instance / "data" / "bot.sqlite"
+            database.parent.mkdir(parents=True)
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE Controllers (id TEXT, timestamp FLOAT, config JSON)"
+            )
+            connection.execute(
+                "INSERT INTO Controllers VALUES (?, ?, ?)",
+                (
+                    "dca_btcusdt_live_200",
+                    1,
+                    json.dumps({
+                        "macro_buy_enabled": False,
+                        "macro_sell_enabled": False,
+                    }),
+                ),
+            )
+            connection.commit()
+            connection.close()
+            config = instance / "conf" / "controllers" / "dca_btcusdt_live_200.yml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                "macro_buy_enabled: true\nmacro_sell_enabled: true\n",
+                encoding="utf-8",
+            )
+            guard = Guard.__new__(Guard)
+            guard.api = FakeApi()
+
+            result = guard._set_effective_gates(
+                "dca-live-btcusdt-200",
+                {"database": str(database)},
+                buy_enabled=False,
+                sell_enabled=False,
+                reasons={"v22": "risk_off", "fomc": "clear"},
+            )
+
+            self.assertEqual("applied", result["status"])
+            self.assertEqual(1, len(guard.api.controller_updates))
             profile = guard.api.controller_updates[0][2]
             self.assertFalse(profile["macro_buy_enabled"])
             self.assertFalse(profile["macro_sell_enabled"])

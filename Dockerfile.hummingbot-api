@@ -84,6 +84,29 @@ if source.count(needle) != 2:
 path.write_text(source.replace(needle, replacement), encoding='utf-8')
 PY
 
+# Live Hummingbot processes reload controller YAML every clock tick. Upstream
+# truncates the file before rewriting it, so a concurrent reader can observe an
+# empty document and fail that tick with ``NoneType.get``. Replace atomically.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path('/hummingbot-api/utils/file_system.py')
+source = path.read_text(encoding='utf-8')
+needle = '''        with open(file_path, 'w', encoding='utf-8') as file:
+            yaml.dump(data_dict, file, default_flow_style=False, allow_unicode=True)
+'''
+replacement = '''        temporary_path = f"{file_path}.tmp"
+        with open(temporary_path, 'w', encoding='utf-8') as file:
+            yaml.dump(data_dict, file, default_flow_style=False, allow_unicode=True)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, file_path)
+'''
+if source.count(needle) != 1:
+    raise SystemExit('FileSystemUtil YAML writer changed; review the atomic-write patch.')
+path.write_text(source.replace(needle, replacement, 1), encoding='utf-8')
+PY
+
 # A plain V2 script has no controller performance report. The upstream status
 # implementation therefore labels a healthy, recently-active script as
 # "stopped" even while its Docker container and MQTT heartbeat are live.

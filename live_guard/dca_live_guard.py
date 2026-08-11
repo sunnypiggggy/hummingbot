@@ -22,6 +22,9 @@ from typing import Any, Dict, Optional
 from urllib.parse import quote, urlencode
 
 import requests
+import yaml
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from dca_live_common import (
     ACCOUNT_NAME,
@@ -76,6 +79,29 @@ V21_PAIR_MAP = {"BTC-USDT": "BTC-FDUSD", "ETH-USDT": "ETH-FDUSD"}
 V22_PAIR_MAP = V21_PAIR_MAP
 
 
+def _read_retry_session() -> requests.Session:
+    """Retry only idempotent reads; trading writes must never be replayed."""
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        status=2,
+        backoff_factor=0.1,
+        allowed_methods=frozenset({"GET"}),
+        status_forcelist=(429, 500, 502, 503, 504),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+READ_SESSION = _read_retry_session()
+
+
 def _env_enabled(name: str, default: bool = True) -> bool:
     return os.getenv(name, "true" if default else "false").lower() == "true"
 
@@ -93,7 +119,7 @@ class BinanceEmergencyClient:
         )
         if scenario_mode() and not api_key.startswith("scenario-"):
             raise RuntimeError("scenario mode refuses non-scenario Binance credentials")
-        self.session = requests.Session()
+        self.session = _read_retry_session()
         self.session.headers.update({"X-MBX-APIKEY": api_key})
         self.time_offset_ms = 0
 
@@ -289,7 +315,7 @@ class DockerEmergencyClient:
 class ApiClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
+        self.session = _read_retry_session()
         self.session.auth = (os.environ["USERNAME"], os.environ["PASSWORD"])
 
     def request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
@@ -1106,7 +1132,7 @@ class Guard:
 
     @staticmethod
     def _price(pair: str) -> Decimal:
-        response = requests.get(
+        response = READ_SESSION.get(
             f"{binance_api_base()}/api/v3/ticker/price",
             params={"symbol": pair.replace("-", "")},
             timeout=15,
@@ -1116,7 +1142,7 @@ class Guard:
 
     @staticmethod
     def _lot_filter(pair: str) -> tuple[Decimal, Decimal]:
-        response = requests.get(
+        response = READ_SESSION.get(
             f"{binance_api_base()}/api/v3/exchangeInfo",
             params={"symbol": pair.replace("-", "")},
             timeout=15,
@@ -1296,6 +1322,21 @@ class Guard:
         if row is None:
             return "", {}
         controller_id, raw_config = row
+        # Strategy V2 reloads this YAML every clock tick, so it is the live
+        # source of truth. The Controllers row is historical executor evidence
+        # and can lag a controller update indefinitely.
+        live_config_path = (
+            database.parent.parent / "conf" / "controllers"
+            / f"{controller_id}.yml"
+        )
+        try:
+            live_config = yaml.safe_load(live_config_path.read_text(encoding="utf-8"))
+            if isinstance(live_config, dict):
+                return str(controller_id), live_config
+        except (OSError, yaml.YAMLError):
+            # Preserve the database fallback for offline snapshots and the
+            # short interval before a deployed config directory is mounted.
+            pass
         try:
             config = json.loads(raw_config)
         except (TypeError, ValueError):
@@ -1541,7 +1582,7 @@ class Guard:
     @staticmethod
     def _market_telemetry(pair: str) -> Dict[str, float]:
         symbol = pair.replace("-", "")
-        book = requests.get(
+        book = READ_SESSION.get(
             f"{binance_api_base()}/api/v3/ticker/bookTicker",
             params={"symbol": symbol},
             timeout=15,
@@ -1551,7 +1592,7 @@ class Guard:
         bid = float(book_value["bidPrice"])
         ask = float(book_value["askPrice"])
         mid = (bid + ask) / 2
-        klines = requests.get(
+        klines = READ_SESSION.get(
             f"{binance_api_base()}/api/v3/klines",
             params={"symbol": symbol, "interval": "1m", "limit": 31},
             timeout=15,
@@ -2331,7 +2372,11 @@ class Guard:
         status_text = json.dumps(self.api.status(), ensure_ascii=True)
         mechanisms = getattr(self, "mechanisms", {})
         for pair, spec in LIVE_PAIRS.items():
-            if spec.bot_name not in status_text:
+            # A stopped but deployed bot still has a live controller YAML that
+            # must be fail-closed before the process is restarted.  Requiring
+            # it to appear in MQTT status created a startup race where stale
+            # permissive gates were loaded before the Guard could correct them.
+            if spec.bot_name not in status_text and self._database(spec.bot_name) is None:
                 continue
             bot_state = self.state["bots"].setdefault(spec.bot_name, {
                 "pair": pair,

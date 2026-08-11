@@ -16,3 +16,12 @@ def test_non_tradable_edo_dust_is_excluded_from_account_valuation():
     ).read_text(encoding="utf-8")
     assert "BANNED_TOKENS:" in compose
     assert '"EDO"' in compose
+
+
+def test_controller_yaml_updates_are_atomic():
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "Dockerfile.hummingbot-api"
+    ).read_text(encoding="utf-8")
+    assert 'temporary_path = f"{file_path}.tmp"' in dockerfile
+    assert "os.fsync(file.fileno())" in dockerfile
+    assert "os.replace(temporary_path, file_path)" in dockerfile
