@@ -157,6 +157,19 @@ class V22LiveGateProducer:
                 authorization, production, observed,
             )
             source_healthy = bool(shadow.get("source_healthy"))
+            if not source_healthy:
+                # Failed shadow contracts intentionally carry null model values.
+                # Do not try to coerce those values while constructing the live
+                # contract: doing so masks the primary integrity failure with an
+                # unhelpful ``float(None)`` error.  Publish the canonical
+                # fail-closed shape and preserve the original source reason.
+                contract = failed_contract(
+                    generated_at=observed,
+                    reason=str(shadow.get("reason") or "v22 shadow source unhealthy"),
+                    metadata=metadata,
+                )
+                atomic_json(self.output, contract)
+                return contract
             pairs = {}
             for pair in REQUIRED_PAIRS:
                 source = shadow["pairs"][pair]

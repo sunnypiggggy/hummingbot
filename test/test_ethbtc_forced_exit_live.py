@@ -2,6 +2,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,7 @@ from ethbtc_forced_exit_contract import (  # noqa: E402
     load_runtime_contract,
     utc,
 )
+from grid_v22_live_gate import V22LiveGateProducer  # noqa: E402
 from risk_recovery import LATCHED, mark_exit_complete, trigger_state  # noqa: E402
 from run_guard_with_v22_observation import update_status  # noqa: E402
 
@@ -166,3 +168,62 @@ def test_failed_runtime_does_not_erase_observation_window(tmp_path: Path) -> Non
     assert after["started_at"] == before["started_at"]
     assert after["event_ids"] == before["event_ids"]
     assert after["source_errors"] == 1
+
+
+def test_live_producer_preserves_unhealthy_shadow_reason(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    package = tmp_path / "package"
+    shadow_package = package / "shadow_package"
+    shadow_package.mkdir(parents=True)
+    lock_path = shadow_package / "shadow_lock.json"
+    lock = {
+        "model_sha256": HASH,
+        "feature_schema_sha256": HASH,
+        "strategy_schema_sha256": HASH,
+        "training_candle_sha256": HASH,
+    }
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    import hashlib
+
+    lock_sha = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    (package / "production_lock.json").write_text(json.dumps({
+        "package_id": PACKAGE_ID,
+        "execution_policy_version": EXECUTION_POLICY_VERSION,
+        "release_sha256": HASH,
+        "model_sha256": HASH,
+        "shadow_lock_sha256": lock_sha,
+        "effective_end": now + 3600,
+    }), encoding="utf-8")
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    producer = V22LiveGateProducer(
+        package_dir=package,
+        cache_dir=tmp_path / "cache",
+        seed_cache_dir=tmp_path / "seed",
+        state_dir=state_dir,
+        authorization_path=tmp_path / "missing-authorization.json",
+        refresh_binance=False,
+    )
+    primary_reason = "fail_closed:ConnectionResetError(104, connection reset by peer)"
+    unhealthy_shadow = {
+        "source_healthy": False,
+        "reason": primary_reason,
+        "pairs": {
+            pair: {"long": {"probability": None, "entry_threshold": None}}
+            for pair in ("BTC-FDUSD", "ETH-FDUSD")
+        },
+    }
+    with patch("grid_v22_live_gate.produce_once", return_value=unhealthy_shadow):
+        produced = producer.produce(now)
+
+    assert produced["source_healthy"] is False
+    assert produced["reason"] == primary_reason
+    assert "float()" not in produced["reason"]
+    loaded = load_runtime_contract(
+        producer.output, now=datetime.fromtimestamp(now, timezone.utc),
+    )
+    assert loaded["runtime_gate_healthy"] is False
+    assert loaded["reason"] == primary_reason
+    assert all(item["force_exit"] for item in loaded["pairs"].values())
