@@ -132,6 +132,25 @@ class BinanceEmergencyClient:
             self.sync_time()
             return self._signed(method, path, {k: v for k, v in params.items() if k not in {"timestamp", "recvWindow", "signature"}})
         if response.status_code >= 400:
+            # Binance can return -2011 when DELETE /openOrders races with the
+            # final order disappearing (or when the symbol is already clear).
+            # Cancellation is an idempotent safety action, so that terminal
+            # state is success rather than a monitor failure.  Keep the
+            # exception behavior for every other endpoint and error code.
+            try:
+                error_payload = response.json()
+            except (TypeError, ValueError):
+                error_payload = {}
+            if (
+                method.upper() == "DELETE"
+                and path == "/api/v3/openOrders"
+                and error_payload.get("code") == -2011
+            ):
+                return {
+                    "status": "already_clear",
+                    "code": -2011,
+                    "message": str(error_payload.get("msg", "Unknown order sent.")),
+                }
             raise RuntimeError(
                 f"Binance emergency {method} {path} failed "
                 f"({response.status_code}): {response.text[:300]}"
@@ -2178,10 +2197,25 @@ class Guard:
             bot["recovery"] = state
             return
 
+        # A restarted bot can restore connector-tracked orders from its
+        # database even though the persisted aggregate controller gate is
+        # already closed.  COOLDOWN/REENTRY are quote-only phases: actively
+        # remove such residual orders instead of waiting forever for
+        # no_runtime_risk to become true.
+        residual_orders = self.emergency_exchange.open_orders(pair)
+        if residual_orders:
+            self.emergency_exchange.cancel_all_orders(pair)
+            self._audit(
+                "recoverable_residual_orders_cancelled",
+                bot=bot_name,
+                pair=pair,
+                phase=state["phase"],
+                order_count=len(residual_orders),
+            )
+            bot["recovery"] = state
+            return
         counts = self._executor_counts(Path(snapshot["database"]))
-        no_runtime_risk = not self.emergency_exchange.open_orders(pair) and all(
-            counts[key] == 0 for key in counts
-        )
+        no_runtime_risk = all(counts[key] == 0 for key in counts)
         underlying_healthy = bool(macro["healthy"] and technical.get("buy_enabled"))
         gates_allow = bool(
             self.auto_reentry_enabled and macro["buy_enabled"] and macro["sell_enabled"]

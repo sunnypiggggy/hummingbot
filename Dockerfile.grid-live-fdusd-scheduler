@@ -17,5 +17,6 @@ COPY scripts/prepare_fdusd_live_grid.py /app/prepare_fdusd_live_grid.py
 COPY scripts/deploy_fdusd_live_grid.py /app/deploy_fdusd_live_grid.py
 COPY scripts/refresh_fdusd_live_preflight.py /app/refresh_fdusd_live_preflight.py
 COPY live_guard/telegram_notifications.py /app/telegram_notifications.py
+COPY live_guard/runtime_endpoints.py /app/runtime_endpoints.py
 COPY scheduler/fdusd_live_grid_scheduler.py /app/fdusd_live_grid_scheduler.py
 CMD ["python", "/app/fdusd_live_grid_scheduler.py"]

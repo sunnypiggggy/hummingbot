@@ -3,6 +3,26 @@ from pathlib import Path
 import yaml
 
 
+def test_grid_scheduler_packages_telegram_endpoint_policy():
+    dockerfile = (
+        Path(__file__).resolve().parents[1]
+        / "Dockerfile.grid-live-fdusd-scheduler"
+    ).read_text(encoding="utf-8")
+    assert "COPY live_guard/runtime_endpoints.py /app/runtime_endpoints.py" in dockerfile
+    scheduler = (
+        Path(__file__).resolve().parents[1]
+        / "scheduler"
+        / "fdusd_live_grid_scheduler.py"
+    ).read_text(encoding="utf-8")
+    assert 'scripts / "runtime_endpoints.py"' in scheduler
+    notifications = (
+        Path(__file__).resolve().parents[1]
+        / "live_guard"
+        / "telegram_notifications.py"
+    ).read_text(encoding="utf-8")
+    assert "from scripts.runtime_endpoints import telegram_api_base" in notifications
+
+
 ROOT = Path(__file__).resolve().parents[1]
 
 

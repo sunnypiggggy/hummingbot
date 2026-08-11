@@ -22,7 +22,7 @@ from dca_live_common import (  # noqa: E402
     validate_config,
     validate_exchange_filters,
 )
-from dca_live_guard import Guard  # noqa: E402
+from dca_live_guard import BinanceEmergencyClient, Guard  # noqa: E402
 from macro_control.telemetry import build_sanitized_snapshot  # noqa: E402
 from deploy_dca_live import (  # noqa: E402
     ApiClient,
@@ -30,7 +30,7 @@ from deploy_dca_live import (  # noqa: E402
     can_start_eth,
     stage_configs,
 )
-from risk_recovery import EXITING, trigger_state  # noqa: E402
+from risk_recovery import COOLDOWN, EXITING, trigger_state  # noqa: E402
 
 
 class FakeApi:
@@ -130,6 +130,26 @@ class FakeEmergencyDocker:
         return {}
 
 
+class FakeResponse:
+    status_code = 400
+    text = '{"code":-2011,"msg":"Unknown order sent."}'
+    content = text.encode()
+
+    @staticmethod
+    def json():
+        return {"code": -2011, "msg": "Unknown order sent."}
+
+
+class FakeSession:
+    def __init__(self):
+        self.headers = {}
+        self.calls = []
+
+    def request(self, method, url, params, timeout):
+        self.calls.append((method, url, params, timeout))
+        return FakeResponse()
+
+
 class CanaryTests(unittest.TestCase):
     def test_eth_requires_24_hours_and_fresh_btc_guard_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +181,45 @@ class CanaryTests(unittest.TestCase):
 
 
 class DcaLiveSafetyTest(unittest.TestCase):
+    def test_cancel_all_orders_treats_binance_already_clear_as_idempotent_success(self):
+        client = BinanceEmergencyClient("key", "secret")
+        client.session = FakeSession()
+
+        result = client.cancel_all_orders("BTC-USDT")
+
+        self.assertEqual("already_clear", result["status"])
+        self.assertEqual(-2011, result["code"])
+        self.assertEqual("DELETE", client.session.calls[0][0])
+
+    def test_cooldown_cancels_orders_restored_by_restarted_bot(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {"bots": {"bot": {"recovery": {
+            "phase": COOLDOWN,
+            "mechanism": "infrastructure_integrity_breaker",
+            "scope": "infrastructure",
+            "cooldown_until": 100,
+        }}}}
+        guard.emergency_exchange = FakeEmergencyExchange()
+        guard.emergency_exchange.open_order_values = [
+            {"symbol": "BTCUSDT", "orderId": 1},
+        ]
+        guard._lot_filter = lambda pair: (Decimal("0.00001"), Decimal("5"))
+        audits = []
+        guard._audit = lambda event, **details: audits.append((event, details))
+
+        guard._process_recoverable(
+            "bot",
+            {"pair": "BTC-USDT", "mark_price": "64000", "database": "unused"},
+            macro={"healthy": True, "buy_enabled": True, "sell_enabled": True},
+            technical={"buy_enabled": True, "execution_authorized": True},
+            now=200,
+        )
+
+        self.assertEqual(["BTC-USDT"], guard.emergency_exchange.cancel_all_calls)
+        self.assertEqual([], guard.emergency_exchange.open_order_values)
+        self.assertEqual(COOLDOWN, guard.state["bots"]["bot"]["recovery"]["phase"])
+        self.assertEqual("recoverable_residual_orders_cancelled", audits[0][0])
+
     def test_recoverable_exit_is_capped_by_deployment_owned_base(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

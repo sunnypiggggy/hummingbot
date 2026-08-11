@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from grid_live_common import PairLedger  # noqa: E402
 from walk_forward_portfolio_grid_live import GridState, LivePortfolioGrid  # noqa: E402
-from risk_recovery import EXITING, trigger_state  # noqa: E402
+from risk_recovery import ACTIVE, EXITING, REENTRY, active_state, normalize_state, trigger_state  # noqa: E402
 
 
 class Order:
@@ -110,6 +110,59 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.cancel_strategy_pair_orders = lambda: calls.append("cancel")
         strategy.on_tick()
         self.assertEqual([], calls)
+
+    def test_btc_reentry_does_not_block_active_eth_grid(self):
+        strategy = self.strategy()
+        strategy.config.risk_auto_reentry_enabled = True
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.pair_recovery = {
+            "BTC-FDUSD": normalize_state({
+                **active_state(),
+                "phase": REENTRY,
+                "mechanism": "v22_weekly_buy_gate",
+                "scope": "technical",
+            }),
+            "ETH-FDUSD": active_state(),
+        }
+        strategy.portfolio_recovery = active_state()
+        strategy.reentry_order_ids = {}
+        strategy.ledgers["BTC-FDUSD"].halted = True
+        strategy.ledgers["ETH-FDUSD"].halted = False
+        strategy.technical_buy_enabled_by_pair = {
+            "BTC-FDUSD": False,
+            "ETH-FDUSD": True,
+        }
+        strategy.grid_states = {
+            "BTC-FDUSD": GridState(
+                lower=Decimal("63000"), upper=Decimal("67000"),
+                levels=[Decimal("63000"), Decimal("67000")],
+            ),
+            "ETH-FDUSD": GridState(
+                lower=Decimal("1800"), upper=Decimal("2000"),
+                levels=[Decimal("1800"), Decimal("2000")],
+            ),
+        }
+        submitted = []
+        strategy.buy = lambda exchange, pair, amount, order_type, price: (
+            submitted.append(("BUY", pair)) or f"buy-{pair}"
+        )
+        strategy.sell = lambda exchange, pair, amount, order_type, price: (
+            submitted.append(("SELL", pair)) or f"sell-{pair}"
+        )
+
+        blocks_all_grids = strategy._advance_risk_recovery(
+            {"BTC-FDUSD": Decimal("65000"), "ETH-FDUSD": Decimal("1900")}, []
+        )
+        if not blocks_all_grids:
+            strategy._place_grids(
+                {"BTC-FDUSD": Decimal("65000"), "ETH-FDUSD": Decimal("1900")}
+            )
+
+        self.assertFalse(blocks_all_grids)
+        self.assertEqual(REENTRY, strategy.pair_recovery["BTC-FDUSD"]["phase"])
+        self.assertTrue(submitted)
+        self.assertEqual({"ETH-FDUSD"}, {pair for _, pair in submitted})
+        self.assertEqual(ACTIVE, strategy.pair_recovery["ETH-FDUSD"]["phase"])
 
     def test_shutdown_pair_cancellation_is_rate_limited_but_retried(self):
         strategy = self.strategy()

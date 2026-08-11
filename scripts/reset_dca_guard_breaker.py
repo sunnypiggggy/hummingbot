@@ -54,11 +54,28 @@ def main() -> int:
             "action_complete": False,
             "started_at": now,
             "recovery": {
-                "phase": "ACTIVE", "mechanism": "", "scope": "",
-                "triggered_at": None, "exit_target": "quote_only",
-                "remaining_base": {}, "exit_completed_at": None,
-                "cooldown_until": None, "healthy_cycles": 0,
-                "reentry": {}, "episode_baseline": {},
+                # The integrity exit sold the managed startup inventory.  Do
+                # not claim ACTIVE before it has been rebuilt.  COOLDOWN has
+                # no additional delay here; the Guard still requires three
+                # healthy cycles and every independent BUY gate before its
+                # existing re-entry path can buy the owned baseline again.
+                "phase": "COOLDOWN",
+                "mechanism": "infrastructure_integrity_breaker",
+                "scope": "infrastructure",
+                "triggered_at": previous[bot_name]["tripped_at"],
+                "exit_target": "quote_only",
+                "remaining_base": dict(
+                    bot_state.get("recovery", {}).get("remaining_base", {})
+                ),
+                "exit_completed_at": bot_state.get("recovery", {}).get(
+                    "exit_completed_at", now
+                ),
+                "cooldown_until": now,
+                "healthy_cycles": 0,
+                "reentry": {},
+                "episode_baseline": {},
+                "latch_after_exit": False,
+                "reason": "manual recovery after reviewed monitor incident",
             },
         })
         for key in (

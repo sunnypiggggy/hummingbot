@@ -1062,18 +1062,23 @@ class LivePortfolioGrid(StrategyV2Base):
         self.pending_flatten.difference_update(completed)
 
     def _advance_risk_recovery(self, prices: Dict[str, Decimal], active_orders: list) -> bool:
-        """Advance recoverable breakers; return True while normal grids must stay blocked."""
-        active_owned = bool(self._owned_active_orders(active_orders))
+        """Advance breakers; block all grids only for a portfolio recovery.
+
+        Pair-local recovery is isolated: the affected ledger remains halted,
+        while another healthy pair may keep its own grid.  Exchange orders are
+        checked per pair so an active ETH grid cannot prevent BTC recovery (or
+        vice versa).
+        """
+        active_owned_orders = self._owned_active_orders(active_orders)
+        active_owned_pairs = {order.trading_pair for order in active_owned_orders}
         gates_healthy = bool(
             self.macro_gate_healthy
             and all(self.technical_gate_healthy_by_pair.values())
         )
-        any_blocked = False
         for pair in self.config.trading_pairs:
             state = self.pair_recovery[pair]
             if state.get("phase") == ACTIVE:
                 continue
-            any_blocked = True
             gates_allow = bool(
                 not self.macro_paused
                 and self.technical_buy_enabled_by_pair.get(pair, False)
@@ -1082,7 +1087,7 @@ class LivePortfolioGrid(StrategyV2Base):
             previous_phase = state.get("phase")
             state = advance_recovery(
                 state, now=self.current_timestamp,
-                healthy=gates_healthy and not active_owned,
+                healthy=gates_healthy and pair not in active_owned_pairs,
                 gates_allow_reentry=gates_allow,
             )
             self.pair_recovery[pair] = state
@@ -1104,8 +1109,8 @@ class LivePortfolioGrid(StrategyV2Base):
                         recovery=self.pair_recovery[pair],
                     )
         portfolio = self.portfolio_recovery
+        portfolio_blocked = portfolio.get("phase") != ACTIVE
         if portfolio.get("phase") != ACTIVE:
-            any_blocked = True
             gates_allow = bool(
                 not self.macro_paused
                 and all(self.technical_buy_enabled_by_pair.values())
@@ -1114,7 +1119,7 @@ class LivePortfolioGrid(StrategyV2Base):
             previous_phase = portfolio.get("phase")
             portfolio = advance_recovery(
                 portfolio, now=self.current_timestamp,
-                healthy=gates_healthy and not active_owned,
+                healthy=gates_healthy and not active_owned_orders,
                 gates_allow_reentry=gates_allow,
             )
             self.portfolio_recovery = portfolio
@@ -1144,7 +1149,7 @@ class LivePortfolioGrid(StrategyV2Base):
                         ledger.peak_equity = ledger.equity(prices[pair])
                         ledger.episode_equity_baseline = ledger.equity(prices[pair])
                         self.pair_recovery[pair] = active_state()
-        return any_blocked
+        return portfolio_blocked
 
     def _reenter_pair(self, pair: str, price: Decimal) -> bool:
         ledger = self.ledgers[pair]

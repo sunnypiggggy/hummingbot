@@ -174,7 +174,20 @@ def prepare(
             raise RuntimeError(f"{name} does not retain reviewed managed inventory")
         bot.update({
             "tripped": False, "action_complete": False, "started_at": now,
-            "recovery": active_state(),
+            # DCA is quote-only after the reviewed integrity exit.  Route it
+            # through the normal three-cycle, all-gates re-entry path instead
+            # of declaring ACTIVE with missing startup inventory.
+            "recovery": {
+                **active_state(),
+                "phase": "COOLDOWN",
+                "mechanism": "infrastructure_integrity_breaker",
+                "scope": "infrastructure",
+                "triggered_at": now,
+                "exit_completed_at": now,
+                "cooldown_until": now,
+                "latch_after_exit": False,
+                "reason": "manual hash-bound recovery after reviewed monitor incident",
+            },
         })
         for key in ("trip_reason", "tripped_at", "manual_exit_required", "exit_status",
                     "flatten_response", "stop_response", "last_action_error"):

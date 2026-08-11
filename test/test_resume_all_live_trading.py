@@ -62,3 +62,5 @@ def test_prepare_reconciles_grid_to_cash_and_preserves_dca_inventory() -> None:
     for name in DCA_BOTS:
         assert dca["bots"][name]["tripped"] is False
         assert dca["bots"][name]["managed_base_target"] == "0.01"
+        assert dca["bots"][name]["recovery"]["phase"] == "COOLDOWN"
+        assert dca["bots"][name]["recovery"]["latch_after_exit"] is False

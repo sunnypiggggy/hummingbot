@@ -374,6 +374,7 @@ class Scheduler:
         )
         shutil.copy2("/app/risk_recovery.py", scripts / "risk_recovery.py")
         shutil.copy2("/app/telegram_notifications.py", scripts / "telegram_notifications.py")
+        shutil.copy2("/app/runtime_endpoints.py", scripts / "runtime_endpoints.py")
 
     def publish_macro_gate(self) -> int:
         macro_state = self.read_json(self.macro_source, None)

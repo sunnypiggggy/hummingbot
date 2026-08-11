@@ -8,3 +8,11 @@ def test_plain_v2_script_recent_activity_is_running():
     assert 'replacement = \'\'\'            if recently_active:' in dockerfile
     assert 'elif len(performance) > 0:' in dockerfile
     assert "Recent MQTT activity is the runtime signal" in dockerfile
+
+
+def test_non_tradable_edo_dust_is_excluded_from_account_valuation():
+    compose = (
+        Path(__file__).resolve().parents[1] / "docker-compose.yml"
+    ).read_text(encoding="utf-8")
+    assert "BANNED_TOKENS:" in compose
+    assert '"EDO"' in compose

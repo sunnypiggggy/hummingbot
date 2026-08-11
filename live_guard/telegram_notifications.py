@@ -23,7 +23,12 @@ import requests
 try:
     from runtime_endpoints import telegram_api_base
 except ModuleNotFoundError:
-    from live_guard.runtime_endpoints import telegram_api_base
+    try:
+        # API-managed Hummingbot instances mount this module under the
+        # namespace-package directory /home/hummingbot/scripts.
+        from scripts.runtime_endpoints import telegram_api_base
+    except ModuleNotFoundError:
+        from live_guard.runtime_endpoints import telegram_api_base
 
 try:
     from PIL import Image, ImageDraw, ImageFont

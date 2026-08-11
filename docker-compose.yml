@@ -44,6 +44,9 @@ services:
     environment:
       # DockerService talks to the host Docker socket, so bind sources must be host-visible paths.
       BOTS_PATH: /home/ubuntu/extra_drive/hummingbot/api-files
+      # EDO is a non-tradable account dust asset with no Binance USDT market.
+      # Excluding it prevents zero-valued account snapshots and repeated price warnings.
+      BANNED_TOKENS: '["NAV","ARS","ETHW","ETHF","EDO"]'
     expose:
       - "8000"
     volumes:
