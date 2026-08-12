@@ -110,6 +110,63 @@ def test_dynamic_evidence_does_not_reset_confirmation_but_deficit_is_fail_closed
         assert deficit["assets"]["BTC"]["confirmation"]["cycles"] == 0
 
 
+def test_deficit_is_immediately_fail_closed_but_alert_confirmation_is_delayed():
+    with tempfile.TemporaryDirectory() as directory:
+        ledger = UnifiedInventoryLedger(Path(directory))
+        owners = {"BTC": {"dca": "0.002"}, "ETH": {"dca": "0.05"}}
+        values = []
+        for now, btc_balance, evidence in (
+            (100, "0.0010", "fill-one"),
+            (115, "0.0012", "fill-two"),
+            (131, "0.0015", "fill-three"),
+        ):
+            values.append(ledger.reconcile(
+                account_fingerprint="account",
+                balances=balances(btc_balance, "0.052"), ownership=owners,
+                evidence_sha256=evidence, open_order_counts={"BTC-USDT": 1},
+                sources_healthy=True, now=now,
+            ))
+        assert all(not value["healthy"] for value in values)
+        confirmations = [
+            value["assets"]["BTC"]["deficit_confirmation"] for value in values
+        ]
+        assert [row["cycles"] for row in confirmations] == [1, 2, 3]
+        assert not confirmations[0]["confirmed"]
+        assert confirmations[-1]["confirmed"]
+        assert confirmations[-1]["peak_deficit"] == "0.0010"
+
+
+def test_deficit_silent_recovery_clears_confirmation_episode():
+    with tempfile.TemporaryDirectory() as directory:
+        ledger = UnifiedInventoryLedger(Path(directory))
+        owners = {"BTC": {"dca": "0.002"}, "ETH": {"dca": "0.05"}}
+        ledger.reconcile(
+            account_fingerprint="account", balances=balances("0.001", "0.052"),
+            ownership=owners, evidence_sha256="one", open_order_counts={},
+            sources_healthy=True, now=100,
+        )
+        recovered = ledger.reconcile(
+            account_fingerprint="account", balances=balances("0.003", "0.052"),
+            ownership=owners, evidence_sha256="two", open_order_counts={},
+            sources_healthy=True, now=110,
+        )
+        row = recovered["assets"]["BTC"]["deficit_confirmation"]
+        assert row["cycles"] == 0
+        assert row["confirmed"] is False
+
+
+def test_deficit_alert_requires_confirmation_and_is_sent_once():
+    row = {
+        "ownership_deficit": "0.0048",
+        "deficit_confirmation": {"cycles": 1, "confirmed": False, "notified": False},
+    }
+    assert not Guard._confirmed_deficit_alert(row)
+    row["deficit_confirmation"].update({"cycles": 3, "confirmed": True})
+    assert Guard._confirmed_deficit_alert(row)
+    row["deficit_confirmation"]["notified"] = True
+    assert not Guard._confirmed_deficit_alert(row)
+
+
 def test_active_orders_do_not_reset_confirmation_but_keep_contract_unhealthy():
     with tempfile.TemporaryDirectory() as directory:
         ledger = UnifiedInventoryLedger(Path(directory))

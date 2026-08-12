@@ -741,6 +741,32 @@ class Guard:
             self.inventory_ledger.mark_event_delivered(event["event_id"])
             self.inventory_ledger.mark_episode_notified(asset, transition)
 
+    def _inventory_deficit_diagnostics(
+        self, asset: str, row: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        pair = f"{asset}-USDT"
+        bot_name = f"dca-live-{asset.lower()}usdt-200"
+        latest_mark = self.state.get("bots", {}).get(bot_name, {}).get(
+            "latest", {}
+        ).get("mark_price")
+        mark = Decimal(str(latest_mark)) if latest_mark is not None else self._price(pair)
+        deficit = Decimal(str(row.get("ownership_deficit", "0")))
+        return {
+            "deficit_quantity": str(deficit),
+            "deficit_estimated_notional": str(deficit * mark),
+            "mark_price": str(mark),
+            "price_source": "guard_snapshot" if latest_mark is not None else "binance_ticker",
+        }
+
+    @staticmethod
+    def _confirmed_deficit_alert(row: Dict[str, Any]) -> bool:
+        confirmation = row.get("deficit_confirmation", {})
+        return bool(
+            Decimal(str(row.get("ownership_deficit", "0"))) > 0
+            and confirmation.get("confirmed") is True
+            and confirmation.get("notified") is not True
+        )
+
     def _flush_inventory_events(self) -> int:
         delivered = 0
         for row in self.inventory_ledger.pending_events():
@@ -946,6 +972,29 @@ class Guard:
         }
         for asset, row in status["assets"].items():
             row["runtime"] = runtime
+            deficit = Decimal(row["ownership_deficit"])
+            unattributed = Decimal(row["unattributed"])
+            if deficit > 0:
+                try:
+                    row.update(self._inventory_deficit_diagnostics(asset, row))
+                except Exception as exc:
+                    row.update({
+                        "deficit_quantity": str(deficit),
+                        "deficit_estimated_notional": "",
+                        "market_data_error": f"{type(exc).__name__}: {exc}",
+                    })
+                confirmation = row.get("deficit_confirmation", {})
+                # Reconciliation is unhealthy immediately; only notification waits.
+                if self._confirmed_deficit_alert(row):
+                    episode_id = f"deficit:{asset}:{confirmation.get('first_seen', '')}"
+                    self._inventory_event(
+                        transition="INVENTORY_OWNERSHIP_DEFICIT", asset=asset,
+                        reason="confirmed_strategy_ownership_exceeds_exchange_balance",
+                        severity="critical", action="fail_closed_no_liquidation",
+                        correlation_id=episode_id, details=row,
+                    )
+                    self.inventory_ledger.mark_deficit_notified(asset)
+                continue
             try:
                 market = self._inventory_market_diagnostics(asset, row)
                 market["market_data_healthy"] = True
@@ -957,16 +1006,6 @@ class Guard:
                     "market_data_error": f"{type(exc).__name__}: {exc}",
                 }
             row.update(market)
-            deficit = Decimal(row["ownership_deficit"])
-            unattributed = Decimal(row["unattributed"])
-            if deficit > 0:
-                self._inventory_event(
-                    transition="INVENTORY_OWNERSHIP_DEFICIT", asset=asset,
-                    reason="strategy_ownership_exceeds_exchange_balance",
-                    severity="critical", action="fail_closed_no_liquidation",
-                    correlation_id=f"deficit:{asset}:{row['stability_sha256']}", details=row,
-                )
-                continue
             if (
                 row["inventory_phase"] == "DUST"
                 and market.get("market_data_healthy")

@@ -335,19 +335,27 @@ def format_event(event: Mapping[str, Any]) -> str:
                 for row in details.get("fee_details", [])
             )
             lines.append(f"手续费资产明细：{fees}")
-        if details.get("inventory_phase"):
+        is_deficit = transition == "INVENTORY_OWNERSHIP_DEFICIT"
+        if details.get("inventory_phase") and not is_deficit:
             lines.append(f"库存阶段：{details.get('inventory_phase')}")
-        if details.get("tradable_quantity") is not None:
+        if is_deficit:
+            lines.append(
+                "缺口数量/预估金额："
+                f"{details.get('deficit_quantity', details.get('ownership_deficit', '-'))} / "
+                f"{details.get('deficit_estimated_notional', '-')} USDT"
+            )
+        elif details.get("tradable_quantity") is not None:
             lines.append(
                 "可成交数量/预估金额/最小金额："
                 f"{details.get('tradable_quantity')} / "
                 f"{details.get('estimated_notional', '-')} / "
                 f"{details.get('minimum_notional', '-')}"
             )
-        if details.get("dust_reason"):
+        if details.get("dust_reason") and not is_deficit:
             lines.append(f"Dust 原因：{details.get('dust_reason')}")
-        if details.get("confirmation"):
-            confirmation = details["confirmation"]
+        confirmation_key = "deficit_confirmation" if is_deficit else "confirmation"
+        if details.get(confirmation_key):
+            confirmation = details[confirmation_key]
             lines.append(
                 f"确认：{confirmation.get('cycles', 0)}/3，"
                 f"已确认={confirmation.get('confirmed', False)}"

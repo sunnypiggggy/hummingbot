@@ -88,6 +88,33 @@ def test_inventory_dust_classified_is_supported_and_explains_no_trade():
     assert "record_dust_no_order" in message
 
 
+def test_inventory_deficit_message_uses_shortage_fields_not_dust_fields():
+    value = event(
+        strategy="account", bot="shared-binance-spot", pair="ETH-USDT",
+        mechanism="account_inventory", transition="INVENTORY_OWNERSHIP_DEFICIT",
+        reason="confirmed_strategy_ownership_exceeds_exchange_balance",
+        action="fail_closed_no_liquidation", correlation_id="deficit-eth",
+        details={
+            "inventory_phase": "RECOVERED",
+            "ownership_deficit": "0.0048",
+            "deficit_quantity": "0.0048",
+            "deficit_estimated_notional": "9.14",
+            "tradable_quantity": "0",
+            "minimum_notional": "5",
+            "dust_reason": "rounded_quantity_zero",
+            "confirmation": {"cycles": 0, "confirmed": False},
+            "deficit_confirmation": {"cycles": 3, "confirmed": True},
+            "runtime": {"trading_normal": False, "robots": {}},
+        },
+    )
+    message = format_event(value)
+    assert "缺口数量/预估金额：0.0048 / 9.14 USDT" in message
+    assert "确认：3/3，已确认=True" in message
+    assert "库存阶段：RECOVERED" not in message
+    assert "可成交数量" not in message
+    assert "Dust 原因" not in message
+
+
 def test_outbox_ingestion_and_restart_are_idempotent():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

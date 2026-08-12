@@ -147,6 +147,11 @@ class UnifiedInventoryLedger:
                     evidence_sha256 TEXT NOT NULL, first_seen REAL NOT NULL,
                     last_seen REAL NOT NULL, cycles INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS deficit_confirmations (
+                    asset TEXT PRIMARY KEY, first_seen REAL NOT NULL,
+                    last_seen REAL NOT NULL, cycles INTEGER NOT NULL,
+                    peak_deficit TEXT NOT NULL, notified INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS inventory_episodes (
                     asset TEXT PRIMARY KEY, episode_id TEXT NOT NULL,
                     phase TEXT NOT NULL, quantity TEXT NOT NULL,
@@ -366,6 +371,47 @@ class UnifiedInventoryLedger:
                 owned = sum(owner_rows.values(), ZERO)
                 deficit = max(owned - total, ZERO)
                 unattributed = max(total - owned, ZERO)
+                deficit_confirmation = connection.execute(
+                    "SELECT * FROM deficit_confirmations WHERE asset=?", (asset,)
+                ).fetchone()
+                if sources_healthy and deficit > 0:
+                    # Fill settlement changes balance and ownership hashes. Keep one
+                    # persisted deficit episode until the shortage actually clears.
+                    first_deficit_seen = (
+                        float(deficit_confirmation["first_seen"])
+                        if deficit_confirmation is not None else now
+                    )
+                    deficit_cycles = (
+                        int(deficit_confirmation["cycles"]) + 1
+                        if deficit_confirmation is not None else 1
+                    )
+                    peak_deficit = max(
+                        deficit,
+                        decimal(deficit_confirmation["peak_deficit"])
+                        if deficit_confirmation is not None else ZERO,
+                    )
+                    deficit_notified = bool(
+                        int(deficit_confirmation["notified"])
+                        if deficit_confirmation is not None else 0
+                    )
+                    connection.execute(
+                        "INSERT OR REPLACE INTO deficit_confirmations"
+                        "(asset,first_seen,last_seen,cycles,peak_deficit,notified) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (asset, first_deficit_seen, now, deficit_cycles,
+                         str(peak_deficit), int(deficit_notified)),
+                    )
+                else:
+                    first_deficit_seen, deficit_cycles = now, 0
+                    peak_deficit, deficit_notified = ZERO, False
+                    connection.execute(
+                        "DELETE FROM deficit_confirmations WHERE asset=?", (asset,)
+                    )
+                deficit_confirmed = bool(
+                    sources_healthy and deficit > 0
+                    and deficit_cycles >= confirmation_cycles
+                    and now - first_deficit_seen >= confirmation_seconds
+                )
                 stability_sha256 = self._stability_sha256(
                     account_fingerprint=account_fingerprint,
                     asset=asset, total=total, owners=owner_rows,
@@ -485,6 +531,14 @@ class UnifiedInventoryLedger:
                         "cycles": cycles, "first_seen": first_seen,
                         "last_seen": now, "confirmed": confirmed,
                     },
+                    "deficit_confirmation": {
+                        "cycles": deficit_cycles,
+                        "first_seen": first_deficit_seen,
+                        "last_seen": now,
+                        "confirmed": deficit_confirmed,
+                        "peak_deficit": str(peak_deficit),
+                        "notified": deficit_notified,
+                    },
                 }
             leases = {
                 row["asset"]: {
@@ -513,6 +567,14 @@ class UnifiedInventoryLedger:
         }
         _atomic_json(self.status_path, payload)
         return payload
+
+    def mark_deficit_notified(self, asset: str, *, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE deficit_confirmations SET notified=1,last_seen=? WHERE asset=?",
+                (now, asset),
+            )
 
     def acquire_lease(
         self, asset: str, holder: str, *, ttl_seconds: int = 30,
