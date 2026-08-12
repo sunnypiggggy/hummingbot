@@ -820,25 +820,19 @@ class Guard:
                     consume_bootstrap_asset=asset if bootstrap_cap is not None else "",
                 )
                 self.inventory_ledger.set_episode_phase(asset, "DUST")
-                self._inventory_event(
-                    transition="INVENTORY_DUST_CLASSIFIED", asset=asset,
-                    reason="unattributed_inventory_below_exchange_minimum",
-                    severity="info", action="record_dust_no_order",
-                    correlation_id=job_id,
-                    details={
-                        "quantity": str(dust_quantity), "dust": True,
-                        "inventory_phase": "DUST",
-                        "tradable_quantity": str(amount),
-                        "estimated_notional": str(amount * mark),
-                        "rounded_quantity": str(amount),
-                        "notional": str(amount * mark),
-                        "minimum_notional": str(minimum_notional),
-                        "dust_reason": (
-                            "rounded_quantity_zero" if amount <= 0
-                            else "below_minimum_notional"
-                        ),
-                        "runtime": row.get("runtime", {}),
-                    },
+                # Expected exchange dust is durable audit evidence, not an
+                # operator alert. A fill/ownership snapshot race commonly
+                # settles here after the next monitor cycle.
+                self._audit(
+                    "inventory_dust_classified",
+                    asset=asset, pair=pair, job_id=job_id,
+                    quantity=str(dust_quantity), rounded_quantity=str(amount),
+                    notional=str(amount * mark),
+                    minimum_notional=str(minimum_notional),
+                    dust_reason=(
+                        "rounded_quantity_zero" if amount <= 0
+                        else "below_minimum_notional"
+                    ),
                 )
                 return
             related_pairs = (f"{asset}-USDT", f"{asset}-FDUSD")
@@ -861,11 +855,10 @@ class Guard:
                     )
                 return
             self.inventory_ledger.set_episode_phase(asset, "LIQUIDATING")
-            self._inventory_event(
-                transition="INVENTORY_LIQUIDATION_STARTED", asset=asset,
-                reason="confirmed_unattributed_inventory", severity="warning",
-                action="market_sell_to_usdt", correlation_id=job_id,
-                details={"quantity": str(amount), "client_order_id": client_order_id},
+            self._audit(
+                "inventory_liquidation_started",
+                asset=asset, pair=pair, job_id=job_id,
+                quantity=str(amount), client_order_id=client_order_id,
             )
             try:
                 before_total = balances.get(asset, {}).get("total", Decimal("0"))
@@ -908,20 +901,25 @@ class Guard:
                     details={"quantity": str(amount)},
                 )
                 raise
-            self._inventory_event(
-                transition="INVENTORY_LIQUIDATION_COMPLETED", asset=asset,
-                reason="unattributed_inventory_converted_to_usdt",
-                severity="info", action="verify_balance_and_dust",
-                correlation_id=job_id,
-                details={
-                    "quantity": response.get("executedQty", "0"),
-                    "quote_quantity": response.get("cummulativeQuoteQty", "0"),
-                    "fee_quote": metrics.get("fee_quote", "0"),
-                    "fee_details": metrics.get("fee_details", []),
-                    "order_id": response.get("orderId", ""),
-                    "verification": verification,
-                },
+            self._audit(
+                "inventory_liquidation_completed",
+                asset=asset, pair=pair, job_id=job_id,
+                quantity=response.get("executedQty", "0"),
+                quote_quantity=response.get("cummulativeQuoteQty", "0"),
+                fee_quote=metrics.get("fee_quote", "0"),
+                fee_details=metrics.get("fee_details", []),
+                order_id=response.get("orderId", ""),
+                verification=verification,
             )
+
+    @staticmethod
+    def _confirmed_unattributed_alert(row: Dict[str, Any]) -> bool:
+        """Alert only after the persisted 3-cycle/30-second confirmation."""
+        return bool(
+            Decimal(str(row.get("unattributed", "0"))) > 0
+            and str(row.get("inventory_phase") or "CLEAR") == "CONFIRMED"
+            and row.get("confirmation", {}).get("confirmed") is True
+        )
 
     def _reconcile_account_inventory(self, *, risk_actions_enabled: bool) -> dict[str, Any]:
         if self.emergency_exchange is None:
@@ -986,27 +984,28 @@ class Guard:
                 }
             phase = str(row.get("inventory_phase") or "CLEAR")
             episode_id = str(row.get("episode_id") or "")
-            if unattributed > 0 and phase in {"DETECTED", "CONFIRMED"}:
-                self._inventory_event(
-                    transition="INVENTORY_UNATTRIBUTED_DETECTED", asset=asset,
-                    reason="exchange_balance_exceeds_all_strategy_ownership",
-                    severity="warning", action="await_three_confirmations",
-                    correlation_id=episode_id,
-                    details=row,
-                )
-            elif phase == "RECOVERED" and episode_id:
-                self._inventory_event(
-                    transition="INVENTORY_RECONCILIATION_RECOVERED", asset=asset,
-                    reason="unattributed_inventory_cleared",
-                    severity="info", action="inventory_cycle_closed",
-                    correlation_id=episode_id, details=row,
+            confirmed_unattributed = self._confirmed_unattributed_alert(row)
+            if confirmed_unattributed:
+                self._audit(
+                    "inventory_unattributed_confirmed",
+                    asset=asset, episode_id=episode_id,
+                    unattributed=str(unattributed), details=row,
                 )
             if (
                 risk_actions_enabled and self.unattributed_auto_liquidate
-                and row["confirmation"]["confirmed"] and unattributed > 0
+                and confirmed_unattributed
                 and market.get("market_data_healthy")
             ):
                 self._liquidate_unattributed(asset, row, episode_id)
+            elif confirmed_unattributed and not (
+                risk_actions_enabled and self.unattributed_auto_liquidate
+            ):
+                self._inventory_event(
+                    transition="INVENTORY_UNATTRIBUTED_DETECTED", asset=asset,
+                    reason="confirmed_unattributed_inventory_has_no_auto_handler",
+                    severity="warning", action="manual_review_required",
+                    correlation_id=episode_id, details=row,
+                )
         self.inventory_ledger.write_status(status)
         return status
 

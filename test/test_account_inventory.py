@@ -411,7 +411,7 @@ def test_first_unattributed_liquidation_honors_approved_cap_and_settles_usdt():
         assert guard.inventory_ledger.bootstrap_cap("BTC") is None
 
 
-def test_notification_failure_cannot_rewrite_completed_fill_or_reuse_cap():
+def test_audit_failure_cannot_rewrite_completed_fill_or_reuse_cap():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         guard = Guard.__new__(Guard)
@@ -422,23 +422,20 @@ def test_notification_failure_cannot_rewrite_completed_fill_or_reuse_cap():
         guard.notification_path = root / "events.jsonl"
         guard._lot_filter = lambda pair: (Decimal("0.00001"), Decimal("5"))
         guard._price = lambda pair: Decimal("65000")
-        original_append = dca_live_guard.append_event
-
-        def fail_completed_event(path, event):
-            if event["transition"] == "INVENTORY_LIQUIDATION_COMPLETED":
-                raise OSError("simulated notification disk failure")
-            return original_append(path, event)
-
-        with patch("dca_live_guard.append_event", side_effect=fail_completed_event):
+        guard._audit = lambda event, **details: (
+            (_ for _ in ()).throw(OSError("simulated audit disk failure"))
+            if event == "inventory_liquidation_completed" else None
+        )
+        with patch.object(guard, "_audit", side_effect=guard._audit):
             try:
                 guard._liquidate_unattributed("BTC", {
                     "owned_total": "0.0015", "unattributed": "0.0025",
                     "confirmation": {"cycles": 3, "confirmed": True},
                 }, "evidence")
             except OSError as exc:
-                assert "notification" in str(exc)
+                assert "audit" in str(exc)
             else:
-                raise AssertionError("notification failure should remain observable")
+                raise AssertionError("audit failure should remain observable")
         with guard.inventory_ledger._connection() as connection:
             job = dict(connection.execute(
                 "SELECT * FROM liquidation_jobs WHERE scope='unattributed'"
@@ -447,8 +444,6 @@ def test_notification_failure_cannot_rewrite_completed_fill_or_reuse_cap():
         assert guard.inventory_ledger.completed_job_verified(job)
         assert guard.inventory_ledger.bootstrap_cap("BTC") is None
         assert len(guard.emergency_exchange.orders) == 1
-        assert len(guard.inventory_ledger.pending_events()) == 1
-        assert guard._flush_inventory_events() == 1
         assert guard.inventory_ledger.pending_events() == []
 
 
@@ -477,3 +472,19 @@ def test_unattributed_below_minimum_is_persisted_as_dust_without_order():
             ).fetchone()
         assert job["status"] == "DUST"
         assert "minimum_notional=5" in job["error"]
+        assert not guard.notification_path.exists()
+
+
+def test_unattributed_alert_waits_for_persisted_confirmation():
+    base = {
+        "unattributed": "0.0075",
+        "inventory_phase": "DETECTED",
+        "confirmation": {"cycles": 0, "confirmed": False},
+    }
+    assert not Guard._confirmed_unattributed_alert(base)
+    base["confirmation"] = {"cycles": 3, "confirmed": True}
+    assert not Guard._confirmed_unattributed_alert(base)
+    base["inventory_phase"] = "CONFIRMED"
+    assert Guard._confirmed_unattributed_alert(base)
+    base["unattributed"] = "0"
+    assert not Guard._confirmed_unattributed_alert(base)
