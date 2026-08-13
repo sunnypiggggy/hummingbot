@@ -67,7 +67,7 @@ class BotOverviewProvider:
             "armed": bool(state.get("armed")),
             "shadow": bool(state.get("shadow")),
             "emergency_ready": bool(state.get("emergency_ready")),
-            "technical_buy_gate": state.get("technical_buy_gate", {}),
+            "technical_buy_gate": state.get("xgboost_risk_gate", {}),
             "observed_at_epoch": observed_at or None,
             "data_age_seconds": age,
             "fresh": age is not None and age <= 90,

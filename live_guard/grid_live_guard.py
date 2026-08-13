@@ -271,6 +271,11 @@ class Guard:
             if self.state_path.exists()
             else {"version": 3, "bots": {}, "first_failure_at": None, "last_success_at": 0}
         )
+        # ``technical_buy_gate`` was the retired ROC/SQZMOM gate snapshot.
+        # Keeping it after the v22 cutover makes status consumers report a
+        # contradictory Risk-On state while the executable v22 contract is
+        # Risk-Off.  It is telemetry only and must not survive state migration.
+        self.state.pop("technical_buy_gate", None)
         self.state.update({
             "armed": self.armed,
             "shadow": self.shadow,

@@ -45,7 +45,10 @@ def test_bot_overview_lists_plain_scripts_and_grid_mtm():
         "armed": True,
         "shadow": False,
         "emergency_ready": True,
-        "technical_buy_gate": {"buy_enabled": True},
+        "xgboost_risk_gate": {
+            "schema": "ethbtc-forced-exit-live-contract-v1",
+            "pairs": {"BTC-FDUSD": {"buy_enabled": False}},
+        },
         "bots": {
             "grid-live-fdusd-400": {
                 "latest": {
@@ -76,6 +79,7 @@ def test_bot_overview_lists_plain_scripts_and_grid_mtm():
     assert result["grid"]["mtm_pnl_quote"] == "0.42"
     assert result["grid"]["pnl_method"] == "strategy_owned_mark_to_market"
     assert result["grid"]["fresh"] is True
+    assert result["grid"]["technical_buy_gate"]["pairs"]["BTC-FDUSD"]["buy_enabled"] is False
     assert "general_logs" not in json.dumps(result)
     dca = next(bot for bot in result["bots"] if bot["bot_name"].startswith("dca-"))
     assert dca["error_count"] == 1

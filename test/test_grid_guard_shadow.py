@@ -17,6 +17,11 @@ from ethbtc_forced_exit_contract import MODEL_VERSION, PACKAGE_ID, SCHEMA  # noq
 
 
 class GridGuardShadowTest(unittest.TestCase):
+    def test_guard_init_migrates_retired_roc_sqzmom_snapshot(self):
+        source = Path(__file__).resolve().parents[1] / "live_guard" / "grid_live_guard.py"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn('self.state.pop("technical_buy_gate", None)', text)
+
     @patch("live_guard.grid_live_guard.atomic_gate_json")
     def test_cached_technical_gate_is_republished_to_new_instance(self, atomic_json):
         guard = Guard.__new__(Guard)
