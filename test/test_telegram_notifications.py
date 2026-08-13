@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from live_guard.telegram_notifications import (
     MARKDOWN_MESSAGE_PREFIX,
+    RuntimeErrorChannel,
     TelegramChannelClient,
     TelegramOutbox,
     append_event,
@@ -20,6 +21,8 @@ from live_guard.telegram_notifications import (
     format_event,
     hermes_recovery_prompt,
     render_mobile_profit_card,
+    runtime_error_lines,
+    sanitize_runtime_error,
 )
 from live_guard.telegram_parameter_report import build_parameter_attachments
 from live_guard.dca_live_guard import Guard as DcaGuard
@@ -35,6 +38,104 @@ def event(**overrides):
     }
     values.update(overrides)
     return build_event(**values)
+
+
+def test_runtime_error_channel_alerts_once_then_reports_recovery(tmp_path):
+    events = tmp_path / "events.jsonl"
+    state = tmp_path / "runtime-errors.json"
+    channel = RuntimeErrorChannel(
+        event_path=events, state_path=state, source="grid-live-guard",
+        strategy="grid", bot="grid-live-fdusd-400",
+        pair="BTC-FDUSD,ETH-FDUSD",
+    )
+    assert channel.failure(
+        "guard_cycle", ConnectionError("connection reset by peer"),
+        trading_impact="automatic retry", now=100,
+    )
+    assert not channel.failure(
+        "guard_cycle", ConnectionError("connection reset by peer"),
+        trading_impact="automatic retry", now=102,
+    )
+    restarted = RuntimeErrorChannel(
+        event_path=events, state_path=state, source="grid-live-guard",
+        strategy="grid", bot="grid-live-fdusd-400",
+        pair="BTC-FDUSD,ETH-FDUSD",
+    )
+    assert not restarted.failure(
+        "guard_cycle", ConnectionError("connection reset by peer"),
+        trading_impact="automatic retry", now=104,
+    )
+    assert restarted.recovered("guard_cycle", now=110)
+    assert not restarted.recovered("guard_cycle", now=111)
+    rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    assert [row["transition"] for row in rows] == ["ERROR_OCCURRED", "ERROR_RECOVERED"]
+    assert rows[1]["details"]["occurrences"] == 3
+    assert rows[1]["details"]["duration_seconds"] == 10
+    assert "运行错误告警" in format_event(rows[0])
+    assert "运行错误已恢复" in format_event(rows[1])
+
+
+def test_runtime_order_error_recovers_only_after_quiet_window(tmp_path):
+    channel = RuntimeErrorChannel(
+        event_path=tmp_path / "events.jsonl", state_path=tmp_path / "state.json",
+        source="strategy", strategy="dca", bot="dca", pair="ETH-USDT",
+    )
+    channel.failure("order_submission", "balance insufficient", trading_impact="rejected", now=10)
+    assert not channel.recover_if_quiet("order_submission", quiet_seconds=300, now=309)
+    assert channel.recover_if_quiet("order_submission", quiet_seconds=300, now=310)
+
+
+def test_runtime_error_is_redacted_and_truncated():
+    raw = (
+        "GET https://api.telegram.org/bot123456:SECRET/sendMessage?signature=abc "
+        "api_key=visible password=hunter2 token=secret " + "x" * 1000
+    )
+    value = sanitize_runtime_error(raw)
+    assert "123456:SECRET" not in value
+    assert "visible" not in value
+    assert "hunter2" not in value
+    assert "token=secret" not in value
+    assert "[REDACTED]" in value
+    assert len(value) <= 600
+
+
+def test_runtime_error_notification_failure_never_breaks_producer(tmp_path):
+    channel = RuntimeErrorChannel(
+        event_path=tmp_path / "directory", state_path=tmp_path / "state.json",
+        source="test", strategy="dca", bot="bot", pair="BTC-USDT",
+    )
+    channel.event_path.mkdir()
+    assert not channel.failure(
+        "cycle", RuntimeError("boom"), trading_impact="none", now=10
+    )
+
+
+def test_outbox_health_exposes_sanitized_delivery_retry(tmp_path):
+    outbox = TelegramOutbox(tmp_path / "outbox.sqlite", channel_id="channel")
+    outbox.enqueue(event_id="event", kind="message", text="alert")
+    outbox.connection.execute(
+        "UPDATE outbox SET attempts=2,last_error=? WHERE event_id='event'",
+        ("token=very-secret transport timeout",),
+    )
+    outbox.connection.commit()
+    health = outbox.health()
+    assert health["retrying"] == 1
+    assert health["max_attempts"] == 2
+    assert "very-secret" not in health["last_error"]
+    outbox.close()
+
+
+def test_runtime_log_filter_selects_errors_and_redacts_secrets():
+    lines = [
+        "2026-08-13 INFO strategy started successfully",
+        "2026-08-13 ERROR order rejected token=secret balance insufficient",
+        "2026-08-13 client_order_tracker Order abc has failed at Binance",
+        "2026-08-13 INFO validation completed with 0 errors",
+    ]
+    found = runtime_error_lines(lines)
+    assert len(found) == 2
+    assert "order rejected" in found[0]
+    assert "secret" not in found[0]
 
 
 def test_correlated_event_id_is_stable_across_guard_cycles():
