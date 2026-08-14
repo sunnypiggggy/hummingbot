@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY live_guard/requirements.txt /tmp/requirements.txt
+COPY requirements-grid-xgboost.txt /tmp/requirements-grid-xgboost.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt -r /tmp/requirements-grid-xgboost.txt
+COPY scripts /app
+COPY live_guard/dca_live_guard.py /app/dca_live_guard.py
+COPY live_guard/grid_live_guard.py /app/grid_live_guard.py
+COPY live_guard/account_inventory.py /app/account_inventory.py
+COPY live_guard/emergency_execution.py /app/emergency_execution.py
+COPY live_guard/runtime_endpoints.py /app/runtime_endpoints.py
+COPY live_guard/telegram_notifications.py /app/telegram_notifications.py
+
+ENV PYTHONPATH=/app \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
+
+CMD ["python", "/app/grid_live_guard.py"]

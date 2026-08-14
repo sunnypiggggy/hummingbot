@@ -1,0 +1,228 @@
+{
+  "schema": "ethbtc-telegram-event-v1",
+  "event_id": "fe2e4a69423028415f20f7026a2341dee605e2705dc2c1358cd909b996f11648",
+  "occurred_at": "2026-08-10T03:05:37.794494+00:00",
+  "source": "v22-backtest-png-report",
+  "strategy": "grid+dca",
+  "bot": "grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
+  "pair": "BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT",
+  "mechanism": "parameter_update",
+  "transition": "PARAMETER_RETAINED",
+  "phase_from": "",
+  "phase_to": "",
+  "correlation_id": "v22-backtest-png:73f59befa431946889a8d5885d04a05adb43c8e81eeab604f1aa89e31f0e9d60:7e1233679cd65c6370dcf8a3a0f9894786bf8911a4cab1be93b2e6c6b3137802",
+  "reason": "已按当前生产 v22 历史周信号与 forced-exit-v2 执行口径生成回测图片：Grid BTC/ETH、DCA BTC/ETH 各自独立权益，包含过去360天、2026年1–2月和2026年5–6月。当前生产包与回放证据覆盖的历史周模型、阈值和边界已逐项一致性核验；签名未覆盖或无可信成交证据的区间在图中单独标示。此消息只发送PNG，不附模型文件。",
+  "severity": "info",
+  "action": "publish_backtest_png_only",
+  "release_sha256": "73f59befa431946889a8d5885d04a05adb43c8e81eeab604f1aa89e31f0e9d60",
+  "model_sha256": "fe487b3b0c8556154d7148583709762e576205059ffc7f7878718730af7fd1a6",
+  "parameter_sha256": "",
+  "requires_manual_action": false,
+  "attachments": [
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/grid_btcfdusd_360d.png",
+      "kind": "photo",
+      "sha256": "39e01d24d7abcd0f905f55acf205fcc1f935b58e337cb13776c5b13b7733b4fb",
+      "caption": "GRID BTC-FDUSD｜过去360天｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/grid_ethfdusd_360d.png",
+      "kind": "photo",
+      "sha256": "012a5035b03529a183e916b41b076715bb0b50eaff9fbeca75f6be9fdc22831e",
+      "caption": "GRID ETH-FDUSD｜过去360天｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/dca_btcusdt_360d.png",
+      "kind": "photo",
+      "sha256": "57edc59e686739e6a65798a9fd530acaf51199c6c7e044644d7fb9899ac049ce",
+      "caption": "DCA BTC-USDT｜过去360天｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/dca_ethusdt_360d.png",
+      "kind": "photo",
+      "sha256": "d8aa9b977f9f5fd8b5cc365c66120abd63e36d58e791cae89d54e296bb679700",
+      "caption": "DCA ETH-USDT｜过去360天｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/grid_btcfdusd_2026_jan_feb.png",
+      "kind": "photo",
+      "sha256": "263705ab4308453e109f9dbe5163f898b94a29866d871ff3e5f952dfa25c9038",
+      "caption": "GRID BTC-FDUSD｜2026年1–2月重点窗口｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/grid_ethfdusd_2026_jan_feb.png",
+      "kind": "photo",
+      "sha256": "fd9e8e6728c3779c67bf0e36fca93cfd0bae3bb3de0a4d5a1b3440c254072147",
+      "caption": "GRID ETH-FDUSD｜2026年1–2月重点窗口｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/dca_btcusdt_2026_jan_feb.png",
+      "kind": "photo",
+      "sha256": "985e4992f5f3ae5be47837368a4578e81845424689475b9bfd8effefb37d52ca",
+      "caption": "DCA BTC-USDT｜2026年1–2月重点窗口｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/dca_ethusdt_2026_jan_feb.png",
+      "kind": "photo",
+      "sha256": "64fbbcd8be19803d7963273d44cb2dc723974b7ef7a113d843911674739ad4f6",
+      "caption": "DCA ETH-USDT｜2026年1–2月重点窗口｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/grid_btcfdusd_2026_may_june.png",
+      "kind": "photo",
+      "sha256": "d5daeac800c025bb6c37283c1123e2e0638050e0d24ca920a40db5d3241d1a8e",
+      "caption": "GRID BTC-FDUSD｜2026年5–6月重点窗口｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/grid_ethfdusd_2026_may_june.png",
+      "kind": "photo",
+      "sha256": "173a1484be118869aaf73fa48d70546b660f0e8d5e1cfbe7bb358ccadbd6db78",
+      "caption": "GRID ETH-FDUSD｜2026年5–6月重点窗口｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/dca_btcusdt_2026_may_june.png",
+      "kind": "photo",
+      "sha256": "e490d091f7c754f4d50e4ce3cbc0c8c0251b0725c435094d487e5235a3079428",
+      "caption": "DCA BTC-USDT｜2026年5–6月重点窗口｜单机器人权益"
+    },
+    {
+      "path": "/workspace/releases/audits/v22-png-backtest-current-v2/dca_ethusdt_2026_may_june.png",
+      "kind": "photo",
+      "sha256": "697e1359a2081977fcbcb72d0df1566bd6b959e8ce06b5805bc7ace8a2d1fa62",
+      "caption": "DCA ETH-USDT｜2026年5–6月重点窗口｜单机器人权益"
+    }
+  ],
+  "details": {
+    "report_schema": "v22-forced-exit-png-windows-v1",
+    "execution_policy": "v22-risk-off-forced-exit-v2",
+    "historical_week_identity_verified": true,
+    "evidence_model_sha256": "3a0eea362858830757db5bf3de3892b88923e5cbce52b5f3e72c8cdabbecc338",
+    "production_model_sha256": "fe487b3b0c8556154d7148583709762e576205059ffc7f7878718730af7fd1a6",
+    "window_360d_start": 1754006400,
+    "window_360d_end": 1785110400,
+    "image_count": 12,
+    "model_attachment_included": false,
+    "images": [
+      {
+        "strategy": "grid",
+        "pair": "BTC-FDUSD",
+        "window": "360d",
+        "pnl": 25.95660095934653,
+        "end_equity": 225.93985219995272,
+        "max_drawdown_pct": -11.43922026185028,
+        "risk_off_hours": 1292.6666666666667,
+        "sha256": "39e01d24d7abcd0f905f55acf205fcc1f935b58e337cb13776c5b13b7733b4fb"
+      },
+      {
+        "strategy": "grid",
+        "pair": "ETH-FDUSD",
+        "window": "360d",
+        "pnl": 27.397910372644617,
+        "end_equity": 227.3249515377193,
+        "max_drawdown_pct": -16.15899512618,
+        "risk_off_hours": 1156.5833333333333,
+        "sha256": "012a5035b03529a183e916b41b076715bb0b50eaff9fbeca75f6be9fdc22831e"
+      },
+      {
+        "strategy": "dca",
+        "pair": "BTC-USDT",
+        "window": "360d",
+        "pnl": 1.8684394036147864,
+        "end_equity": 192.1875134956091,
+        "max_drawdown_pct": -11.910944428929525,
+        "risk_off_hours": 1292.5833333333333,
+        "sha256": "57edc59e686739e6a65798a9fd530acaf51199c6c7e044644d7fb9899ac049ce"
+      },
+      {
+        "strategy": "dca",
+        "pair": "ETH-USDT",
+        "window": "360d",
+        "pnl": -14.126693326281838,
+        "end_equity": 176.07988719055322,
+        "max_drawdown_pct": -16.871359669731223,
+        "risk_off_hours": 1156.5,
+        "sha256": "d8aa9b977f9f5fd8b5cc365c66120abd63e36d58e791cae89d54e296bb679700"
+      },
+      {
+        "strategy": "grid",
+        "pair": "BTC-FDUSD",
+        "window": "2026_jan_feb",
+        "pnl": -2.541799498958767,
+        "end_equity": 203.296227591838,
+        "max_drawdown_pct": -10.904768283575084,
+        "risk_off_hours": 248.08333333333334,
+        "sha256": "263705ab4308453e109f9dbe5163f898b94a29866d871ff3e5f952dfa25c9038"
+      },
+      {
+        "strategy": "grid",
+        "pair": "ETH-FDUSD",
+        "window": "2026_jan_feb",
+        "pnl": 7.138060955086814,
+        "end_equity": 220.64310632749556,
+        "max_drawdown_pct": -7.344503427882265,
+        "risk_off_hours": 432.1666666666667,
+        "sha256": "fd9e8e6728c3779c67bf0e36fca93cfd0bae3bb3de0a4d5a1b3440c254072147"
+      },
+      {
+        "strategy": "dca",
+        "pair": "BTC-USDT",
+        "window": "2026_jan_feb",
+        "pnl": -8.166248085090217,
+        "end_equity": 182.1528260069041,
+        "max_drawdown_pct": -10.397318953357571,
+        "risk_off_hours": 248.08333333333334,
+        "sha256": "985e4992f5f3ae5be47837368a4578e81845424689475b9bfd8effefb37d52ca"
+      },
+      {
+        "strategy": "dca",
+        "pair": "ETH-USDT",
+        "window": "2026_jan_feb",
+        "pnl": -8.01728558066418,
+        "end_equity": 182.18929493617088,
+        "max_drawdown_pct": -11.199001272077492,
+        "risk_off_hours": 432.1666666666667,
+        "sha256": "64fbbcd8be19803d7963273d44cb2dc723974b7ef7a113d843911674739ad4f6"
+      },
+      {
+        "strategy": "grid",
+        "pair": "BTC-FDUSD",
+        "window": "2026_may_june",
+        "pnl": 3.947885564814243,
+        "end_equity": 222.5828253383858,
+        "max_drawdown_pct": -4.021692820052635,
+        "risk_off_hours": 692.1666666666666,
+        "sha256": "d5daeac800c025bb6c37283c1123e2e0638050e0d24ca920a40db5d3241d1a8e"
+      },
+      {
+        "strategy": "grid",
+        "pair": "ETH-FDUSD",
+        "window": "2026_may_june",
+        "pnl": -21.55629912241332,
+        "end_equity": 215.6487413344628,
+        "max_drawdown_pct": -16.15899512618,
+        "risk_off_hours": 376.0833333333333,
+        "sha256": "173a1484be118869aaf73fa48d70546b660f0e8d5e1cfbe7bb358ccadbd6db78"
+      },
+      {
+        "strategy": "dca",
+        "pair": "BTC-USDT",
+        "window": "2026_may_june",
+        "pnl": -0.5234967205228713,
+        "end_equity": 187.38609806325474,
+        "max_drawdown_pct": -7.617093407967312,
+        "risk_off_hours": 692.1666666666666,
+        "sha256": "e490d091f7c754f4d50e4ce3cbc0c8c0251b0725c435094d487e5235a3079428"
+      },
+      {
+        "strategy": "dca",
+        "pair": "ETH-USDT",
+        "window": "2026_may_june",
+        "pnl": -15.268785049807889,
+        "end_equity": 168.52800866184566,
+        "max_drawdown_pct": -16.871359669731223,
+        "risk_off_hours": 376.0833333333333,
+        "sha256": "697e1359a2081977fcbcb72d0df1566bd6b959e8ce06b5805bc7ace8a2d1fa62"
+      }
+    ]
+  }
+}
