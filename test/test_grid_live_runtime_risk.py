@@ -62,6 +62,8 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             move_threshold=Decimal("0.015"),
             min_grid_move_seconds=1800,
             startup_order_reconcile_seconds=30,
+            fee_rate=Decimal("0"),
+            taker_fee_rate=Decimal("0.001"),
         )
         strategy.connectors = {"binance": Connector()}
         strategy.ledgers = {
@@ -99,9 +101,37 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.technical_reason_by_pair = {pair: "active" for pair in strategy.config.trading_pairs}
         strategy.technical_signal_by_pair = {pair: {} for pair in strategy.config.trading_pairs}
         strategy.technical_transition_key = None
+        strategy.integrity_failure_grace = {}
         strategy.runtime_events = []
         strategy._append_notification_event = lambda *args, **kwargs: None
         return strategy
+
+    def test_market_fill_fee_conversion_failure_uses_taker_not_maker_rate(self):
+        strategy = self.strategy()
+        order_id = "market-reentry"
+        ledger = strategy.ledgers["ETH-FDUSD"]
+        ledger.open_order_ids.add(order_id)
+
+        class MissingRateFee:
+            @staticmethod
+            def fee_amount_in_token(*_args, **_kwargs):
+                raise ValueError("quote conversion unavailable")
+
+        event = SimpleNamespace(
+            trading_pair="ETH-FDUSD",
+            order_id=order_id,
+            price=Decimal("2000"),
+            amount=Decimal("0.05"),
+            order_type=SimpleNamespace(name="MARKET"),
+            trade_type=SimpleNamespace(name="BUY"),
+            trade_fee=MissingRateFee(),
+        )
+
+        strategy.did_fill_order(event)
+
+        self.assertEqual(Decimal("0.1"), ledger.fees_quote)
+        self.assertEqual("quote_fee_fallback_applied", strategy.runtime_events[-1]["event"])
+        self.assertEqual("0.001", strategy.runtime_events[-1]["fee_rate"])
 
     def test_shutdown_flag_blocks_new_orders_without_competing_cancellation(self):
         strategy = LivePortfolioGrid.__new__(LivePortfolioGrid)
@@ -480,6 +510,51 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             "xgboost_risk_off_unknown_sides_sell_rebuild_scheduled",
             strategy.runtime_events[-1]["event"],
         )
+
+    def test_transient_technical_failure_blocks_buys_without_immediate_latch(self):
+        strategy = self.strategy()
+        strategy.config.technical_buy_gate_enabled = True
+        strategy.config.technical_buy_gate_poll_seconds = 5
+        strategy.config.technical_buy_gate_file = "unused"
+        strategy.config.technical_buy_gate_max_age_seconds = 150
+        strategy.config.technical_buy_fail_closed = True
+        strategy.config.technical_model_sha256 = ""
+        strategy.config.technical_feature_sha256 = ""
+        strategy.cancel_owned_buy_orders = lambda pair=None: False
+        strategy._latch_integrity_failure = lambda reason: self.fail(reason)
+        with patch("walk_forward_portfolio_grid_live.load_runtime_xgboost_gate", return_value={
+            "runtime_gate_healthy": False,
+            "reason": "fail_closed:ConnectionResetError(104, connection reset by peer)",
+            "pairs": {},
+        }):
+            strategy._poll_technical_buy_gate()
+        self.assertFalse(strategy.technical_buy_enabled)
+        self.assertFalse(strategy.integrity_failure_grace["technical_contract"]["expired"])
+        self.assertEqual(
+            "technical_contract_transport_grace_started",
+            strategy.runtime_events[-1]["event"],
+        )
+
+    def test_deterministic_technical_failure_still_latches_immediately(self):
+        strategy = self.strategy()
+        strategy.config.technical_buy_gate_enabled = True
+        strategy.config.technical_buy_gate_poll_seconds = 5
+        strategy.config.technical_buy_gate_file = "unused"
+        strategy.config.technical_buy_gate_max_age_seconds = 150
+        strategy.config.technical_buy_fail_closed = True
+        strategy.config.technical_model_sha256 = ""
+        strategy.config.technical_feature_sha256 = ""
+        strategy.cancel_owned_buy_orders = lambda pair=None: False
+        latched = []
+        strategy._latch_integrity_failure = latched.append
+        with patch("walk_forward_portfolio_grid_live.load_runtime_xgboost_gate", return_value={
+            "runtime_gate_healthy": False,
+            "reason": "fail_closed:model hash mismatch",
+            "pairs": {},
+        }):
+            strategy._poll_technical_buy_gate()
+        self.assertEqual(1, len(latched))
+        self.assertIn("model hash mismatch", latched[0])
 
     def test_continuous_cycle_failure_trips_after_sixty_seconds(self):
         strategy = self.strategy()

@@ -45,6 +45,7 @@ class ScenarioState:
         self.faults = {key: list(value) for key, value in document.get("faults", {}).items()}
         self.next_order_id = int(document.get("next_order_id", 900000))
         self.next_message_id = 1
+        self.spot_bnb_burn = bool(document.get("spot_bnb_burn", False))
 
     def fault(self, key):
         with self.lock:
@@ -64,6 +65,7 @@ class ScenarioState:
                 "telegram": list(self.telegram),
                 "controller_updates": list(self.control.get("controller_updates", [])),
                 "faults_remaining": {key: len(value) for key, value in self.faults.items()},
+                "spot_bnb_burn": self.spot_bnb_burn,
             }
 
 
@@ -157,6 +159,10 @@ class ScenarioHandler(BaseHTTPRequestHandler):
                     "locked": str(value["locked"]),
                 } for asset, value in balances.items()]
             return self._json(200, {"canTrade": True, "balances": rows})
+        if path == "/sapi/v1/bnbBurn":
+            if not self._signed():
+                return
+            return self._json(200, {"spotBNBBurn": self.state.spot_bnb_burn})
         if path == "/api/v3/openOrders":
             if not self._signed():
                 return
@@ -231,6 +237,14 @@ class ScenarioHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path, params = parsed.path, self._params()
+        if path == "/sapi/v1/bnbBurn":
+            if not self._signed():
+                return
+            raw = str(params.get("spotBNBBurn", "")).lower()
+            if raw not in {"true", "false"}:
+                return self._json(400, {"code": -1102, "msg": "spotBNBBurn is required"})
+            self.state.spot_bnb_burn = raw == "true"
+            return self._json(200, {"spotBNBBurn": self.state.spot_bnb_burn})
         if path == "/api/v3/order":
             if not self._signed():
                 return

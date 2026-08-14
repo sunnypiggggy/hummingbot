@@ -70,6 +70,27 @@ def test_scenario_mode_refuses_non_scenario_credentials(monkeypatch):
         BinanceEmergencyClient("production-looking-key", "secret", "http://127.0.0.1:1")
 
 
+def test_live_readiness_rejects_bnb_fee_deduction_and_toggle_is_verified(monkeypatch):
+    document = scenario_document()
+    document["spot_bnb_burn"] = True
+    with RiskScenarioServer(document) as server:
+        enable_scenario(monkeypatch, server, "bnb-fee-policy")
+        exchange = client(server)
+
+        with pytest.raises(RuntimeError, match="spotBNBBurn=true"):
+            exchange.verify_ready(["BTC-USDT", "ETH-USDT"])
+
+        assert exchange.set_spot_bnb_burn(False) is False
+        assert exchange.spot_bnb_burn_enabled() is False
+        assert exchange.verify_ready(["BTC-USDT", "ETH-USDT"]) == {
+            "spot_trading": True,
+            "spot_bnb_burn_disabled": True,
+        }
+        assert requests.get(f"{server.base_url}/scenario/state", timeout=2).json()[
+            "spot_bnb_burn"
+        ] is False
+
+
 def test_inventory_health_is_false_while_any_open_order_exists(tmp_path):
     ledger = UnifiedInventoryLedger(tmp_path)
     status = ledger.reconcile(

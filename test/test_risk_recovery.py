@@ -2,8 +2,44 @@ from scripts.risk_recovery import (
     ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
     PORTFOLIO_COOLDOWN_SECONDS, REQUIRED_HEALTHY_CYCLES,
     TECHNICAL_COOLDOWN_SECONDS,
-    advance_recovery, mark_exit_complete, mark_reentry_complete, trigger_state,
+    advance_integrity_failure, advance_recovery, classify_integrity_failure,
+    mark_exit_complete, mark_reentry_complete, trigger_state,
 )
+
+
+def test_transient_transport_failure_has_persistent_grace_then_expires() -> None:
+    assert classify_integrity_failure(
+        "fail_closed:ConnectionResetError(104, connection reset by peer)"
+    ) == "transient_transport"
+    first = advance_integrity_failure(
+        None, reason="ConnectionResetError", now=100, grace_seconds=60,
+    )
+    assert first["expired"] is False
+    second = advance_integrity_failure(
+        first, reason="ReadTimeout", now=159.9, grace_seconds=60,
+    )
+    assert second["first_seen_at"] == 100
+    assert second["attempts"] == 2
+    assert second["expired"] is False
+    expired = advance_integrity_failure(
+        second, reason="ReadTimeout", now=160, grace_seconds=60,
+    )
+    assert expired["expired"] is True
+
+
+def test_contract_integrity_errors_remain_immediate_fail_closed() -> None:
+    for reason in (
+        "model hash mismatch",
+        "no signed weekly model covers BTC-FDUSD",
+        "contract is stale",
+        "authorization is missing",
+        "fail_closed:transient_grace_expired:60s:ConnectionResetError",
+    ):
+        decision = advance_integrity_failure(
+            None, reason=reason, now=100, grace_seconds=60,
+        )
+        assert decision["classification"] == "deterministic_integrity"
+        assert decision["expired"] is True
 
 
 def test_transaction_breaker_exits_cools_reenters_and_resets_baseline() -> None:

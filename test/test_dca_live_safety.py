@@ -3,7 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from decimal import Decimal
 from pathlib import Path
 
@@ -183,6 +183,35 @@ class CanaryTests(unittest.TestCase):
 
 
 class DcaLiveSafetyTest(unittest.TestCase):
+    def test_transient_contract_failure_uses_grace_without_latch(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {}
+        guard.fail_closed_seconds = 60
+        guard.runtime_errors = Mock()
+
+        self.assertFalse(guard._integrity_failure_requires_latch(
+            "v22_contract", "fail_closed:ConnectionResetError", 100,
+        ))
+        self.assertFalse(guard._integrity_failure_requires_latch(
+            "v22_contract", "fail_closed:ReadTimeout", 159.9,
+        ))
+        self.assertTrue(guard._integrity_failure_requires_latch(
+            "v22_contract", "fail_closed:ReadTimeout", 160,
+        ))
+        self.assertEqual(
+            3, guard.state["integrity_failure_grace"]["v22_contract"]["attempts"]
+        )
+
+    def test_deterministic_contract_failure_bypasses_grace(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {}
+        guard.fail_closed_seconds = 60
+        guard.runtime_errors = Mock()
+
+        self.assertTrue(guard._integrity_failure_requires_latch(
+            "v22_contract", "fail_closed:model hash mismatch", 100,
+        ))
+
     def test_http_retry_policy_never_replays_trading_writes(self):
         session = _read_retry_session()
         retry = session.get_adapter("https://").max_retries

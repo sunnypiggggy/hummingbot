@@ -20,6 +20,78 @@ REQUIRED_HEALTHY_CYCLES = 3
 EMERGENCY_ESCALATION_SECONDS = 3
 EXIT_CRITICAL_SECONDS = 10
 
+# Only transport failures that are normally recoverable without changing the
+# signed model/data contract receive a grace period.  Unknown failures remain
+# deterministic and therefore fail closed immediately.
+TRANSIENT_TRANSPORT_MARKERS = (
+    "connectionreseterror",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote disconnected",
+    "remotedisconnected",
+    "read timed out",
+    "connect timeout",
+    "connecttimeout",
+    "readtimeout",
+    "temporarily unavailable",
+    "temporary failure in name resolution",
+    "name resolution",
+    "max retries exceeded",
+    "http 429",
+    "status code 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "status code 500",
+    "status code 502",
+    "status code 503",
+    "status code 504",
+)
+
+
+def classify_integrity_failure(reason: Any) -> str:
+    """Classify a contract/source failure without weakening integrity checks."""
+    normalized = str(reason or "").strip().lower()
+    if "transient_grace_expired" in normalized:
+        return "deterministic_integrity"
+    if any(marker in normalized for marker in TRANSIENT_TRANSPORT_MARKERS):
+        return "transient_transport"
+    return "deterministic_integrity"
+
+
+def advance_integrity_failure(
+    previous: Mapping[str, Any] | None,
+    *,
+    reason: Any,
+    now: float,
+    grace_seconds: float,
+) -> dict[str, Any]:
+    """Advance a persistent transient-failure timer.
+
+    Deterministic integrity failures expire immediately.  Transport failures
+    share one episode even if the exception text changes between retries.
+    """
+    classification = classify_integrity_failure(reason)
+    old = dict(previous or {})
+    same_episode = old.get("classification") == classification
+    first_seen_at = float(old.get("first_seen_at", now)) if same_episode else float(now)
+    elapsed = max(0.0, float(now) - first_seen_at)
+    grace = max(0.0, float(grace_seconds))
+    expired = classification != "transient_transport" or elapsed >= grace
+    return {
+        "classification": classification,
+        "first_seen_at": first_seen_at,
+        "last_seen_at": float(now),
+        "reason": str(reason or "unknown"),
+        "attempts": int(old.get("attempts", 0)) + 1 if same_episode else 1,
+        "grace_seconds": grace,
+        "elapsed_seconds": elapsed,
+        "remaining_seconds": max(0.0, grace - elapsed) if not expired else 0.0,
+        "expired": expired,
+    }
+
 
 def cooldown_for_scope(scope: str) -> int:
     return {

@@ -29,7 +29,11 @@ from ethbtc_forced_exit_contract import (
     atomic_json as atomic_v22_json,
     load_runtime_contract as load_runtime_v22_contract,
 )
-from risk_recovery import EMERGENCY_ESCALATION_SECONDS, EXITING
+from risk_recovery import (
+    EMERGENCY_ESCALATION_SECONDS,
+    EXITING,
+    advance_integrity_failure,
+)
 try:
     from account_inventory import (
         SCHEMA as INVENTORY_STATUS_SCHEMA,
@@ -461,7 +465,7 @@ class Guard:
     def verify_shadow_exchange_ready(self, pairs: list[str]) -> dict:
         if self.emergency_exchange is None:
             raise RuntimeError("Grid shadow preflight requires Binance credentials")
-        self.emergency_exchange.verify_ready(pairs)
+        fee_policy = self.emergency_exchange.verify_ready(pairs)
         restrictions = self.emergency_exchange._signed(
             "GET", "/sapi/v1/account/apiRestrictions"
         )
@@ -557,6 +561,9 @@ class Guard:
         return {
             "account_read": True,
             "spot_trading": True,
+            "spot_bnb_burn_disabled": bool(
+                fee_policy.get("spot_bnb_burn_disabled")
+            ),
             "withdrawals_disabled": True,
             "ip_restricted": True,
             "futures_disabled": True,
@@ -593,6 +600,40 @@ class Guard:
             or (gate.get("schema") == V22_GATE_SCHEMA
                 and gate.get("model_version") == V22_MODEL_VERSION
                 and gate.get("package_id") == V22_PACKAGE_ID)
+        )
+
+    @classmethod
+    def _is_usable_cached_technical_gate(cls, gate: dict, now: float) -> bool:
+        """Return true only while the prior signed contract remains valid."""
+        if not cls._is_distributable_technical_gate(gate):
+            return False
+        if gate.get("source_healthy") is not True:
+            return False
+        if gate.get("schema") == V22_GATE_SCHEMA and gate.get("execution_authorized") is not True:
+            return False
+        if not all(pair in gate.get("pairs", {}) for pair in ("BTC-FDUSD", "ETH-FDUSD")):
+            return False
+        try:
+            generated = datetime.fromisoformat(
+                str(gate["generated_at"]).replace("Z", "+00:00")
+            ).timestamp()
+            valid_until = datetime.fromisoformat(
+                str(gate["valid_until"]).replace("Z", "+00:00")
+            ).timestamp()
+        except (KeyError, TypeError, ValueError):
+            return False
+        return generated <= now + 10 and now <= valid_until
+
+    @staticmethod
+    def _runtime_error_is_active(runtime_errors: Any, component: str) -> bool:
+        state = getattr(runtime_errors, "state", {})
+        if not isinstance(state, dict):
+            return False
+        components = state.get("components", {})
+        return bool(
+            isinstance(components, dict)
+            and isinstance(components.get(component), dict)
+            and components[component].get("active")
         )
 
     def publish_technical_buy_gate(self, *, force: bool = False) -> dict:
@@ -651,6 +692,91 @@ class Guard:
             runtime = load_runtime_xgboost_gate(self.technical_gate_path)
             healthy = bool(runtime.get("runtime_gate_healthy"))
             self.state["active_technical_producer"] = "v21_observation_bridge"
+
+        raw_failure = None if healthy else str(
+            runtime.get("reason") or "technical runtime unhealthy"
+        )
+        held_cached_contract = False
+        if raw_failure is not None:
+            failure = advance_integrity_failure(
+                self.state.get("technical_refresh_failure"),
+                reason=raw_failure,
+                now=now,
+                grace_seconds=self.fail_closed_seconds,
+            )
+            self.state["technical_refresh_failure"] = failure
+            if (
+                failure["classification"] == "transient_transport"
+                and not failure["expired"]
+                and self._is_usable_cached_technical_gate(previous_gate, now)
+            ):
+                # Never extend or rewrite timestamps/hashes.  The last verified
+                # contract is reused only inside its original signed validity.
+                gate = dict(previous_gate)
+                healthy = True
+                held_cached_contract = True
+                runtime = {
+                    "runtime_gate_healthy": True,
+                    "reason": "transient_transport_grace_using_cached_contract",
+                }
+                if failure["attempts"] == 1:
+                    self.audit(
+                        "grid_v22_transport_grace_started",
+                        reason=raw_failure,
+                        grace_seconds=self.fail_closed_seconds,
+                    )
+                if hasattr(self, "runtime_errors"):
+                    self.runtime_errors.failure(
+                        "v22_contract_refresh",
+                        raw_failure,
+                        trading_impact=(
+                            "Transient source failure: keep the last still-valid signed contract; "
+                            "retry without forced exit or integrity latch."
+                        ),
+                    )
+            else:
+                if (
+                    failure["classification"] == "transient_transport"
+                    and failure["expired"]
+                    and isinstance(gate, dict)
+                ):
+                    gate = dict(gate)
+                    gate["reason"] = (
+                        "fail_closed:transient_grace_expired:"
+                        f"{self.fail_closed_seconds}s:{raw_failure}"
+                    )
+                    runtime = {
+                        **dict(runtime),
+                        "runtime_gate_healthy": False,
+                        "reason": gate["reason"],
+                    }
+                if hasattr(self, "runtime_errors"):
+                    self.runtime_errors.failure(
+                        "v22_contract_refresh",
+                        raw_failure,
+                        trading_impact=(
+                            "Integrity failure or transport grace expired; publish Fail-Closed "
+                            "and let the existing exit/latch path take control."
+                        ),
+                    )
+        else:
+            previous_refresh_failure = self.state.pop("technical_refresh_failure", None)
+            runtime_failure_active = bool(
+                hasattr(self, "runtime_errors")
+                and self._runtime_error_is_active(
+                    self.runtime_errors, "v22_contract_refresh"
+                )
+            )
+            if previous_refresh_failure or runtime_failure_active:
+                self.audit(
+                    "grid_v22_transport_grace_recovered",
+                    previous_failure=previous_refresh_failure or {},
+                )
+            if hasattr(self, "runtime_errors") and runtime_failure_active:
+                self.runtime_errors.recovered(
+                    "v22_contract_refresh",
+                    trading_status="v22 contract refresh healthy; normal signed signal applies",
+                )
         atomic_v22_json(self.technical_gate_path, gate)
         distributable = self._is_distributable_technical_gate(gate)
         for target in self._technical_gate_targets():
@@ -676,6 +802,8 @@ class Guard:
                 runtime_healthy=healthy,
                 reason=runtime.get("reason"), gate=gate,
                 previous_failure=previous_failure,
+                source_failure=raw_failure,
+                held_cached_contract=held_cached_contract,
             )
         return gate
 

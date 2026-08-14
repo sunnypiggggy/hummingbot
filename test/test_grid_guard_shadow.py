@@ -17,6 +17,12 @@ from ethbtc_forced_exit_contract import MODEL_VERSION, PACKAGE_ID, SCHEMA  # noq
 
 
 class GridGuardShadowTest(unittest.TestCase):
+    def test_runtime_error_active_lookup_is_defensive(self):
+        channel = Mock()
+        channel.state = {"components": {"v22_contract_refresh": {"active": True}}}
+        self.assertTrue(Guard._runtime_error_is_active(channel, "v22_contract_refresh"))
+        self.assertFalse(Guard._runtime_error_is_active(channel, "other"))
+
     def test_guard_init_migrates_retired_roc_sqzmom_snapshot(self):
         source = Path(__file__).resolve().parents[1] / "live_guard" / "grid_live_guard.py"
         text = source.read_text(encoding="utf-8")
@@ -67,6 +73,97 @@ class GridGuardShadowTest(unittest.TestCase):
             load_gate.assert_called_once_with(guard.v22_observation_gate_path)
             self.assertEqual("v22", guard.state["active_technical_producer"])
 
+    @patch("live_guard.grid_live_guard.time.time", return_value=1_000.0)
+    @patch("live_guard.grid_live_guard.atomic_gate_json")
+    @patch("live_guard.grid_live_guard.atomic_v22_json")
+    @patch("live_guard.grid_live_guard.load_runtime_v22_contract")
+    def test_transient_v22_refresh_reuses_only_still_valid_signed_contract(
+        self, load_gate, atomic_v22_json, atomic_json, _time,
+    ):
+        guard = Guard.__new__(Guard)
+        previous = {
+            "schema": SCHEMA, "package_id": PACKAGE_ID,
+            "model_version": MODEL_VERSION, "execution_authorized": True,
+            "source_healthy": True, "release_sha256": "a" * 64,
+            "generated_at": "1970-01-01T00:15:00+00:00",
+            "valid_until": "1970-01-01T00:20:00+00:00",
+            "pairs": {"BTC-FDUSD": {}, "ETH-FDUSD": {}},
+        }
+        failed = {
+            **previous, "source_healthy": False, "execution_authorized": False,
+            "generated_at": "1970-01-01T00:16:40+00:00",
+            "reason": "fail_closed:ConnectionResetError(104, connection reset by peer)",
+        }
+        guard.next_technical_refresh = 0
+        guard.technical_refresh_seconds = 30
+        guard.fail_closed_seconds = 60
+        guard.state = {"xgboost_risk_gate": previous, "v22_cutover_complete": True}
+        guard.technical_gate_path = Path("state/xgboost_risk_gate.json")
+        guard.v22_observation_gate_path = Path("state/observation.json")
+        guard.v22_execution_mode = "live"
+        guard.v21_producer = None
+        guard.v22_producer = Mock()
+        guard.v22_producer.produce.return_value = failed
+        guard._technical_gate_targets = Mock(return_value=[
+            guard.technical_gate_path, Path("instance/data/xgboost_risk_gate.json")
+        ])
+        guard.audit = Mock()
+        guard.runtime_errors = Mock()
+        load_gate.return_value = {
+            "runtime_gate_healthy": False, "reason": failed["reason"],
+        }
+
+        result = guard.publish_technical_buy_gate(force=True)
+
+        self.assertEqual(previous, result)
+        atomic_v22_json.assert_called_once_with(guard.technical_gate_path, previous)
+        atomic_json.assert_called_once_with(Path("instance/data/xgboost_risk_gate.json"), previous)
+        self.assertEqual(
+            "transient_transport", guard.state["technical_refresh_failure"]["classification"]
+        )
+        self.assertIsNone(guard.state["v22_notification_failure"])
+
+    @patch("live_guard.grid_live_guard.time.time", return_value=1_000.0)
+    @patch("live_guard.grid_live_guard.atomic_gate_json")
+    @patch("live_guard.grid_live_guard.atomic_v22_json")
+    @patch("live_guard.grid_live_guard.load_runtime_v22_contract")
+    def test_deterministic_v22_failure_is_distributed_immediately(
+        self, load_gate, atomic_v22_json, _atomic_json, _time,
+    ):
+        guard = Guard.__new__(Guard)
+        previous = {
+            "schema": SCHEMA, "package_id": PACKAGE_ID,
+            "model_version": MODEL_VERSION, "execution_authorized": True,
+            "source_healthy": True,
+            "generated_at": "1970-01-01T00:15:00+00:00",
+            "valid_until": "1970-01-01T00:20:00+00:00",
+            "pairs": {"BTC-FDUSD": {}, "ETH-FDUSD": {}},
+        }
+        failed = {
+            **previous, "source_healthy": False, "execution_authorized": False,
+            "reason": "fail_closed:model hash mismatch",
+        }
+        guard.next_technical_refresh = 0
+        guard.technical_refresh_seconds = 30
+        guard.fail_closed_seconds = 60
+        guard.state = {"xgboost_risk_gate": previous, "v22_cutover_complete": True}
+        guard.technical_gate_path = Path("state/xgboost_risk_gate.json")
+        guard.v22_observation_gate_path = Path("state/observation.json")
+        guard.v22_execution_mode = "live"
+        guard.v21_producer = None
+        guard.v22_producer = Mock()
+        guard.v22_producer.produce.return_value = failed
+        guard._technical_gate_targets = Mock(return_value=[guard.technical_gate_path])
+        guard.audit = Mock()
+        guard.runtime_errors = Mock()
+        load_gate.return_value = {
+            "runtime_gate_healthy": False, "reason": failed["reason"],
+        }
+
+        self.assertEqual(failed, guard.publish_technical_buy_gate(force=True))
+        atomic_v22_json.assert_called_once_with(guard.technical_gate_path, failed)
+        self.assertEqual("fail_closed:model hash mismatch", guard.state["v22_notification_failure"])
+
     @patch("live_guard.grid_live_guard.atomic_gate_json")
     def test_guard_never_distributes_v21_shadow_contract(self, atomic_json):
         guard = Guard.__new__(Guard)
@@ -90,6 +187,10 @@ class GridGuardShadowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             guard = Guard.__new__(Guard)
             guard.emergency_exchange = Mock()
+            guard.emergency_exchange.verify_ready.return_value = {
+                "spot_trading": True,
+                "spot_bnb_burn_disabled": True,
+            }
             guard.emergency_exchange.open_orders.return_value = []
             guard.emergency_exchange.account_balances.return_value = {
                 "BTC": {"total": Decimal("0.002")},
@@ -134,6 +235,7 @@ class GridGuardShadowTest(unittest.TestCase):
             ]
             result = guard.verify_shadow_exchange_ready(["BTC-FDUSD", "ETH-FDUSD"])
             self.assertTrue(result["test_order_no_fill"])
+            self.assertTrue(result["spot_bnb_burn_disabled"])
             self.assertEqual(5, guard.emergency_exchange._signed.call_count)
             self.assertEqual(
                 {"BTC-FDUSD": 0, "ETH-FDUSD": 0},

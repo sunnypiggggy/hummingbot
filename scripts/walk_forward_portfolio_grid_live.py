@@ -56,7 +56,8 @@ from scripts.grid_macro_gate import load_runtime_macro_gate
 from scripts.grid_xgboost_risk_gate import load_runtime_xgboost_gate
 from scripts.risk_recovery import (
     ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
-    advance_recovery, active_state, mark_exit_complete, mark_reentry_complete,
+    advance_integrity_failure, advance_recovery, active_state,
+    mark_exit_complete, mark_reentry_complete,
     normalize_state, trigger_state,
 )
 try:
@@ -113,7 +114,11 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
     pair_drawdown_limit_pct: Decimal = PAIR_DRAWDOWN_LIMIT_PCT
     fail_closed_seconds: int = 60
     min_order_quote: Decimal = MIN_ORDER_QUOTE
+    # FDUSD LIMIT_MAKER fills are fee-free, but forced exit/reentry orders are
+    # taker MARKET orders.  Keep the rates separate so a fee conversion outage
+    # can never turn a market fee into the maker fallback of zero.
     fee_rate: Decimal = Decimal("0.001")
+    taker_fee_rate: Decimal = Decimal("0.001")
     trading_enabled: bool = False
     bootstrap_from_quote: bool = False
     bootstrap_completed: bool = False
@@ -287,6 +292,7 @@ class LivePortfolioGrid(StrategyV2Base):
         self.technical_signal: Dict[str, Any] = {}
         self.next_technical_poll = 0.0
         self.technical_transition_key: Optional[tuple] = None
+        self.integrity_failure_grace: Dict[str, Dict[str, Any]] = {}
         self.runtime_events: List[Dict[str, Any]] = []
         # Process-local by design: every process start must reconcile exchange
         # orders before it is allowed to create a fresh grid.  Persisting this
@@ -505,7 +511,39 @@ class LivePortfolioGrid(StrategyV2Base):
         self.macro_active_lease_ids = lease_ids
         self.macro_reason = reason
         if not healthy:
-            self._latch_integrity_failure(f"FOMC contract unhealthy: {reason}")
+            if not hasattr(self, "integrity_failure_grace"):
+                self.integrity_failure_grace = {}
+            previous_failure = self.integrity_failure_grace.get("macro_contract")
+            decision = advance_integrity_failure(
+                previous_failure,
+                reason=reason,
+                now=self.current_timestamp,
+                grace_seconds=self.config.fail_closed_seconds,
+            )
+            self.integrity_failure_grace["macro_contract"] = decision
+            if decision["expired"]:
+                self._record_runtime_event(
+                    "macro_contract_failure_latched",
+                    reason=reason,
+                    classification=decision["classification"],
+                    elapsed_seconds=decision["elapsed_seconds"],
+                )
+                self._latch_integrity_failure(f"FOMC contract unhealthy: {reason}")
+            elif not previous_failure:
+                self._record_runtime_event(
+                    "macro_contract_transport_grace_started",
+                    reason=reason,
+                    grace_seconds=self.config.fail_closed_seconds,
+                )
+        else:
+            if not hasattr(self, "integrity_failure_grace"):
+                self.integrity_failure_grace = {}
+            previous_failure = self.integrity_failure_grace.pop("macro_contract", None)
+            if previous_failure:
+                self._record_runtime_event(
+                    "macro_contract_transport_grace_recovered",
+                    previous_failure=previous_failure,
+                )
         if previous_paused and not paused:
             self.next_refresh = 0.0
             self._record_runtime_event(
@@ -527,6 +565,7 @@ class LivePortfolioGrid(StrategyV2Base):
 
     def _poll_technical_buy_gate(self) -> None:
         if not self.config.technical_buy_gate_enabled:
+            getattr(self, "integrity_failure_grace", {}).pop("technical_contract", None)
             for pair in self.config.trading_pairs:
                 self.technical_buy_enabled_by_pair[pair] = True
                 self.technical_gate_healthy_by_pair[pair] = True
@@ -608,7 +647,41 @@ class LivePortfolioGrid(StrategyV2Base):
             pair: dict(value) for pair, value in self.technical_signal_by_pair.items()
         }
         if not healthy:
-            self._latch_integrity_failure(f"technical contract unhealthy: {reason}")
+            if not hasattr(self, "integrity_failure_grace"):
+                self.integrity_failure_grace = {}
+            previous_failure = self.integrity_failure_grace.get("technical_contract")
+            decision = advance_integrity_failure(
+                previous_failure,
+                reason=reason,
+                now=self.current_timestamp,
+                grace_seconds=self.config.fail_closed_seconds,
+            )
+            self.integrity_failure_grace["technical_contract"] = decision
+            if decision["expired"]:
+                self._record_runtime_event(
+                    "technical_contract_failure_latched",
+                    reason=reason,
+                    classification=decision["classification"],
+                    elapsed_seconds=decision["elapsed_seconds"],
+                )
+                self._latch_integrity_failure(f"technical contract unhealthy: {reason}")
+            elif not previous_failure:
+                self._record_runtime_event(
+                    "technical_contract_transport_grace_started",
+                    reason=reason,
+                    grace_seconds=self.config.fail_closed_seconds,
+                )
+        else:
+            if not hasattr(self, "integrity_failure_grace"):
+                self.integrity_failure_grace = {}
+            previous_failure = self.integrity_failure_grace.pop(
+                "technical_contract", None
+            )
+            if previous_failure:
+                self._record_runtime_event(
+                    "technical_contract_transport_grace_recovered",
+                    previous_failure=previous_failure,
+                )
         transition = tuple(transitions)
         if transition != self.technical_transition_key:
             self.technical_transition_key = transition
@@ -1314,8 +1387,23 @@ class LivePortfolioGrid(StrategyV2Base):
             fee = event.trade_fee.fee_amount_in_token(
                 event.trading_pair, event.price, event.amount, self.config.quote_asset
             )
-        except Exception:
-            fee = event.price * event.amount * self.config.fee_rate
+        except Exception as exc:
+            order_type = str(getattr(event.order_type, "name", event.order_type)).upper()
+            fallback_rate = (
+                self.config.taker_fee_rate
+                if order_type == "MARKET"
+                else self.config.fee_rate
+            )
+            fee = event.price * event.amount * fallback_rate
+            self._record_runtime_event(
+                "quote_fee_fallback_applied",
+                pair=event.trading_pair,
+                order_id=event.order_id,
+                order_type=order_type,
+                fee_rate=str(fallback_rate),
+                fee_quote=str(fee),
+                reason=repr(exc),
+            )
         ledger.apply_fill(event.trade_type.name, event.price, event.amount, fee)
         flatten_pair = next(
             (pair for pair, order_id in self.flatten_order_ids.items() if order_id == event.order_id),
@@ -1462,6 +1550,13 @@ class LivePortfolioGrid(StrategyV2Base):
                 value for value in state.get("runtime_events", [])
                 if isinstance(value, dict)
             ][-100:]
+            saved_integrity_grace = state.get("integrity_failure_grace", {})
+            if isinstance(saved_integrity_grace, dict):
+                self.integrity_failure_grace = {
+                    str(key): dict(value)
+                    for key, value in saved_integrity_grace.items()
+                    if isinstance(value, dict)
+                }
             saved_gate = state.get("technical_buy_gate", {})
             saved_pairs = saved_gate.get("pairs", {}) if isinstance(saved_gate, dict) else {}
             if schema_version == RUNTIME_STATE_SCHEMA_VERSION and set(saved_pairs) == set(restored):
@@ -1512,6 +1607,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 "max_hold_seconds": self.config.max_extra_inventory_hold_seconds,
             },
             "runtime_events": self.runtime_events,
+            "integrity_failure_grace": self.integrity_failure_grace,
             "macro_gate": {
                 "enabled": self.config.macro_gate_enabled,
                 "healthy": self.macro_gate_healthy,

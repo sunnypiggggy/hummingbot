@@ -64,7 +64,7 @@ except ModuleNotFoundError:
 from risk_recovery import (
     ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
     EMERGENCY_ESCALATION_SECONDS, EXIT_CRITICAL_SECONDS,
-    advance_recovery, active_state,
+    advance_integrity_failure, advance_recovery, active_state,
     mark_exit_complete, mark_reentry_complete, normalize_state, trigger_state,
 )
 try:
@@ -194,17 +194,54 @@ class BinanceEmergencyClient:
     def cancel_all_orders(self, pair: str) -> Any:
         return self._signed("DELETE", "/api/v3/openOrders", {"symbol": self.symbol(pair)})
 
-    def verify_ready(self, pairs: list[str]) -> None:
+    def spot_bnb_burn_enabled(self) -> bool:
+        """Return Binance's account-level Spot BNB fee-discount setting.
+
+        The live Grid/DCA accounting is denominated in FDUSD/USDT.  Allowing
+        Binance to deduct fees in BNB makes a completed fill depend on an
+        unrelated rate oracle and can cause the quote fee to be persisted as
+        zero while that oracle is warming up.  Treat a missing or malformed
+        response as an integrity failure instead of guessing.
+        """
+        value = self._signed("GET", "/sapi/v1/bnbBurn")
+        if not isinstance(value, dict) or not isinstance(value.get("spotBNBBurn"), bool):
+            raise RuntimeError(f"Invalid Binance BNB burn status response: {value!r}")
+        return value["spotBNBBurn"]
+
+    def set_spot_bnb_burn(self, enabled: bool) -> bool:
+        """Set and verify the account-level Spot BNB fee-discount setting."""
+        value = self._signed(
+            "POST", "/sapi/v1/bnbBurn",
+            {"spotBNBBurn": "true" if enabled else "false"},
+        )
+        if not isinstance(value, dict) or value.get("spotBNBBurn") is not enabled:
+            raise RuntimeError(f"Binance did not confirm the requested BNB burn setting: {value!r}")
+        confirmed = self.spot_bnb_burn_enabled()
+        if confirmed is not enabled:
+            raise RuntimeError(
+                "Binance BNB burn setting verification disagrees with the update response"
+            )
+        return confirmed
+
+    def verify_ready(self, pairs: list[str]) -> Dict[str, Any]:
         self.sync_time()
         account = self._signed("GET", "/api/v3/account")
         if not isinstance(account, dict) or account.get("canTrade") is not True:
             raise RuntimeError("Binance emergency key does not have trading permission")
+        if self.spot_bnb_burn_enabled():
+            raise RuntimeError(
+                "Binance Spot BNB fee deduction must be disabled (spotBNBBurn=true)"
+            )
         # Binance's account-level canWithdraw flag does not expose the API
         # key's withdrawal permission, so it must not be used to reject an
         # otherwise valid key. Withdrawal permission and IP restrictions are
         # enforced in Binance API Management and audited during deployment.
         for pair in pairs:
             self.open_orders(pair)
+        return {
+            "spot_trading": True,
+            "spot_bnb_burn_disabled": True,
+        }
 
     def account_balances(self) -> Dict[str, Dict[str, Decimal]]:
         account = self._signed("GET", "/api/v3/account")
@@ -543,16 +580,19 @@ class Guard:
             if Path(docker_socket).exists()
             else None
         )
+        fee_policy = None
         if os.getenv("DCA_LIVE_TRADING_ENABLED", "false").lower() == "true":
             if self.emergency_exchange is None or self.emergency_docker is None:
                 raise RuntimeError(
                     "armed DCA Guard requires independent Binance credentials "
                     "and the Docker emergency socket"
                 )
-            self.emergency_exchange.verify_ready(list(LIVE_PAIRS))
+            fee_policy = self.emergency_exchange.verify_ready(list(LIVE_PAIRS))
             for spec in LIVE_PAIRS.values():
                 self.emergency_docker.matching_containers(spec.bot_name)
         self.state = self._load_state()
+        if fee_policy is not None:
+            self.state["fee_policy"] = fee_policy
         self.state["emergency_ready"] = bool(
             self.emergency_exchange is not None and self.emergency_docker is not None
         )
@@ -1560,6 +1600,46 @@ class Guard:
                 "execution_authorized": bool(contract.get("execution_authorized", False)),
                 "model_version": contract.get("model_version"),
                 "generated_at": contract.get("generated_at"), "pairs": mapped}
+
+    def _integrity_failure_requires_latch(
+        self, source: str, reason: str, now: float,
+    ) -> bool:
+        """Apply grace only to transient transport failures.
+
+        During grace the aggregate gate remains closed, so no new DCA risk is
+        created, but inventory is not force-exited and the bot is not latched.
+        """
+        episodes = self.state.setdefault("integrity_failure_grace", {})
+        decision = advance_integrity_failure(
+            episodes.get(source), reason=reason, now=now,
+            grace_seconds=self.fail_closed_seconds,
+        )
+        episodes[source] = decision
+        if decision["classification"] == "transient_transport" and not decision["expired"]:
+            self.runtime_errors.failure(
+                f"{source}_transport",
+                reason,
+                trading_impact=(
+                    "Aggregate order gate is temporarily closed while the Guard retries; "
+                    "no forced exit or integrity latch before the grace deadline."
+                ),
+                details={
+                    "grace_seconds": self.fail_closed_seconds,
+                    "remaining_seconds": decision["remaining_seconds"],
+                },
+                now=now,
+            )
+            return False
+        return True
+
+    def _clear_integrity_failure(self, source: str, now: float) -> None:
+        episode = self.state.setdefault("integrity_failure_grace", {}).pop(source, None)
+        if episode:
+            self.runtime_errors.recovered(
+                f"{source}_transport",
+                trading_status="contract healthy; aggregate gates again follow all active mechanisms",
+                now=now,
+            )
 
     def _observe_v22_contract(self, now: float) -> None:
         if not self.v22_observation_gate_path.exists():
@@ -2630,12 +2710,33 @@ class Guard:
                 )
         macro_contract = self._macro_gate()
         v21_contract = self._v21_gate()
+        if macro_contract["healthy"]:
+            self._clear_integrity_failure("macro_contract", now)
+        if v21_contract["healthy"]:
+            self._clear_integrity_failure("v22_contract", now)
+        macro_requires_latch = bool(
+            not macro_contract["healthy"]
+            and self._integrity_failure_requires_latch(
+                "macro_contract", str(macro_contract["reason"]), now,
+            )
+        )
+        v22_requires_latch = bool(
+            macro_contract["healthy"]
+            and not v21_contract["healthy"]
+            and self._integrity_failure_requires_latch(
+                "v22_contract", str(v21_contract["reason"]), now,
+            )
+        )
         if risk_actions_enabled:
             for bot_name, snapshot in snapshots.items():
                 if not macro_contract["healthy"]:
-                    self._latch_integrity_failure(bot_name, snapshot, str(macro_contract["reason"]))
+                    reason = str(macro_contract["reason"])
+                    if macro_requires_latch:
+                        self._latch_integrity_failure(bot_name, snapshot, reason)
                 elif not v21_contract["healthy"]:
-                    self._latch_integrity_failure(bot_name, snapshot, str(v21_contract["reason"]))
+                    reason = str(v21_contract["reason"])
+                    if v22_requires_latch:
+                        self._latch_integrity_failure(bot_name, snapshot, reason)
                 else:
                     technical = v21_contract["pairs"][snapshot["pair"]]
                     if (
