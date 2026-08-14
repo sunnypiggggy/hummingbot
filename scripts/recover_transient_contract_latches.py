@@ -13,7 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from risk_recovery import active_state
+try:
+    # Direct OCI CLI execution adds ``scripts/`` to sys.path.
+    from risk_recovery import active_state, classify_integrity_failure
+except ModuleNotFoundError:  # Package import used by tests and archive tooling.
+    from scripts.risk_recovery import active_state, classify_integrity_failure
 
 
 def read_object(path: Path) -> dict[str, Any]:
@@ -35,8 +39,10 @@ def write_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 def transport_latch(value: Any) -> bool:
-    text = str(value or "").lower()
-    return "connectionreseterror" in text or "connection reset by peer" in text
+    # Recovery must use the same reviewed classification as the live guards.
+    # A separate hand-maintained marker list caused valid HTTP 5xx transport
+    # incidents to be impossible to recover with this narrowly scoped tool.
+    return classify_integrity_failure(value) == "transient_transport"
 
 
 def cooldown_state(*, now: float, mechanism: str, reason: str) -> dict[str, Any]:

@@ -44,6 +44,14 @@ TRANSIENT_TRANSPORT_MARKERS = (
     "http 502",
     "http 503",
     "http 504",
+    # ``requests.raise_for_status()`` formats Binance 5xx responses as
+    # ``500 Server Error: Internal Server Error for url: ...``.  Keep these
+    # exact wire-level spellings in the transient class; otherwise one brief
+    # exchange outage bypasses the grace timer and liquidates every robot.
+    "500 server error",
+    "502 server error",
+    "503 server error",
+    "504 server error",
     "status code 500",
     "status code 502",
     "status code 503",

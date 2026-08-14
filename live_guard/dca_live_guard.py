@@ -552,6 +552,16 @@ class Guard:
             "DCA_PORTFOLIO_DRAWDOWN_LIMIT_PCT", "0.08"
         ))
         self.auto_reentry_enabled = _env_enabled("DCA_RISK_AUTO_REENTRY_ENABLED", False)
+        # Capital shortages are recoverable. They close ordinary BUY only;
+        # existing SELL protection stays enabled and no forced liquidation or
+        # integrity latch is triggered merely because quote is temporarily
+        # locked or a settlement is delayed.
+        self.quote_budget_buffer_pct = Decimal(os.getenv(
+            "DCA_QUOTE_BUDGET_BUFFER_PCT", "0.002"
+        ))
+        self.quote_balance_cache_seconds = max(
+            10, int(os.getenv("DCA_QUOTE_BALANCE_CACHE_SECONDS", "30"))
+        )
         if not Decimal("0") < self.strategy_drawdown_limit < Decimal("1"):
             raise ValueError("DCA strategy drawdown limit must be between zero and one")
         if not Decimal("0") < self.portfolio_drawdown_limit < Decimal("1"):
@@ -1048,9 +1058,14 @@ class Guard:
         order_counts = {
             pair: len(self.emergency_exchange.open_orders(pair)) for pair in pairs
         }
+        balances = self.emergency_exchange.account_balances()
+        self.state["quote_balance_source"] = {
+            "free_quote": str(balances.get("USDT", {}).get("free", Decimal("0"))),
+            "observed_at": time.time(), "source": "account_reconciliation",
+        }
         status = self.inventory_ledger.reconcile(
             account_fingerprint=self.inventory_account_fingerprint,
-            balances=self.emergency_exchange.account_balances(), ownership=ownership,
+            balances=balances, ownership=ownership,
             evidence_sha256=evidence, open_order_counts=order_counts,
             sources_healthy=sources_healthy,
             confirmation_cycles=self.inventory_confirmation_cycles,
@@ -1702,6 +1717,130 @@ class Guard:
             "response": response,
         }
 
+    def _quote_budget_status(
+        self, required_quote: Decimal, *, now: Optional[float] = None,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Evaluate the self-recovering, BUY-only quote-capital gate."""
+        observed = time.time() if now is None else float(now)
+        required = max(Decimal(str(required_quote)), Decimal("0"))
+        buffer_pct = max(
+            Decimal(str(getattr(self, "quote_budget_buffer_pct", "0.002"))),
+            Decimal("0"),
+        )
+        required_with_buffer = required * (Decimal("1") + buffer_pct)
+        previous = self.state.get("quote_budget_observation", {})
+        source = self.state.get("quote_balance_source", {})
+        exchange = getattr(self, "emergency_exchange", None)
+
+        if required <= 0:
+            result = {
+                "healthy": True, "buy_ready": True, "free_quote": "0",
+                "required_quote": "0", "required_with_buffer": "0",
+                "reason": "no_buy_capital_required", "observed_at": observed,
+                "cached": False,
+            }
+            self.state["quote_budget_observation"] = result
+            return result
+
+        # Offline/observation Guards may intentionally omit a signed exchange
+        # channel. Armed production construction already rejects that setup.
+        if exchange is None:
+            return {
+                "healthy": False, "buy_ready": True, "free_quote": None,
+                "required_quote": str(required),
+                "required_with_buffer": str(required_with_buffer),
+                "reason": "quote_balance_channel_unavailable_observation_only",
+                "observed_at": observed, "cached": False,
+            }
+
+        source_age = observed - float(source.get("observed_at") or 0)
+        cache_seconds = int(getattr(self, "quote_balance_cache_seconds", 30))
+        if (
+            not force_refresh and source.get("free_quote") is not None
+            and 0 <= source_age <= cache_seconds
+        ):
+            free_quote = Decimal(str(source["free_quote"]))
+            ready = free_quote >= required_with_buffer
+            result = {
+                "healthy": True, "buy_ready": ready,
+                "free_quote": str(free_quote),
+                "required_quote": str(required),
+                "required_with_buffer": str(required_with_buffer),
+                "reason": "quote_budget_available" if ready else "insufficient_quote_budget",
+                "observed_at": float(source["observed_at"]), "cached": True,
+                "cache_age_seconds": source_age,
+                "source": str(source.get("source", "account_reconciliation")),
+            }
+            self.state["quote_budget_observation"] = result
+            return result
+
+        try:
+            balances = exchange.account_balances()
+            free_quote = Decimal(str(balances.get("USDT", {}).get("free", "0")))
+            self.state["quote_balance_source"] = {
+                "free_quote": str(free_quote), "observed_at": observed,
+                "source": "direct_preflight",
+            }
+            ready = free_quote >= required_with_buffer
+            result = {
+                "healthy": True, "buy_ready": ready,
+                "free_quote": str(free_quote),
+                "required_quote": str(required),
+                "required_with_buffer": str(required_with_buffer),
+                "reason": "quote_budget_available" if ready else "insufficient_quote_budget",
+                "observed_at": observed, "cached": False,
+            }
+            self.state["quote_budget_observation"] = result
+            return result
+        except Exception as exc:
+            age = observed - float(previous.get("observed_at") or 0)
+            if (
+                not force_refresh and previous.get("healthy")
+                and previous.get("free_quote") is not None
+                and 0 <= age <= cache_seconds
+            ):
+                free_quote = Decimal(str(previous["free_quote"]))
+                ready = free_quote >= required_with_buffer
+                return {
+                    **previous, "buy_ready": ready,
+                    "required_quote": str(required),
+                    "required_with_buffer": str(required_with_buffer),
+                    "reason": "quote_budget_cached_after_transient_read_error",
+                    "cached": True, "cache_age_seconds": age,
+                    "last_error": f"{type(exc).__name__}: {exc}",
+                }
+            result = {
+                "healthy": False, "buy_ready": False, "free_quote": None,
+                "required_quote": str(required),
+                "required_with_buffer": str(required_with_buffer),
+                "reason": "quote_balance_temporarily_unavailable",
+                "observed_at": observed, "cached": False,
+                "last_error": f"{type(exc).__name__}: {exc}",
+            }
+            self.state["quote_budget_observation"] = result
+            return result
+
+    def _reentry_quote_requirement(
+        self, current_bot: str, v22_contract: Dict[str, Any]
+    ) -> Decimal:
+        """Cash needed to rebuild pending base while preserving BUY budgets."""
+        risk_on = {
+            spec.bot_name for pair, spec in LIVE_PAIRS.items()
+            if v22_contract.get("pairs", {}).get(pair, {}).get("buy_enabled")
+        }
+        pending = set()
+        for bot_name in risk_on:
+            phase = normalize_state(
+                self.state.get("bots", {}).get(bot_name, {}).get("recovery")
+            )["phase"]
+            if phase == REENTRY:
+                pending.add(bot_name)
+        pending.add(current_bot)
+        # Every Risk-On bot retains one BUY-side budget. Every pending bot
+        # additionally needs one side budget to rebuild base inventory.
+        return side_budget() * Decimal(len(risk_on) + len(pending & risk_on))
+
     def _apply_aggregate_gates(
         self, snapshots: Dict[str, Dict[str, Any]], *, risk_actions_enabled: bool,
     ) -> None:
@@ -1709,8 +1848,37 @@ class Guard:
         v21 = self._v21_gate()
         previous_aggregate = self.state.get("gate_aggregate", {})
         previous_macro = previous_aggregate.get("macro", {})
+        previous_capital = previous_aggregate.get("capital", {})
         previous_bots = previous_aggregate.get("bots", {})
-        aggregate = {"macro": macro, "v22": v21, "bots": {}}
+        candidate_buy_bots = []
+        for bot_name, snapshot in snapshots.items():
+            bot_state = self.state.get("bots", {}).get(bot_name, {})
+            if bot_state.get("tripped"):
+                continue
+            technical = v21["pairs"][str(snapshot["pair"])]
+            recovery = normalize_state(bot_state.get("recovery"))
+            if (
+                recovery["phase"] == ACTIVE and macro["buy_enabled"]
+                and technical["buy_enabled"]
+            ):
+                candidate_buy_bots.append(bot_name)
+        capital = self._quote_budget_status(
+            side_budget() * Decimal(len(candidate_buy_bots))
+        )
+        aggregate = {"macro": macro, "v22": v21, "capital": capital, "bots": {}}
+        if (
+            previous_capital.get("buy_ready") is not None
+            and previous_capital.get("buy_ready") != capital.get("buy_ready")
+        ):
+            self._audit(
+                "capital_budget_gate_transition",
+                buy_enabled=bool(capital["buy_ready"]),
+                reason=capital["reason"],
+                free_quote=capital.get("free_quote"),
+                required_quote=capital.get("required_quote"),
+                action=("resume_ordinary_buy" if capital["buy_ready"]
+                        else "pause_ordinary_buy_keep_sell"),
+            )
         for bot_name, snapshot in snapshots.items():
             bot_state = self.state.get("bots", {}).get(bot_name, {})
             if bot_state.get("tripped"):
@@ -1721,7 +1889,7 @@ class Guard:
             recoverable_blocked = recovery["phase"] != ACTIVE
             buy_enabled = bool(
                 macro["buy_enabled"] and technical["buy_enabled"]
-                and not recoverable_blocked
+                and not recoverable_blocked and capital["buy_ready"]
             )
             sell_enabled = bool(macro["sell_enabled"] and not recoverable_blocked)
             reasons = {
@@ -1730,6 +1898,9 @@ class Guard:
                 "v22_source_pair": technical["source_pair"],
                 "recovery_phase": recovery["phase"],
                 "recovery_mechanism": recovery.get("mechanism", ""),
+                "capital_gate": capital["reason"],
+                "free_quote": capital.get("free_quote"),
+                "required_quote": capital.get("required_quote"),
             }
             aggregate["bots"][bot_name] = {
                 "pair": pair, "buy_enabled": buy_enabled,
@@ -1738,6 +1909,7 @@ class Guard:
                 "fomc_sell_enabled": bool(macro["sell_enabled"]),
                 "v22_buy_enabled": bool(technical["buy_enabled"]),
                 "v22_event_id": technical.get("event_id"),
+                "capital_buy_ready": bool(capital["buy_ready"]),
             }
             previous_bot = previous_bots.get(bot_name, {})
             macro_changed = (
@@ -2488,6 +2660,28 @@ class Guard:
                         recovery=state)
         if state.get("reentry_allowed"):
             target_quote = side_budget()
+            v22_contract = self.state.get("gate_aggregate", {}).get("v22", {})
+            required_quote = self._reentry_quote_requirement(bot_name, v22_contract)
+            capital = self._quote_budget_status(
+                required_quote, now=now, force_refresh=True,
+            )
+            if not capital["buy_ready"]:
+                previous_reason = str(state.get("reentry_block_reason", ""))
+                state["reentry_allowed"] = False
+                state["reentry_block_reason"] = str(capital["reason"])
+                state["reentry_capital"] = capital
+                if previous_reason != state["reentry_block_reason"]:
+                    self._audit(
+                        "recoverable_reentry_capital_wait",
+                        bot=bot_name, pair=pair, recovery=state,
+                        free_quote=capital.get("free_quote"),
+                        required_quote=capital.get("required_quote"),
+                        action="wait_without_liquidation_or_latch",
+                    )
+                bot["recovery"] = state
+                return
+            state.pop("reentry_block_reason", None)
+            state.pop("reentry_capital", None)
             amount = ((target_quote / mark) / step).to_integral_value(rounding=ROUND_DOWN) * step
             if amount <= 0 or amount * mark < minimum_notional:
                 raise RuntimeError(f"DCA reentry amount is below exchange minimum for {pair}")

@@ -5,6 +5,7 @@ from scripts.risk_recovery import (
     advance_integrity_failure, advance_recovery, classify_integrity_failure,
     mark_exit_complete, mark_reentry_complete, trigger_state,
 )
+from scripts.recover_transient_contract_latches import transport_latch
 
 
 def test_transient_transport_failure_has_persistent_grace_then_expires() -> None:
@@ -25,6 +26,19 @@ def test_transient_transport_failure_has_persistent_grace_then_expires() -> None
         second, reason="ReadTimeout", now=160, grace_seconds=60,
     )
     assert expired["expired"] is True
+
+
+def test_requests_binance_500_server_error_is_transient_transport() -> None:
+    reason = (
+        "fail_closed:500 Server Error: Internal Server Error for url: "
+        "https://api.binance.com/api/v3/time"
+    )
+    decision = advance_integrity_failure(
+        None, reason=reason, now=100, grace_seconds=60,
+    )
+    assert decision["classification"] == "transient_transport"
+    assert decision["expired"] is False
+    assert transport_latch(reason) is True
 
 
 def test_contract_integrity_errors_remain_immediate_fail_closed() -> None:

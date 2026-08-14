@@ -90,6 +90,8 @@ class FakeEmergencyExchange:
         self.orders = []
         self.open_order_values = []
         self.cancel_all_calls = []
+        self.free_usdt = Decimal("1000")
+        self.account_balance_calls = 0
 
     def open_orders(self, pair):
         return list(self.open_order_values)
@@ -100,9 +102,11 @@ class FakeEmergencyExchange:
         return []
 
     def account_balances(self):
+        self.account_balance_calls += 1
         return {
             "BTC": {"free": Decimal("10"), "locked": Decimal("0"), "total": Decimal("10")},
             "ETH": {"free": Decimal("10"), "locked": Decimal("0"), "total": Decimal("10")},
+            "USDT": {"free": self.free_usdt, "locked": Decimal("0"), "total": self.free_usdt},
         }
 
     def market_order(self, pair, side, amount):
@@ -202,6 +206,23 @@ class DcaLiveSafetyTest(unittest.TestCase):
             3, guard.state["integrity_failure_grace"]["v22_contract"]["attempts"]
         )
 
+    def test_binance_500_server_error_uses_grace_without_latch(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {}
+        guard.fail_closed_seconds = 60
+        guard.runtime_errors = Mock()
+        reason = (
+            "fail_closed:500 Server Error: Internal Server Error for url: "
+            "https://api.binance.com/api/v3/time"
+        )
+
+        self.assertFalse(guard._integrity_failure_requires_latch(
+            "v22_contract", reason, 100,
+        ))
+        decision = guard.state["integrity_failure_grace"]["v22_contract"]
+        self.assertEqual("transient_transport", decision["classification"])
+        self.assertFalse(decision["expired"])
+
     def test_deterministic_contract_failure_bypasses_grace(self):
         guard = Guard.__new__(Guard)
         guard.state = {}
@@ -258,6 +279,124 @@ class DcaLiveSafetyTest(unittest.TestCase):
         self.assertEqual([], guard.emergency_exchange.open_order_values)
         self.assertEqual(COOLDOWN, guard.state["bots"]["bot"]["recovery"]["phase"])
         self.assertEqual("recoverable_residual_orders_cancelled", audits[0][0])
+
+    def test_quote_shortage_is_buy_only_and_self_recovering(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {}
+        guard.emergency_exchange = FakeEmergencyExchange()
+        guard.quote_budget_buffer_pct = Decimal("0.002")
+        guard.quote_balance_cache_seconds = 30
+        guard.emergency_exchange.free_usdt = Decimal("89.52")
+
+        blocked = guard._quote_budget_status(Decimal("95"), now=100)
+        self.assertFalse(blocked["buy_ready"])
+        self.assertEqual("insufficient_quote_budget", blocked["reason"])
+
+        guard.emergency_exchange.free_usdt = Decimal("100")
+        recovered = guard._quote_budget_status(
+            Decimal("95"), now=110, force_refresh=True,
+        )
+        self.assertTrue(recovered["buy_ready"])
+        self.assertEqual("quote_budget_available", recovered["reason"])
+
+    def test_quote_gate_reuses_fresh_reconciliation_balance(self):
+        guard = Guard.__new__(Guard)
+        exchange = FakeEmergencyExchange()
+        guard.state = {"quote_balance_source": {
+            "free_quote": "100", "observed_at": 100,
+            "source": "account_reconciliation",
+        }}
+        guard.emergency_exchange = exchange
+        guard.quote_budget_buffer_pct = Decimal("0.002")
+        guard.quote_balance_cache_seconds = 30
+
+        result = guard._quote_budget_status(Decimal("95"), now=110)
+
+        self.assertTrue(result["buy_ready"])
+        self.assertTrue(result["cached"])
+        self.assertEqual(0, exchange.account_balance_calls)
+
+    def test_aggregate_capital_gate_blocks_buy_but_keeps_sell_enabled(self):
+        bot_name = LIVE_PAIRS["ETH-USDT"].bot_name
+        guard = Guard.__new__(Guard)
+        guard.state = {"bots": {bot_name: {"recovery": {"phase": "ACTIVE"}}}}
+        guard.emergency_exchange = FakeEmergencyExchange()
+        guard.emergency_exchange.free_usdt = Decimal("89.52")
+        guard.quote_budget_buffer_pct = Decimal("0.002")
+        guard.quote_balance_cache_seconds = 30
+        guard._macro_gate = lambda: {
+            "healthy": True, "buy_enabled": True, "sell_enabled": True,
+            "reason": "macro_state_healthy", "active_lease_ids": [],
+        }
+        guard._v21_gate = lambda: {
+            "healthy": True, "reason": "healthy", "pairs": {
+                "ETH-USDT": {
+                    "buy_enabled": True, "source_pair": "ETH-FDUSD",
+                    "reason": "risk_on", "event_id": "eth-on",
+                },
+            },
+        }
+        applied = []
+        guard._set_effective_gates = lambda bot, snapshot, **gates: applied.append(gates) or {
+            "status": "applied",
+        }
+        guard._audit = lambda *args, **kwargs: None
+
+        guard._apply_aggregate_gates(
+            {bot_name: {"pair": "ETH-USDT", "database": "unused"}},
+            risk_actions_enabled=True,
+        )
+
+        self.assertFalse(applied[0]["buy_enabled"])
+        self.assertTrue(applied[0]["sell_enabled"])
+        aggregate = guard.state["gate_aggregate"]
+        self.assertFalse(aggregate["capital"]["buy_ready"])
+        self.assertEqual("insufficient_quote_budget", aggregate["capital"]["reason"])
+
+    def test_reentry_waits_for_base_rebuild_and_buy_side_cash_without_liquidation(self):
+        bot_name = LIVE_PAIRS["BTC-USDT"].bot_name
+        guard = Guard.__new__(Guard)
+        guard.state = {
+            "bots": {bot_name: {"recovery": {
+                "phase": "REENTRY", "mechanism": "v22_weekly_buy_gate",
+                "scope": "technical", "healthy_cycles": 3,
+                "cooldown_until": 0,
+            }}},
+            "gate_aggregate": {"v22": {"pairs": {
+                "BTC-USDT": {"buy_enabled": True},
+                "ETH-USDT": {"buy_enabled": False},
+            }}},
+        }
+        guard.auto_reentry_enabled = True
+        guard.quote_budget_buffer_pct = Decimal("0.002")
+        guard.quote_balance_cache_seconds = 30
+        guard.emergency_exchange = FakeEmergencyExchange()
+        # Enough to rebuild ~95 USDT of BTC, but not enough to preserve the
+        # robot's separate ~95 USDT BUY-side budget afterwards.
+        guard.emergency_exchange.free_usdt = Decimal("180")
+        guard._lot_filter = lambda pair: (Decimal("0.00001"), Decimal("5"))
+        guard._executor_counts = lambda database: {
+            "active_buy_executors": 0, "trading_buy_executors": 0,
+            "active_sell_executors": 0, "trading_sell_executors": 0,
+            "open_orders": 0,
+        }
+        audits = []
+        guard._audit = lambda event, **details: audits.append((event, details))
+
+        guard._process_recoverable(
+            bot_name,
+            {"pair": "BTC-USDT", "mark_price": "65000", "database": "unused"},
+            macro={"healthy": True, "buy_enabled": True, "sell_enabled": True},
+            technical={"buy_enabled": True, "execution_authorized": True},
+            now=200,
+        )
+
+        recovery = guard.state["bots"][bot_name]["recovery"]
+        self.assertEqual("REENTRY", recovery["phase"])
+        self.assertFalse(recovery["reentry_allowed"])
+        self.assertEqual("insufficient_quote_budget", recovery["reentry_block_reason"])
+        self.assertEqual([], guard.emergency_exchange.orders)
+        self.assertEqual("recoverable_reentry_capital_wait", audits[-1][0])
 
     def test_recoverable_exit_is_capped_by_deployment_owned_base(self):
         with tempfile.TemporaryDirectory() as directory:

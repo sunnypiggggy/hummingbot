@@ -524,7 +524,10 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy._latch_integrity_failure = lambda reason: self.fail(reason)
         with patch("walk_forward_portfolio_grid_live.load_runtime_xgboost_gate", return_value={
             "runtime_gate_healthy": False,
-            "reason": "fail_closed:ConnectionResetError(104, connection reset by peer)",
+            "reason": (
+                "fail_closed:500 Server Error: Internal Server Error for url: "
+                "https://api.binance.com/api/v3/time"
+            ),
             "pairs": {},
         }):
             strategy._poll_technical_buy_gate()

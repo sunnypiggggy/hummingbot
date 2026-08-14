@@ -92,7 +92,10 @@ class GridGuardShadowTest(unittest.TestCase):
         failed = {
             **previous, "source_healthy": False, "execution_authorized": False,
             "generated_at": "1970-01-01T00:16:40+00:00",
-            "reason": "fail_closed:ConnectionResetError(104, connection reset by peer)",
+            "reason": (
+                "fail_closed:500 Server Error: Internal Server Error for url: "
+                "https://api.binance.com/api/v3/time"
+            ),
         }
         guard.next_technical_refresh = 0
         guard.technical_refresh_seconds = 30
