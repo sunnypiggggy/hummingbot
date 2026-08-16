@@ -24,7 +24,10 @@ from live_guard.telegram_notifications import (
     runtime_error_lines,
     sanitize_runtime_error,
 )
-from live_guard.telegram_parameter_report import build_parameter_attachments
+from live_guard.telegram_parameter_report import (
+    _resolve_report_inputs,
+    build_parameter_attachments,
+)
 from live_guard.dca_live_guard import Guard as DcaGuard
 from live_guard.grid_live_guard import Guard as GridGuard
 
@@ -408,6 +411,27 @@ def test_v22_parameter_report_is_twelve_pngs_without_documents(tmp_path):
     assert "过去360天" in captions
     assert "2026年1–2月" in captions
     assert "2026年5–6月" in captions
+
+
+def test_pending_weekly_candidate_uses_family_replay_evidence(tmp_path):
+    release_sha = "c" * 64
+    family = tmp_path / "ethbtc-forced-exit"
+    candidate = family / "releases" / release_sha
+    (candidate / "shadow_package").mkdir(parents=True)
+    (candidate / "shadow_package" / "shadow_lock.json").write_text(
+        json.dumps({"effective_start": 123}), encoding="utf-8",
+    )
+    evidence = family / "evidence"
+    evidence.mkdir(parents=True)
+    for name in ("summary.json", "audit_series.csv.gz", "risk_intervals.csv"):
+        (evidence / name).write_bytes(b"evidence")
+
+    identity_root, evidence_root = _resolve_report_inputs(
+        family, {"release_sha256": release_sha},
+    )
+
+    assert identity_root == candidate
+    assert evidence_root == family
 
 
 def test_latched_prompt_contains_binding_but_no_secret_or_command():

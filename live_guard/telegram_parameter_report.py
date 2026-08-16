@@ -45,16 +45,55 @@ PAIR_SPECS = (
 )
 
 
-def _resolve_release(root: Path, event: Mapping[str, Any]) -> Path:
-    candidates = [
-        root / "releases" / str(event.get("release_sha256", "")),
-        root / "current",
-        root,
-    ]
-    for candidate in candidates:
-        if (candidate / "evidence/summary.json").is_file():
-            return candidate
-    raise FileNotFoundError("no release evidence/summary.json matches the notification")
+def _resolve_report_inputs(root: Path, event: Mapping[str, Any]) -> tuple[Path, Path]:
+    """Resolve candidate identity separately from lineage replay evidence.
+
+    A weekly candidate intentionally contains the signed model, policy and
+    documentation, while the immutable 360-day replay evidence is stored once
+    at the release-family root.  Treating them as one directory prevented a
+    not-yet-active candidate from producing its approval charts.
+    """
+    release_sha = str(event.get("release_sha256", ""))
+    requested = root / "releases" / release_sha
+    identity_candidates = (requested, root / "current", root)
+    identity = next(
+        (
+            candidate
+            for candidate in identity_candidates
+            if (
+                (candidate / "shadow_package/shadow_lock.json").is_file()
+                or (
+                    candidate
+                    / "inputs/frozen_v22/shadow_package/shadow_lock.json"
+                ).is_file()
+            )
+        ),
+        None,
+    )
+    if identity is None:
+        raise FileNotFoundError(
+            f"signed model identity is missing for approval release {release_sha or '-'}"
+        )
+
+    evidence_candidates = (requested, root, root / "current")
+    evidence = next(
+        (
+            candidate
+            for candidate in evidence_candidates
+            if (
+                (candidate / "evidence/summary.json").is_file()
+                and (candidate / "evidence/audit_series.csv.gz").is_file()
+                and (candidate / "evidence/risk_intervals.csv").is_file()
+            )
+        ),
+        None,
+    )
+    if evidence is None:
+        raise FileNotFoundError(
+            "release-family replay evidence is incomplete: summary, audit series, "
+            "and risk intervals are required"
+        )
+    return identity, evidence
 
 
 def _read_summary(root: Path) -> dict[str, Any]:
@@ -263,13 +302,13 @@ def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
         return [{"path": str(pdf), "kind": "document",
                  "sha256": sha256_file(pdf), "caption": "Grid参数分析PDF（360天证据缺失）",
                  "evidence_complete": False}]
-    release_root = _resolve_release(release_root, event)
-    summary = _read_summary(release_root)
+    identity_root, evidence_root = _resolve_report_inputs(release_root, event)
+    summary = _read_summary(evidence_root)
     evidence_model = str(summary.get("frozen_inputs", {}).get("model_sha256", ""))
     requested_model = str(event.get("model_sha256", ""))
     manifest = build_v22_png_windows(
-        release_root / "evidence", directory,
-        signed_start=_signed_start(release_root),
+        evidence_root / "evidence", directory,
+        signed_start=_signed_start(identity_root),
         production_model_sha256=requested_model or evidence_model,
         evidence_model_sha256=evidence_model,
     )

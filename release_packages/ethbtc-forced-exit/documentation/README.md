@@ -15,6 +15,7 @@ OCI 运维见 [TELEGRAM_NOTIFICATIONS.md](TELEGRAM_NOTIFICATIONS.md)。
 - [CONTAINERS_AND_SIGNAL_FLOW.md](CONTAINERS_AND_SIGNAL_FLOW.md)：当前 v22 live 容器拓扑、唯一 producer、共享目录和交易链路。
 - [RISK_MECHANISMS.md](RISK_MECHANISMS.md)：Grid/DCA 七类风控、阈值、作用范围和开关。
 - [V22_WEEKLY_MODEL.md](V22_WEEKLY_MODEL.md)：v22 周度模型、阈值、状态连续性、训练防泄漏和 Fail-Closed。
+- [WEEKLY_APPROVAL_NOTIFICATIONS.md](WEEKLY_APPROVAL_NOTIFICATIONS.md)：每周候选、默认审批、原子切换时间及 12 张回测 PNG 的同步通知链路。
 - [FORCED_EXIT_AND_RECOVERY.md](FORCED_EXIT_AND_RECOVERY.md)：强制退出、双通道接管、冷却、自动重入和人工解锁。
 - [CONFIGURATION_AND_OPERATIONS.md](CONFIGURATION_AND_OPERATIONS.md)：容器依赖、合同字段、环境变量、观察、审批、切换、监控与回滚。
 - [CONTRACTS_AND_RUNTIME_FLOW.md](CONTRACTS_AND_RUNTIME_FLOW.md)：所有 JSON 合同、producer/consumer、授权语义、运行链路和真实阻塞判定。

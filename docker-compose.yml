@@ -367,7 +367,9 @@ services:
       GRID_LIVE_STATE_PATH: /workspace/grid
       ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
       ACCOUNT_INVENTORY_LEDGER_PATH: /workspace/account-inventory
-      DCA_LIVE_REPORT_INTERVAL: "300"
+      # Approval requests and their PNG jobs are picked up within one minute.
+      # The four-hour profit slot remains controlled by its persisted schedule.
+      DCA_LIVE_REPORT_INTERVAL: "60"
       TELEGRAM_NOTIFY_BOT_TOKEN_FILE: /run/secrets/telegram_notify_bot_token
       TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED: "${TELEGRAM_ALERT_V22_WEEKLY_BUY_GATE_ENABLED:-true}"
       TELEGRAM_ALERT_FOMC_GATE_ENABLED: "${TELEGRAM_ALERT_FOMC_GATE_ENABLED:-true}"
