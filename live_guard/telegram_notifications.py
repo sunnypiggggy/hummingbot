@@ -47,6 +47,7 @@ MECHANISMS = (
     "portfolio_loss_breaker",
     "portfolio_drawdown_breaker",
     "position_protection",
+    "capital_budget_gate",
 )
 LIFECYCLE_TRANSITIONS = {
     "TRIGGERED", "EXITING", "EXIT_COMPLETE", "COOLDOWN", "REENTRY",
@@ -355,6 +356,7 @@ MECHANISM_EXPLANATIONS = {
     "portfolio_loss_breaker": "同一策略的 BTC/ETH 组合累计亏损达到组合保护条件",
     "portfolio_drawdown_breaker": "同一策略的 BTC/ETH 组合权益回撤达到组合保护条件",
     "position_protection": "机器人归属持仓达到止损或异常持仓保护条件",
+    "capital_budget_gate": "可用 USDT 低于计划资金预算；该机制仅告警，不改变 BUY/SELL 权限",
     "infrastructure_integrity_breaker": "模型、合同、行情、API 或数据完整性检查失败",
 }
 
@@ -368,6 +370,16 @@ def explain_event(event: Mapping[str, Any]) -> str:
     cause = MECHANISM_EXPLANATIONS.get(mechanism, "该风控机制的状态发生变化")
     details = event.get("details", {})
     details = details if isinstance(details, Mapping) else {}
+
+    if mechanism == "capital_budget_gate":
+        free_quote = details.get("free_quote", event.get("trigger_value", "未知"))
+        required_quote = details.get("required_quote", event.get("threshold", "未知"))
+        state = "已恢复预算水平" if transition == "RECOVERED" else "低于预算水平"
+        return (
+            f"解释：可用 USDT {free_quote}，计划预算 {required_quote}，当前{state}"
+            f"（原始原因：{reason}）；该机制仅发送告警和展示状态，"
+            "不会关闭 BUY/SELL、不会撤单，也不会改变交易机器人正常运行权限。"
+        )
 
     if mechanism == "v22_weekly_buy_gate" and strategy == "dca":
         mechanism_buy = details.get("buy_enabled")

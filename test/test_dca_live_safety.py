@@ -316,7 +316,7 @@ class DcaLiveSafetyTest(unittest.TestCase):
         self.assertTrue(result["cached"])
         self.assertEqual(0, exchange.account_balance_calls)
 
-    def test_aggregate_capital_gate_blocks_buy_but_keeps_sell_enabled(self):
+    def test_aggregate_capital_shortage_is_alert_only_and_keeps_both_sides_enabled(self):
         bot_name = LIVE_PAIRS["ETH-USDT"].bot_name
         guard = Guard.__new__(Guard)
         guard.state = {"bots": {bot_name: {"recovery": {"phase": "ACTIVE"}}}}
@@ -347,11 +347,33 @@ class DcaLiveSafetyTest(unittest.TestCase):
             risk_actions_enabled=True,
         )
 
-        self.assertFalse(applied[0]["buy_enabled"])
+        self.assertTrue(applied[0]["buy_enabled"])
         self.assertTrue(applied[0]["sell_enabled"])
         aggregate = guard.state["gate_aggregate"]
         self.assertFalse(aggregate["capital"]["buy_ready"])
+        self.assertFalse(aggregate["capital"]["enforced"])
+        self.assertEqual("alert_only", aggregate["capital"]["mode"])
         self.assertEqual("insufficient_quote_budget", aggregate["capital"]["reason"])
+        self.assertFalse(aggregate["bots"][bot_name]["capital_gate_enforced"])
+
+    def test_capital_alert_notification_explicitly_has_no_trade_impact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guard = Guard.__new__(Guard)
+            guard.notification_path = Path(directory) / "events.jsonl"
+
+            guard._emit_notification("capital_budget_gate_transition", {
+                "buy_enabled": False,
+                "reason": "insufficient_quote_budget",
+                "free_quote": "18.68",
+                "required_quote": "190",
+                "action": "capital_alert_only_no_trade_block",
+            })
+
+            event = json.loads(guard.notification_path.read_text(encoding="utf-8"))
+            self.assertEqual("capital_budget_gate", event["mechanism"])
+            self.assertEqual("TRIGGERED", event["transition"])
+            self.assertFalse(event["details"]["trading_permissions_changed"])
+            self.assertEqual("alert_only", event["details"]["enforcement_mode"])
 
     def test_reentry_waits_for_base_rebuild_and_buy_side_cash_without_liquidation(self):
         bot_name = LIVE_PAIRS["BTC-USDT"].bot_name

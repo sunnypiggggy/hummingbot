@@ -15,7 +15,7 @@ GATE_LABELS = {
     "portfolio_drawdown_breaker": "组合回撤熔断",
     "position_protection": "持仓保护",
     "infrastructure_integrity_breaker": "基础设施/完整性",
-    "capital_budget_gate": "资金预算门",
+    "capital_budget_gate": "资金预算告警",
     "inventory_ownership_gate": "库存归属门",
     "recovery_phase_gate": "退出/冷却/重入",
     "controller_application_gate": "控制器落地",

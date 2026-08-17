@@ -552,10 +552,12 @@ class Guard:
             "DCA_PORTFOLIO_DRAWDOWN_LIMIT_PCT", "0.08"
         ))
         self.auto_reentry_enabled = _env_enabled("DCA_RISK_AUTO_REENTRY_ENABLED", False)
-        # Capital shortages are recoverable. They close ordinary BUY only;
-        # existing SELL protection stays enabled and no forced liquidation or
-        # integrity latch is triggered merely because quote is temporarily
-        # locked or a settlement is delayed.
+        # Quote capital is advisory for ordinary DCA trading.  It is observed
+        # and reported, but it must never participate in the aggregate
+        # BUY/SELL permission decision: open BUY orders legitimately move
+        # funds from ``free`` to ``locked`` and would otherwise create a
+        # cancel/recreate feedback loop.  Transaction-level affordability is
+        # still checked before an emergency market re-entry is submitted.
         self.quote_budget_buffer_pct = Decimal(os.getenv(
             "DCA_QUOTE_BUDGET_BUFFER_PCT", "0.002"
         ))
@@ -1223,6 +1225,34 @@ class Guard:
         path = getattr(self, "notification_path", None)
         if path is None:
             return
+        if audit_event == "capital_budget_gate_transition":
+            ready = bool(details.get("buy_enabled"))
+            append_event(path, build_event(
+                source="dca-live-guard", strategy="dca",
+                bot=",".join(spec.bot_name for spec in LIVE_PAIRS.values()),
+                pair=",".join(LIVE_PAIRS),
+                mechanism="capital_budget_gate",
+                transition="RECOVERED" if ready else "TRIGGERED",
+                reason=str(details.get("reason") or audit_event),
+                severity="info" if ready else "warning",
+                phase_from="ALERT_ONLY" if ready else "OK",
+                phase_to="OK" if ready else "ALERT_ONLY",
+                action=str(details.get("action") or
+                           "capital_alert_only_no_trade_block"),
+                trigger_value=details.get("free_quote"),
+                threshold=details.get("required_quote"),
+                correlation_id=(
+                    f"capital-budget-alert-only:{ready}:"
+                    f"{details.get('reason')}"
+                ),
+                details={
+                    "free_quote": details.get("free_quote"),
+                    "required_quote": details.get("required_quote"),
+                    "enforcement_mode": "alert_only",
+                    "trading_permissions_changed": False,
+                },
+            ))
+            return
         if audit_event in {"fomc_gate_transition", "v22_gate_transition"}:
             mechanism = "fomc_gate" if audit_event.startswith("fomc") else "v22_weekly_buy_gate"
             blocked = not bool(details.get("buy_enabled")) or (
@@ -1789,7 +1819,7 @@ class Guard:
         self, required_quote: Decimal, *, now: Optional[float] = None,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate the self-recovering, BUY-only quote-capital gate."""
+        """Observe quote capital without changing ordinary trade permissions."""
         observed = time.time() if now is None else float(now)
         required = max(Decimal(str(required_quote)), Decimal("0"))
         buffer_pct = max(
@@ -1933,8 +1963,17 @@ class Guard:
         capital = self._quote_budget_status(
             side_budget() * Decimal(len(candidate_buy_bots))
         )
+        # The capital observation is intentionally advisory.  Keep the raw
+        # readiness result in the contract for reports and alerts, while the
+        # aggregate permission remains the AND of actual risk mechanisms.
+        capital["mode"] = "alert_only"
+        capital["enforced"] = False
         aggregate = {"macro": macro, "v22": v21, "capital": capital, "bots": {}}
-        if (
+        capital_mode_changed = bool(
+            previous_capital.get("mode") != "alert_only"
+            or previous_capital.get("enforced") is not False
+        )
+        if capital_mode_changed or (
             previous_capital.get("buy_ready") is not None
             and previous_capital.get("buy_ready") != capital.get("buy_ready")
         ):
@@ -1944,8 +1983,11 @@ class Guard:
                 reason=capital["reason"],
                 free_quote=capital.get("free_quote"),
                 required_quote=capital.get("required_quote"),
-                action=("resume_ordinary_buy" if capital["buy_ready"]
-                        else "pause_ordinary_buy_keep_sell"),
+                action=("capital_alert_cleared_no_trade_change"
+                        if capital["buy_ready"] else
+                        "capital_alert_only_no_trade_block"),
+                enforcement_mode="alert_only",
+                trading_permissions_changed=False,
             )
         for bot_name, snapshot in snapshots.items():
             bot_state = self.state.get("bots", {}).get(bot_name, {})
@@ -1957,7 +1999,7 @@ class Guard:
             recoverable_blocked = recovery["phase"] != ACTIVE
             buy_enabled = bool(
                 macro["buy_enabled"] and technical["buy_enabled"]
-                and not recoverable_blocked and capital["buy_ready"]
+                and not recoverable_blocked
             )
             sell_enabled = bool(macro["sell_enabled"] and not recoverable_blocked)
             reasons = {
@@ -1967,6 +2009,7 @@ class Guard:
                 "recovery_phase": recovery["phase"],
                 "recovery_mechanism": recovery.get("mechanism", ""),
                 "capital_gate": capital["reason"],
+                "capital_gate_mode": "alert_only",
                 "free_quote": capital.get("free_quote"),
                 "required_quote": capital.get("required_quote"),
             }
@@ -1978,6 +2021,7 @@ class Guard:
                 "v22_buy_enabled": bool(technical["buy_enabled"]),
                 "v22_event_id": technical.get("event_id"),
                 "capital_buy_ready": bool(capital["buy_ready"]),
+                "capital_gate_enforced": False,
             }
             previous_bot = previous_bots.get(bot_name, {})
             macro_changed = (

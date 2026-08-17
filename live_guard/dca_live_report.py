@@ -1073,9 +1073,11 @@ class UnifiedTelegramReporting:
                     reason=infra_reason, source="dca_guard",
                 ),
                 gate_row(
-                    "capital_budget_gate", state="ALLOW" if capital.get("buy_ready") else "BLOCK",
-                    buy_enabled=bool(capital.get("buy_ready")), sell_enabled=True,
-                    health="HEALTHY" if capital.get("healthy") else "DEGRADED",
+                    "capital_budget_gate",
+                    state="OK" if capital.get("buy_ready") else "ALERT_ONLY",
+                    # Advisory only: expose the observation without changing
+                    # the final controller permissions or normal-trading flag.
+                    buy_enabled=True, sell_enabled=True, health="HEALTHY",
                     reason=str(capital.get("reason") or "unknown"), source="quote_budget",
                 ),
                 self._inventory_row(pair.split("-", 1)[0]),

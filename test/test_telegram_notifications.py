@@ -539,6 +539,19 @@ def test_risk_event_message_explains_cause_and_follow_up_impact_in_one_line():
     assert "\n" not in explain_event(multiline)
 
 
+def test_capital_budget_alert_explains_that_trading_is_not_blocked():
+    explanation = explain_event({
+        "mechanism": "capital_budget_gate",
+        "strategy": "dca",
+        "transition": "TRIGGERED",
+        "reason": "insufficient_quote_budget",
+        "details": {"free_quote": "18.68", "required_quote": "190"},
+    })
+    assert "仅发送告警" in explanation
+    assert "不会关闭 BUY/SELL" in explanation
+    assert "18.68" in explanation
+
+
 def test_recovered_explanation_never_claims_all_gates_are_open():
     value = event(
         strategy="dca", mechanism="v22_weekly_buy_gate",

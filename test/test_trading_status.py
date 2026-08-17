@@ -55,6 +55,19 @@ def test_disabled_and_not_applicable_gates_do_not_block():
     assert value["trading_normal"] is True
 
 
+def test_capital_budget_alert_only_does_not_block_normal_trading():
+    value = status(
+        gate_row("v22_weekly_buy_gate"),
+        gate_row("capital_budget_gate", state="ALERT_ONLY",
+                 buy_enabled=True, sell_enabled=True,
+                 reason="insufficient_quote_budget"),
+        gate_row("controller_application_gate"),
+    )
+    assert value["trade_mode"] == "NORMAL"
+    assert value["trading_normal"] is True
+    assert value["blockers"] == []
+
+
 def test_report_marks_isolated_prewarm_without_changing_current_model_semantics():
     phase = UnifiedTelegramReporting._reported_cutover_phase(
         {
