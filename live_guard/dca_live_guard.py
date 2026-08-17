@@ -606,20 +606,22 @@ class Guard:
         self.state["emergency_ready"] = bool(
             self.emergency_exchange is not None and self.emergency_docker is not None
         )
-        if self.state["emergency_ready"] and self.managed_inventory_path.exists():
-            ownership = json.loads(self.managed_inventory_path.read_text(encoding="utf-8"))
-            balances = self.emergency_exchange.account_balances()
-            coverage = {}
-            for pair, spec in LIVE_PAIRS.items():
-                managed = Decimal(str(
-                    ownership.get("pairs", {}).get(pair, {}).get("managed_base", "0")
-                ))
-                available = balances.get(spec.base_asset, {}).get("total", Decimal("0"))
-                coverage[pair] = {
-                    "managed_base": str(managed), "account_total_base": str(available),
-                    "covered": managed > 0 and managed <= available,
+        if self.state["emergency_ready"] and self.inventory_ledger.status_path.exists():
+            try:
+                inventory_status = self._read_json(self.inventory_ledger.status_path)
+                managed = self._read_json(self.managed_inventory_path)
+                self.state["ownership_preflight"] = self._ownership_preflight_from_status(
+                    inventory_status, managed,
+                )
+            except Exception as exc:
+                self.state["ownership_preflight"] = {
+                    pair: {
+                        "covered": False,
+                        "source": "unified_account_inventory_v3",
+                        "reason": f"inventory_status_unavailable:{type(exc).__name__}",
+                    }
+                    for pair in LIVE_PAIRS
                 }
-            self.state["ownership_preflight"] = coverage
         self._migrate_incomplete_latched_inventory()
         self._save()
 
@@ -653,6 +655,55 @@ class Guard:
         if not isinstance(value, dict):
             raise RuntimeError(f"inventory evidence is not an object: {path}")
         return value
+
+    @staticmethod
+    def _ownership_preflight_from_status(
+        status: Dict[str, Any], managed_inventory: Dict[str, Any],
+        *, observed_at: float | None = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Build approval coverage from current ownership, not startup inventory.
+
+        ``latest.net_base`` already contains all Guard emergency adjustments.
+        The immutable managed inventory remains an auditable cycle baseline, but
+        it is not the amount that must still be present after confirmed exits.
+        """
+        now = time.time() if observed_at is None else observed_at
+        generated_at = float(status.get("generated_at") or 0)
+        fresh = generated_at > 0 and now - generated_at < 30
+        contract_healthy = bool(
+            fresh and status.get("sources_healthy") is True
+            and status.get("healthy") is True
+        )
+        result: Dict[str, Dict[str, Any]] = {}
+        for pair, spec in LIVE_PAIRS.items():
+            row = status.get("assets", {}).get(spec.base_asset, {})
+            owner_key = f"dca:{spec.bot_name}"
+            owned = Decimal(str(row.get("owners", {}).get(owner_key, "0")))
+            total = Decimal(str(row.get("exchange", {}).get("total", "0")))
+            deficit = Decimal(str(row.get("ownership_deficit", "0")))
+            target = Decimal(str(
+                managed_inventory.get("pairs", {}).get(pair, {}).get("managed_base", "0")
+            ))
+            covered = bool(
+                contract_healthy and deficit <= 0 and owned >= 0 and owned <= total
+            )
+            result[pair] = {
+                "managed_base": str(owned),
+                "managed_base_target": str(target),
+                "owned_base": str(owned),
+                "account_total_base": str(total),
+                "ownership_deficit": str(deficit),
+                "covered": covered,
+                "source": "unified_account_inventory_v3",
+                "evidence_sha256": status.get("evidence_sha256"),
+                "generated_at": generated_at,
+                "age_seconds": max(0.0, now - generated_at) if generated_at else None,
+                "reason": "current_strategy_ownership_covered" if covered else (
+                    "inventory_contract_unhealthy_or_stale" if not contract_healthy
+                    else "current_strategy_ownership_exceeds_account_balance"
+                ),
+            }
+        return result
 
     def _migrate_incomplete_latched_inventory(self) -> None:
         """Do not keep claiming an integrity exit completed when startup stock remains.
@@ -1073,6 +1124,10 @@ class Guard:
         )
         runtime = self._inventory_runtime_status(order_counts)
         status["runtime"] = runtime
+        managed = self._read_json(self.managed_inventory_path)
+        self.state["ownership_preflight"] = self._ownership_preflight_from_status(
+            status, managed,
+        )
         self.state["account_inventory"] = {
             "healthy": status["healthy"], "evidence_sha256": evidence,
             "status_path": str(self.inventory_ledger.status_path),

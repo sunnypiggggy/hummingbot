@@ -47,22 +47,6 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _adjustments(bot: Mapping[str, Any], asset: str) -> Decimal:
-    total = ZERO
-    for row in bot.get("emergency_adjustments", []):
-        if not isinstance(row, Mapping):
-            continue
-        pair = str(row.get("pair", ""))
-        if pair.split("-", 1)[0] != asset:
-            continue
-        if row.get("base_delta") is not None:
-            total += decimal(row.get("base_delta"))
-            continue
-        executed = decimal(row.get("executed_qty"))
-        total += executed if str(row.get("side", "")).upper() == "BUY" else -executed
-    return total
-
-
 def ownership_from_documents(
     *, reservations: Mapping[str, Any], grid_state: Mapping[str, Any],
     managed_inventory: Mapping[str, Any], dca_state: Mapping[str, Any],
@@ -74,10 +58,10 @@ def ownership_from_documents(
     grid_bases = reservations.get("reservations", {}).get("FDUSD", {}).get("base", {})
     for asset in ASSETS:
         pair = f"{asset}-FDUSD"
+        # Guard snapshots already fold emergency fills into net_base.
         quantity = (
             decimal(grid_bases.get(asset))
             + decimal(grid_pairs.get(pair, {}).get("net_base"))
-            + _adjustments(grid_bot, asset)
         )
         result[asset]["grid:grid-live-fdusd-400"] = max(quantity, ZERO)
 
@@ -90,10 +74,10 @@ def ownership_from_documents(
         target = bot.get("managed_base_target")
         if target is None:
             target = pair_docs.get(pair, {}).get("managed_base")
+        # Guard snapshots already fold emergency fills into net_base.
         quantity = (
             decimal(target)
             + decimal(bot.get("latest", {}).get("net_base"))
-            + _adjustments(bot, asset)
         )
         result[asset][f"dca:{bot_name}"] = max(quantity, ZERO)
     return result

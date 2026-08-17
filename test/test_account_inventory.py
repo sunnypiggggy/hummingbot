@@ -60,6 +60,74 @@ def test_ownership_combines_grid_and_dca_evidence_without_account_balance():
     assert value["ETH"]["dca:dca-live-ethusdt-200"] == Decimal("0.0505")
 
 
+def test_ownership_does_not_double_count_adjustments_already_in_latest_net_base():
+    value = ownership_from_documents(
+        reservations={"reservations": {"FDUSD": {"base": {
+            "BTC": "0", "ETH": "0",
+        }}}},
+        grid_state={"bots": {"grid": {"latest": {"pairs": {
+            "BTC-FDUSD": {"net_base": "0"},
+            "ETH-FDUSD": {"net_base": "0"},
+        }}}}},
+        managed_inventory={"pairs": {
+            "BTC-USDT": {"managed_base": "0.001499762327138578"},
+            "ETH-USDT": {"managed_base": "0.050528420907064937"},
+        }},
+        dca_state={"bots": {
+            "dca-live-btcusdt-200": {
+                "latest": {"net_base": "-0.00149000"},
+                "emergency_adjustments": [{"pair": "BTC-USDT", "base_delta": "-0.00192000"}],
+            },
+            "dca-live-ethusdt-200": {
+                "latest": {"net_base": "-0.05095080"},
+                "emergency_adjustments": [{"pair": "ETH-USDT", "base_delta": "-0.05050000"}],
+            },
+        }},
+    )
+    assert value["BTC"]["dca:dca-live-btcusdt-200"] == Decimal(
+        "0.000009762327138578"
+    )
+    assert value["ETH"]["dca:dca-live-ethusdt-200"] == 0
+
+
+def test_dca_approval_preflight_uses_current_unified_ownership():
+    status = {
+        "generated_at": 95,
+        "sources_healthy": True,
+        "healthy": True,
+        "evidence_sha256": "evidence",
+        "assets": {
+            "BTC": {
+                "exchange": {"total": "0.00001462"},
+                "owners": {"dca:dca-live-btcusdt-200": "0.000009762327138578"},
+                "ownership_deficit": "0",
+            },
+            "ETH": {
+                "exchange": {"total": "0.00189080"},
+                "owners": {"dca:dca-live-ethusdt-200": "0"},
+                "ownership_deficit": "0",
+            },
+        },
+    }
+    managed = {"pairs": {
+        "BTC-USDT": {"managed_base": "0.001499762327138578"},
+        "ETH-USDT": {"managed_base": "0.050528420907064937"},
+    }}
+    value = Guard._ownership_preflight_from_status(
+        status, managed, observed_at=100,
+    )
+    assert value["BTC-USDT"]["covered"] is True
+    assert value["BTC-USDT"]["managed_base"] == "0.000009762327138578"
+    assert value["BTC-USDT"]["managed_base_target"] == "0.001499762327138578"
+    assert value["ETH-USDT"]["covered"] is True
+    assert value["ETH-USDT"]["managed_base"] == "0"
+
+    stale = Guard._ownership_preflight_from_status(
+        status, managed, observed_at=126,
+    )
+    assert all(not row["covered"] for row in stale.values())
+
+
 def test_unattributed_requires_three_cycles_and_thirty_seconds():
     with tempfile.TemporaryDirectory() as directory:
         ledger = UnifiedInventoryLedger(Path(directory))
