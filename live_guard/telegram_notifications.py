@@ -53,6 +53,10 @@ LIFECYCLE_TRANSITIONS = {
     "RECOVERED", "LATCHED", "EXIT_DELAY", "ACTION_FAILED",
 }
 RUNTIME_ERROR_TRANSITIONS = {"ERROR_OCCURRED", "ERROR_RECOVERED"}
+MODEL_CUTOVER_TRANSITIONS = {
+    "MODEL_CUTOVER_PREWARMED", "MODEL_CUTOVER_STABLE",
+    "MODEL_CUTOVER_PRECHECK_FAILED", "MODEL_FOLD_ACTIVATED",
+}
 INVENTORY_TRANSITIONS = {
     "INVENTORY_UNATTRIBUTED_DETECTED",
     "INVENTORY_DUST_CLASSIFIED",
@@ -65,7 +69,7 @@ INVENTORY_TRANSITIONS = {
     "INVENTORY_LIQUIDATION_FEE_RECONCILED",
 }
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-MOBILE_CARD_SIZE = (1440, 2400)
+MOBILE_CARD_SIZE = (1440, 3200)
 
 
 def sha256_file(path: Path) -> str:
@@ -100,7 +104,7 @@ def build_event(
     correlation_id: str = "", details: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     transition = transition.upper()
-    if transition not in LIFECYCLE_TRANSITIONS and transition not in INVENTORY_TRANSITIONS and transition not in RUNTIME_ERROR_TRANSITIONS and transition not in {
+    if transition not in LIFECYCLE_TRANSITIONS and transition not in INVENTORY_TRANSITIONS and transition not in RUNTIME_ERROR_TRANSITIONS and transition not in MODEL_CUTOVER_TRANSITIONS and transition not in {
         "PARAMETER_CANDIDATE", "PARAMETER_ACTIVATED", "PARAMETER_RETAINED",
         "MODEL_APPROVAL_PENDING", "MODEL_DEFAULT_APPROVED",
         "MODEL_APPROVAL_REJECTED", "MODEL_UPDATE_BLOCKED",
@@ -606,7 +610,7 @@ def format_event(event: Mapping[str, Any]) -> str:
                 lines.append(f"默认审批截止：{shown}")
             lines.extend((
                 "默认行为：截止前无人拒绝且全部硬门槛持续通过，则自动批准；任一校验失败不会自动放行。",
-                "审批等待不影响当前模型交易，新模型仅在未来周边界原子切换。",
+                "审批等待不影响当前模型交易；候选会在边界前隔离预热并原子切换 runtime generation，周边界只切换内部 fold。",
                 "",
                 "请在 Hermes 私聊中发送以下提示词：",
                 str(details.get("prompt") or "请检查该 v22 周模型候选并选择批准或拒绝。"),
@@ -1017,6 +1021,44 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     draw.text((70, 55), title, fill="#172033", font=report_font(52, bold=True))
     draw.text((70, 130), f"北京时间：{report.get('generated_at_bjt', '-')}  数据年龄：{report.get('data_age_seconds', '-')}秒",
               fill="#64748b", font=report_font(28))
+    status = report.get("trading_status", {})
+    system_health = str(status.get("system_health") or "UNKNOWN")
+    trade_mode = str(status.get("trade_mode") or "UNKNOWN")
+    trading_normal = status.get("trading_normal") is True
+    if system_health == "FAILED":
+        status_color, status_fill = "#b91c1c", "#fef2f2"
+    elif system_health == "DEGRADED":
+        status_color, status_fill = "#b45309", "#fff7ed"
+    elif trading_normal:
+        status_color, status_fill = "#15803d", "#f0fdf4"
+    else:
+        status_color, status_fill = "#a16207", "#fefce8"
+    draw.rounded_rectangle((70, 180, 1370, 370), radius=18, fill=status_fill,
+                           outline=status_color, width=3)
+    permissions = status.get("final_permissions", {})
+    trade_text = "正常交易" if trading_normal else f"交易受限（{trade_mode}）"
+    draw.text((105, 205), f"系统：{system_health}   结论：{trade_text}",
+              fill=status_color, font=report_font(36, bold=True))
+    draw.text(
+        (105, 262),
+        f"最终权限：BUY={'放行' if permissions.get('buy_enabled') else '阻止'} / "
+        f"SELL={'放行' if permissions.get('sell_enabled') else '阻止'}   "
+        f"阶段：{status.get('phase', '-')}",
+        fill="#334155", font=report_font(28),
+    )
+    generation = str(status.get("runtime_generation") or "-")
+    release = str(status.get("release_sha256") or "-")
+    cutover_phase = str(status.get("cutover_phase") or "-")
+    cutover_label = (
+        "候选预热中（当前模型继续交易）"
+        if cutover_phase == "PREWARMING_CURRENT_MODEL_ACTIVE" else cutover_phase
+    )
+    draw.text(
+        (105, 315),
+        f"Generation：{generation[:12]}  Release：{release[:12]}  "
+        f"模型周：{status.get('model_week', '-')}  切换：{cutover_label}",
+        fill="#64748b", font=report_font(23),
+    )
     windows = report.get("profit", {})
     cards = [
         ("最近4小时", windows.get("four_hour_mtm_quote")),
@@ -1026,7 +1068,7 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     ]
     for index, (label, value) in enumerate(cards):
         left = 70 + (index % 2) * 650
-        top = 210 + (index // 2) * 190
+        top = 410 + (index // 2) * 170
         draw.rounded_rectangle((left, top, left + 600, top + 150), radius=18,
                                fill="#ffffff", outline="#dce3ea", width=2)
         draw.text((left + 28, top + 20), label, fill="#64748b", font=report_font(28))
@@ -1045,7 +1087,6 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         ("费用", _number(report.get("fees_quote"), f" {report.get('quote_asset', '')}")),
         ("买/卖成交", f"{report.get('buys', '-')} / {report.get('sells', '-') }"),
         ("恢复阶段", str(report.get("phase") or "无可信数据")),
-        ("v22 / FOMC", f"{report.get('v22_gate', '-')} / {report.get('fomc_gate', '-') }"),
         ("活动订单/执行器", _runtime_summary(report.get("active_runtime", {}))),
     ]
     dust = report.get("unattributed_dust")
@@ -1056,28 +1097,65 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
             f"{dust.get('quantity', '-')} {base_asset} / "
             f"约 {dust.get('estimated_notional', '-')} USDT",
         ))
-    top = 620
-    draw.rounded_rectangle((70, top, 1370, top + 510), radius=18,
+    top = 790
+    draw.rounded_rectangle((70, top, 1370, top + 390), radius=18,
                            fill="#ffffff", outline="#dce3ea", width=2)
     for index, (label, value) in enumerate(metrics):
         x = 105 + (index % 2) * 650
-        y = top + 35 + (index // 2) * 92
+        y = top + 30 + (index // 2) * 82
         draw.text((x, y), f"{label}：{value}", fill="#334155", font=report_font(29))
-    draw.text((70, 1180), "单机器人连续权益", fill="#172033", font=report_font(34, bold=True))
-    _line(draw, (70, 1230, 1370, 1705), [float(x) for x in report.get("equity_series", [])], "#2563eb")
-    draw.text((70, 1750), "单机器人回撤（%）", fill="#172033", font=report_font(34, bold=True))
-    _line(draw, (70, 1800, 1370, 2180), [float(x) for x in report.get("drawdown_series", [])], "#dc2626")
+    draw.text((70, 1220), "全部有效门控", fill="#172033", font=report_font(34, bold=True))
+    table_top = 1270
+    draw.rounded_rectangle((70, table_top, 1370, table_top + 710), radius=18,
+                           fill="#ffffff", outline="#dce3ea", width=2)
+    headers = (("机制", 90), ("开关", 390), ("状态", 520),
+               ("BUY", 720), ("SELL", 840), ("原因", 970))
+    for label, x in headers:
+        draw.text((x, table_top + 16), label, fill="#172033",
+                  font=report_font(24, bold=True))
+    draw.line((85, table_top + 55, 1355, table_top + 55), fill="#cbd5e1", width=2)
+    for index, row in enumerate(status.get("gate_statuses", [])[:12]):
+        y = table_top + 65 + index * 53
+        if index % 2:
+            draw.rectangle((82, y - 5, 1358, y + 43), fill="#f8fafc")
+        blocked = (
+            row.get("health") != "HEALTHY"
+            or row.get("buy_enabled") is False or row.get("sell_enabled") is False
+        )
+        color = "#b91c1c" if row.get("health") == "FAILED" else (
+            "#a16207" if blocked else "#166534"
+        )
+        draw.text((90, y), str(row.get("label") or row.get("mechanism"))[:15],
+                  fill="#334155", font=report_font(22))
+        switch = "N/A" if not row.get("applicable") else (
+            "开" if row.get("enabled") else "关"
+        )
+        draw.text((390, y), switch, fill="#334155", font=report_font(22))
+        draw.text((520, y), str(row.get("state") or "-")[:14],
+                  fill=color, font=report_font(22, bold=True))
+        draw.text((720, y), "放行" if row.get("buy_enabled") is True else
+                  "阻止" if row.get("buy_enabled") is False else "N/A",
+                  fill=color, font=report_font(22))
+        draw.text((840, y), "放行" if row.get("sell_enabled") is True else
+                  "阻止" if row.get("sell_enabled") is False else "N/A",
+                  fill=color, font=report_font(22))
+        draw.text((970, y), str(row.get("reason") or "-")[:30],
+                  fill="#475569", font=report_font(20))
+    draw.text((70, 2020), "单机器人连续权益", fill="#172033", font=report_font(34, bold=True))
+    _line(draw, (70, 2070, 1370, 2430), [float(x) for x in report.get("equity_series", [])], "#2563eb")
+    draw.text((70, 2470), "单机器人回撤（%）", fill="#172033", font=report_font(34, bold=True))
+    _line(draw, (70, 2520, 1370, 2820), [float(x) for x in report.get("drawdown_series", [])], "#dc2626")
     warnings = report.get("warnings", [])
     warning = "；".join(str(item) for item in warnings) if warnings else "数据完整；未跨策略合并权益。"
     sources = " / ".join(str(value) for value in report.get("data_sources", []))
     source_text = f"数据源：{sources or '无可信数据源'}"
     for index, line in enumerate((source_text[:70], source_text[70:140])):
         if line:
-            draw.text((70, 2205 + index * 36), line, fill="#64748b",
+            draw.text((70, 2860 + index * 36), line, fill="#64748b",
                       font=report_font(23))
     for index, line in enumerate((warning[:68], warning[68:136])):
         if line:
-            draw.text((70, 2282 + index * 36), line,
+            draw.text((70, 2940 + index * 36), line,
                       fill="#b45309" if warnings else "#64748b",
                       font=report_font(24))
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -21,9 +21,11 @@ import requests
 
 try:
     from ethbtc_forced_exit_contract import PACKAGE_ID, atomic_json, sha256_file
+    from grid_v22_live_gate import V22LiveGateProducer
     from telegram_notifications import append_event, build_event
 except ModuleNotFoundError:
     from scripts.ethbtc_forced_exit_contract import PACKAGE_ID, atomic_json, sha256_file
+    from scripts.grid_v22_live_gate import V22LiveGateProducer
     from live_guard.telegram_notifications import append_event, build_event
 
 
@@ -32,7 +34,9 @@ AUTO_CONFIRMATION = "AUTO-PROMOTE-ETHBTC-FORCED-EXIT-AFTER-12H"
 MANUAL_CONFIRMATION = "PROMOTE-ETHBTC-FORCED-EXIT"
 DEFAULT_DELAY_SECONDS = 12 * 60 * 60
 DEFAULT_MINIMUM_RUNWAY_SECONDS = 24 * 60 * 60
-DEFAULT_GENERATION_LEAD_SECONDS = 13 * 60 * 60
+DEFAULT_GENERATION_LEAD_SECONDS = 16 * 60 * 60
+DEFAULT_PREWARM_LEAD_SECONDS = 35 * 60
+DEFAULT_ACTIVATION_LEAD_SECONDS = 30 * 60
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
 
@@ -85,6 +89,7 @@ class WeeklyReleaseManager:
         self, *, release_root: Path, work_root: Path, candle_dir: Path,
         state_path: Path, authorization_path: Path, notification_path: Path,
         grid_state_path: Path, dca_state_path: Path, policy: Policy,
+        runtime_root: Path | None = None,
         now: Callable[[], int] | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     ) -> None:
@@ -96,6 +101,7 @@ class WeeklyReleaseManager:
         self.notification_path = notification_path
         self.grid_state_path = grid_state_path
         self.dca_state_path = dca_state_path
+        self.runtime_root = runtime_root or grid_state_path.parent / "v22-runtime"
         self.policy = policy
         self.now = now or (lambda: int(time.time()))
         self.runner = runner or subprocess.run
@@ -111,6 +117,21 @@ class WeeklyReleaseManager:
 
     def _save(self, value: Mapping[str, Any]) -> None:
         atomic_json(self.state_path, dict(value))
+        public = {
+            "schema": "ethbtc-forced-exit-cutover-status-v1",
+            "updated_at": int(self.now()),
+            "phase": value.get("phase", "UNKNOWN"),
+            "candidate_release_sha256": value.get("candidate_release_sha256"),
+            "runtime_generation": value.get("runtime_generation"),
+            "fold_boundary": value.get("activation_boundary"),
+            "activate_at": value.get("activate_at"),
+            "current_generation_unaffected": value.get("phase") in {
+                "SCHEDULED", "AWAITING_APPROVAL", "APPROVED_PENDING_PREWARM",
+                "PREWARMED_PENDING_ACTIVATION",
+            },
+            "last_error": value.get("last_error"),
+        }
+        atomic_json(self.grid_state_path.parent / "v22_cutover_status.json", public)
 
     def _production(self, package: Path | None = None) -> dict[str, Any]:
         value = load_json((package or self.current) / "production_lock.json", {}) or {}
@@ -299,6 +320,43 @@ class WeeklyReleaseManager:
         os.replace(temporary, self.current)
 
     def _activate(self, state: dict[str, Any], observed: int) -> dict[str, Any]:
+        release_sha = str(state["candidate_release_sha256"])
+        prepared_pointer = load_json(Path(state["prepared_pointer_path"]), {}) or {}
+        prepared_pointer["cutover_phase"] = "WARM_ACTIVE"
+        producer = V22LiveGateProducer(
+            package_dir=self.release_root, cache_dir=self.candle_dir,
+            seed_cache_dir=self.candle_dir, state_dir=self.grid_state_path.parent,
+            authorization_path=self.authorization_path, refresh_binance=False,
+            runtime_root=self.runtime_root,
+        )
+        previous_pointer = load_json(self.runtime_root / "current.json", None)
+        producer.commit_generation(prepared_pointer)
+        state.update({
+            "phase": "WARM_ACTIVE_PENDING_FOLD",
+            "warm_activated_at": observed,
+            "previous_runtime_pointer": previous_pointer,
+            "warm_verified_cycles": 0,
+            "warm_failures": 0,
+            "last_error": None,
+        })
+        self._save(state)
+        append_event(self.notification_path, build_event(
+            source="v22-weekly-release-manager", strategy="grid+dca",
+            bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
+            pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT", mechanism="parameter_update",
+            transition="MODEL_CUTOVER_STABLE", reason="v22 候选已在当前签名周内完成无故障热切换",
+            severity="info", action="monitor_warm_generation_until_fold_boundary",
+            release_sha256=release_sha,
+            correlation_id=f"warm-active:{prepared_pointer.get('runtime_generation')}",
+            details={"runtime_generation": prepared_pointer.get("runtime_generation"),
+                     "fold_boundary": state["activation_boundary"],
+                     "approval_mode": state["approval_mode"]},
+        ))
+        return state
+
+    def _finalize_fold(
+        self, state: dict[str, Any], observed: int, *, generation_healthy: bool,
+    ) -> dict[str, Any]:
         receipt = load_json(Path(state["pending_authorization_path"]), {}) or {}
         release_sha = str(state["candidate_release_sha256"])
         pointer = {
@@ -311,31 +369,137 @@ class WeeklyReleaseManager:
         atomic_json(target, pointer)
         self._switch_current(release_sha)
         atomic_json(self.authorization_path, receipt)
-        state.update({"phase": "ACTIVE", "activated_at": observed,
-                      "active_deployment_sha256": sha256_file(target)})
+        state.update({
+            "phase": "ACTIVE" if generation_healthy else "ACTIVE_UNAVAILABLE",
+            "activated_at": observed,
+            "active_deployment_sha256": sha256_file(target),
+            "last_error": None if generation_healthy else "signed_week_unavailable",
+        })
         self._save(state)
         append_event(self.notification_path, build_event(
             source="v22-weekly-release-manager", strategy="grid+dca",
             bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
             pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT", mechanism="parameter_update",
-            transition="PARAMETER_ACTIVATED", reason="v22 新周 release 与授权已在周边界原子切换",
-            severity="info", action="atomic_deployment_pointer_switch",
+            transition=("MODEL_FOLD_ACTIVATED" if generation_healthy
+                        else "MODEL_CUTOVER_PRECHECK_FAILED"),
+            reason=("v22 已预热 release 在周边界自然进入新 fold"
+                    if generation_healthy else
+                    "周边界到达时当前 generation 无健康签名周，模型信号不可用并进入 Fail-Closed"),
+            severity="info" if generation_healthy else "critical",
+            action=("finalize_non_runtime_release_aliases" if generation_healthy
+                    else "signed_week_unavailable_fail_closed"),
             release_sha256=release_sha, model_sha256=receipt.get("model_sha256", ""),
             correlation_id=f"activated:{release_sha}",
             details={"activation_boundary": state["activation_boundary"],
+                     "runtime_generation": state.get("runtime_generation"),
+                     "fold_boundary": state["activation_boundary"],
                      "approval_mode": state["approval_mode"],
                      "active_deployment_sha256": state["active_deployment_sha256"]},
         ))
         return state
 
-    def _notify_blocked(self, state: Mapping[str, Any], checks: Mapping[str, bool]) -> None:
-        release_sha = str(state.get("candidate_release_sha256", ""))
+    def _monitor_warm_generation(self, state: dict[str, Any], observed: int) -> dict[str, Any]:
+        contract = load_json(
+            self.grid_state_path.parent / "ethbtc_forced_exit_observation.json", {},
+        ) or {}
+        healthy = bool(
+            contract.get("source_healthy") is True
+            and contract.get("runtime_generation") == state.get("runtime_generation")
+        )
+        if healthy:
+            state["warm_verified_cycles"] = int(state.get("warm_verified_cycles", 0)) + 1
+            state["warm_failures"] = 0
+        else:
+            state["warm_failures"] = int(state.get("warm_failures", 0)) + 1
+            state["last_error"] = (
+                "warm generation not observed healthy; signed predecessor remains active"
+            )
+        if observed >= int(state["activation_boundary"]):
+            return self._finalize_fold(
+                state, observed, generation_healthy=healthy,
+            )
+        if int(state.get("warm_failures", 0)) >= 3:
+            current_pointer = self.runtime_root / "current.json"
+            previous = state.get("previous_runtime_pointer")
+            if isinstance(previous, dict):
+                atomic_json(current_pointer, previous)
+            elif current_pointer.exists():
+                failed = self.runtime_root / (
+                    f"failed-{state.get('runtime_generation')}-{observed}.json"
+                )
+                os.replace(current_pointer, failed)
+            state.update({
+                "phase": "APPROVED_PENDING_PREWARM",
+                "prewarm_at": observed + 60,
+                "retry_after": observed + 60,
+            })
+            self._notify_blocked(state, {
+                "warm_generation_healthy": False,
+                "signed_predecessor_preserved": True,
+            })
+        self._save(state)
+        return state
+
+    def _prewarm(self, state: dict[str, Any], observed: int) -> dict[str, Any]:
+        producer = V22LiveGateProducer(
+            package_dir=self.release_root, cache_dir=self.candle_dir,
+            seed_cache_dir=self.candle_dir, state_dir=self.grid_state_path.parent,
+            authorization_path=self.authorization_path, refresh_binance=True,
+            runtime_root=self.runtime_root,
+        )
+        prepared = producer.prepare_generation(
+            release=Path(state["candidate_path"]),
+            authorization=Path(state["pending_authorization_path"]),
+            predecessor_release_sha256=str(state["source_release_sha256"]),
+            fold_boundary=int(state["activation_boundary"]), observed_at=observed,
+            live_contract_path=(
+                self.grid_state_path.parent / "ethbtc_forced_exit_observation.json"
+            ),
+            final_preflight_sha256=canonical_sha256(state.get("final_checks", {})),
+        )
+        pointer_path = self.work_root / f"runtime-pointer-{prepared['generation']}.json"
+        atomic_json(pointer_path, prepared["pointer"])
+        state.update({
+            "phase": "PREWARMED_PENDING_ACTIVATION",
+            "prewarmed_at": observed,
+            "runtime_generation": prepared["generation"],
+            "prepared_pointer_path": str(pointer_path),
+            "semantic_parity": prepared["manifest"].get("semantic_parity"),
+            "last_error": None,
+        })
+        self._save(state)
         append_event(self.notification_path, build_event(
             source="v22-weekly-release-manager", strategy="grid+dca",
             bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
             pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT", mechanism="parameter_update",
-            transition="MODEL_UPDATE_BLOCKED", reason="v22 自动审批硬门槛未全部通过，维持 Fail-Closed",
-            severity="critical", action="keep_fail_closed_and_require_review",
+            transition="MODEL_CUTOVER_PREWARMED",
+            reason="v22 候选已隔离预热并通过当前周语义一致性检查",
+            severity="info", action="wait_for_early_atomic_activation",
+            release_sha256=state["candidate_release_sha256"],
+            correlation_id=f"prewarmed:{prepared['generation']}",
+            details={"runtime_generation": prepared["generation"],
+                     "activate_at": state["activate_at"],
+                     "fold_boundary": state["activation_boundary"],
+                     "semantic_parity": state["semantic_parity"]},
+        ))
+        return state
+
+    def _notify_blocked(self, state: Mapping[str, Any], checks: Mapping[str, bool]) -> None:
+        release_sha = str(state.get("candidate_release_sha256", ""))
+        boundary_missed = checks.get("approved_before_fold_boundary") is False
+        reason = (
+            "v22 候选在周边界前仍不可用；当前签名周结束后必须 Fail-Closed"
+            if boundary_missed else
+            "v22 候选核验或预热未通过；当前已提交 generation 继续正常刷新，候选不会污染交易合同"
+        )
+        append_event(self.notification_path, build_event(
+            source="v22-weekly-release-manager", strategy="grid+dca",
+            bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
+            pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT", mechanism="parameter_update",
+            transition="MODEL_CUTOVER_PRECHECK_FAILED", reason=reason,
+            severity="critical" if boundary_missed else "warning",
+            action=("signed_week_unavailable_fail_closed" if boundary_missed
+                    else "preserve_current_generation_and_retry_candidate"),
             release_sha256=release_sha,
             correlation_id=f"blocked:{release_sha}:{canonical_sha256(checks)}",
             details={"checks": dict(checks), "default_approval_suppressed": True},
@@ -357,9 +521,16 @@ class WeeklyReleaseManager:
             self._notify_blocked(state, checks)
             return state
         mode = "manual_hermes" if manual else "automatic_default_after_12h"
-        activate_at = int(state["activation_boundary"])
-        if observed >= activate_at:
-            activate_at = ((observed + 119) // 60) * 60
+        boundary = int(state["activation_boundary"])
+        if observed >= boundary:
+            state.update({"phase": "AWAITING_APPROVAL", "retry_after": observed + 300,
+                          "last_error": "candidate approval missed the signed week boundary"})
+            self._save(state)
+            self._notify_blocked(state, {"approved_before_fold_boundary": False})
+            return state
+        preferred_activation = boundary - DEFAULT_ACTIVATION_LEAD_SECONDS
+        activate_at = max(preferred_activation, ((observed + 119) // 60) * 60)
+        prewarm_at = max(observed, activate_at - 5 * 60)
         production = self._production(release)
         evidence = {
             "schema": "ethbtc-forced-exit-12h-review-evidence-v1", "release_sha256": release_sha,
@@ -385,8 +556,11 @@ class WeeklyReleaseManager:
         }
         pending = self.work_root / f"pending-authorization-{release_sha}.json"
         atomic_json(pending, receipt)
-        state.update({"phase": "APPROVED_PENDING_ACTIVATION", "approved_at": observed,
+        state.update({"phase": "APPROVED_PENDING_PREWARM", "approved_at": observed,
                       "activate_at": activate_at, "approval_mode": mode,
+                      "prewarm_at": prewarm_at,
+                      "final_check_at": max(observed, boundary - 60 * 60),
+                      "final_check_complete": False,
                       "pending_authorization_path": str(pending),
                       "authorization_sha256": sha256_file(pending),
                       "last_error": None})
@@ -401,6 +575,8 @@ class WeeklyReleaseManager:
             release_sha256=release_sha, model_sha256=production["model_sha256"],
             correlation_id=f"approved:{release_sha}",
             details={"approval_mode": mode, "activate_at": activate_at,
+                     "final_check_at": state["final_check_at"],
+                     "prewarm_at": prewarm_at,
                      "effective_end": production["effective_end"], "checks": checks,
                      "authorization_sha256": state["authorization_sha256"]},
         ))
@@ -411,10 +587,79 @@ class WeeklyReleaseManager:
         if not self.policy.enabled:
             return {"phase": "DISABLED", "automatic_update": False}
         state = self._state()
-        if state.get("phase") == "APPROVED_PENDING_ACTIVATION":
+        if state.get("phase") == "APPROVED_PENDING_PREWARM":
+            boundary = int(state["activation_boundary"])
+            if observed >= boundary:
+                state.update({
+                    "phase": "SIGNED_WEEK_UNAVAILABLE",
+                    "last_error": "signed_week_unavailable: candidate missed pre-boundary commit",
+                })
+                self._save(state)
+                self._notify_blocked(state, {"approved_before_fold_boundary": False})
+                return state
+            if (
+                not state.get("final_check_complete")
+                and observed >= int(state.get("final_check_at", boundary - 60 * 60))
+            ):
+                release = Path(state["candidate_path"])
+                checks = {
+                    **self._candidate_checks(
+                        release, current_end=int(state["source_effective_end"]),
+                    ),
+                    **self._runtime_checks(release, observed),
+                }
+                if not all(checks.values()):
+                    state.update({
+                        "retry_after": observed + 60,
+                        "last_error": f"T-60m final checks failed: {checks}",
+                    })
+                    self._save(state)
+                    self._notify_blocked(state, {
+                        **checks, "live_generation_unchanged": True,
+                    })
+                    return state
+                state.update({
+                    "final_check_complete": True,
+                    "final_checked_at": observed,
+                    "final_checks": checks,
+                    "last_error": None,
+                })
+                self._save(state)
+            if observed < int(state["prewarm_at"]):
+                return state
+            if not state.get("final_check_complete"):
+                return state
+            try:
+                return self._prewarm(state, observed)
+            except Exception as exc:
+                state.update({
+                    "phase": "APPROVED_PENDING_PREWARM",
+                    "retry_after": observed + 60,
+                    "last_error": (
+                        "prewarm failed without live impact: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                })
+                self._save(state)
+                self._notify_blocked(state, {
+                    "candidate_prewarm": False,
+                    "live_generation_unchanged": True,
+                })
+                return state
+        if state.get("phase") == "PREWARMED_PENDING_ACTIVATION":
             if observed < int(state["activate_at"]):
                 return state
+            if observed >= int(state["activation_boundary"]):
+                state.update({
+                    "phase": "SIGNED_WEEK_UNAVAILABLE",
+                    "last_error": "signed_week_unavailable: runtime commit missed T-30m window",
+                })
+                self._save(state)
+                self._notify_blocked(state, {"approved_before_fold_boundary": False})
+                return state
             return self._activate(state, observed)
+        if state.get("phase") == "WARM_ACTIVE_PENDING_FOLD":
+            return self._monitor_warm_generation(state, observed)
         if state.get("phase") == "AWAITING_APPROVAL":
             decision = self._decision(str(state["candidate_release_sha256"]))
             if decision.get("decision") == "reject":
@@ -503,6 +748,7 @@ def main() -> int:
         authorization_path=Path(os.getenv("GRID_V22_AUTHORIZATION_PATH", "/workspace/state/ethbtc_forced_exit_authorization.json")),
         notification_path=Path(os.getenv("TELEGRAM_NOTIFICATION_EVENTS_PATH", "/workspace/state/telegram_events.jsonl")),
         grid_state_path=args.grid_state, dca_state_path=args.dca_state, policy=policy_from_environment(),
+        runtime_root=Path(os.getenv("V22_RUNTIME_ROOT", "/workspace/state/v22-runtime")),
     )
     print(json.dumps(manager.reconcile(), ensure_ascii=False, indent=2))
     return 0

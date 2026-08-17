@@ -119,6 +119,7 @@ def load_state(path: Path, expected: dict[str, Any], *,
     if mismatches and not metadata_only and not contiguous_rollover:
         raise ValueError("v22 state hash/manifest mismatch")
     if mismatches:
+        previous_effective_end = int(payload.get("manifest_effective_end", 0))
         previous_strategy = payload.get("strategy_schema_sha256")
         payload.update(expected)
         payload["rollover_from_lock_sha256"] = rollover_from_lock_sha256
@@ -130,6 +131,18 @@ def load_state(path: Path, expected: dict[str, Any], *,
         payload["rollover_strategy_changed"] = bool(
             previous_strategy != expected.get("strategy_schema_sha256")
         )
+        if contiguous_rollover:
+            # Do not let probability/arming evidence produced by the old
+            # release trigger Risk-Off immediately after a weekly cutover.
+            # Existing Risk-Off and recovery state remains continuous.
+            for pair_state in payload.get("pairs", {}).values():
+                gate = pair_state.get("gate_state", {})
+                if not bool(gate.get("active")):
+                    gate["above_entry_count"] = 0
+                    gate["armed_until"] = None
+                    gate["entry_evidence_not_before"] = previous_effective_end
+                    pair_state["gate_state"] = gate
+            payload["rollover_entry_evidence_reset_at"] = previous_effective_end
     return payload
 
 

@@ -33,7 +33,7 @@ producer 加载模型、行情和连续状态，发布有执行权的合同；Gr
 
 默认每周在旧周边界前13小时生成候选，随后进入12小时复核窗口。频道通知包含报告、截止时间和 Hermes 提示词；明确拒绝会终止候选，明确批准可提前完成审批，无操作时仅在所有硬门槛持续通过后默认批准。审批等待不修改当前 release 或 controller，不撤单、不成交，也不暂停当前模型交易。
 
-关键配置为 `V22_WEEKLY_AUTO_UPDATE_ENABLED=true`、`V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS=43200`、`V22_WEEKLY_GENERATION_LEAD_SECONDS=46800`、`V22_WEEKLY_MINIMUM_RUNWAY_SECONDS=86400`。授权绑定 release、模型哈希、复核请求、账户预检、审批方式和未来周边界；完整性、连续性、资金归属、紧急通道或过滤器任一失败时拒绝默认通过。
+关键配置为 `V22_WEEKLY_AUTO_UPDATE_ENABLED=true`、`V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS=43200`、`V22_WEEKLY_GENERATION_LEAD_SECONDS=57600`、`V22_WEEKLY_MINIMUM_RUNWAY_SECONDS=86400` 和 `V22_RUNTIME_ROOT=/workspace/state/v22-runtime`。候选在 `T-16h` 生成，保留 12 小时无人拒绝自动批准语义；随后在周边界前 35 分钟隔离预热、前 30 分钟原子提交 runtime generation，周边界不再切换实时文件。授权绑定 release、模型哈希、复核请求、账户预检、审批方式和未来周边界；完整性、连续性、资金归属、紧急通道或过滤器任一失败时拒绝默认通过。
 
 ## 原子切换
 

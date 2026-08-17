@@ -238,6 +238,9 @@ class Guard:
                     "/workspace/state/ethbtc_forced_exit_authorization.json",
                 )),
                 refresh_binance=True,
+                runtime_root=Path(os.getenv(
+                    "V22_RUNTIME_ROOT", "/workspace/state/v22-runtime",
+                )),
             )
             self.v22_producer.output = self.v22_observation_gate_path
         else:

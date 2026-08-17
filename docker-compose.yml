@@ -169,13 +169,14 @@ services:
       GRID_LIVE_GATE_RECONCILE_SECONDS: "5"
       V22_WEEKLY_AUTO_UPDATE_ENABLED: "${V22_WEEKLY_AUTO_UPDATE_ENABLED:-true}"
       V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS: "${V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS:-43200}"
-      V22_WEEKLY_GENERATION_LEAD_SECONDS: "${V22_WEEKLY_GENERATION_LEAD_SECONDS:-46800}"
+      V22_WEEKLY_GENERATION_LEAD_SECONDS: "${V22_WEEKLY_GENERATION_LEAD_SECONDS:-57600}"
       V22_WEEKLY_MINIMUM_RUNWAY_SECONDS: "${V22_WEEKLY_MINIMUM_RUNWAY_SECONDS:-86400}"
       V22_WEEKLY_AUTOMATION_INTERVAL_SECONDS: "60"
       V22_WEEKLY_XGB_THREADS: "2"
       ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
       V22_WEEKLY_WORK_PATH: /workspace/weekly
       V22_WEEKLY_CANDLE_PATH: /workspace/weekly/candles
+      V22_RUNTIME_ROOT: /workspace/state/v22-runtime
       DCA_LIVE_STATE_PATH: /workspace/dca-state
       GRID_V22_AUTHORIZATION_PATH: /workspace/state/ethbtc_forced_exit_authorization.json
       TELEGRAM_NOTIFICATION_EVENTS_PATH: /workspace/state/telegram_events.jsonl
@@ -255,6 +256,7 @@ services:
       GRID_V22_CANDLE_PATH: /workspace/technical-candles
       GRID_V22_SEED_CANDLE_PATH: /workspace/research-candles
       GRID_V22_AUTHORIZATION_PATH: /workspace/state/ethbtc_forced_exit_authorization.json
+      V22_RUNTIME_ROOT: /workspace/state/v22-runtime
       GRID_RISK_V22_WEEKLY_GATE_ENABLED: "${GRID_RISK_V22_WEEKLY_GATE_ENABLED:-true}"
       GRID_RISK_FOMC_GATE_ENABLED: "${GRID_RISK_FOMC_GATE_ENABLED:-true}"
       GRID_RISK_STRATEGY_LOSS_BREAKER_ENABLED: "${GRID_RISK_STRATEGY_LOSS_BREAKER_ENABLED:-true}"
@@ -278,7 +280,7 @@ services:
     depends_on:
       - hummingbot-api
     healthcheck:
-      test: ["CMD", "python", "-c", "import datetime,json,time; s=json.load(open('/workspace/state/guard_state.json')); o=json.load(open('/workspace/state/ethbtc_forced_exit_observation.json')); assert s.get('v22_in_guard') is True and o.get('package_id')=='ethbtc-forced-exit'; assert set(o.get('pairs',{}))=={'BTC-FDUSD','ETH-FDUSD'}; assert time.time()-s.get('last_success_at',0)<90; assert time.time()-datetime.datetime.fromisoformat(o['generated_at'].replace('Z','+00:00')).timestamp()<150; assert not s.get('v22_cutover_complete') or s.get('active_technical_producer')=='v22'"]
+      test: ["CMD", "python", "-c", "import datetime,json,os,time; s=json.load(open('/workspace/state/guard_state.json')); o=json.load(open('/workspace/state/ethbtc_forced_exit_observation.json')); r='/workspace/state/v22-runtime/current.json'; assert s.get('v22_in_guard') is True and o.get('package_id')=='ethbtc-forced-exit'; assert set(o.get('pairs',{}))=={'BTC-FDUSD','ETH-FDUSD'}; assert time.time()-s.get('last_success_at',0)<90; assert time.time()-datetime.datetime.fromisoformat(o['generated_at'].replace('Z','+00:00')).timestamp()<150; assert not os.path.isfile(r) or json.load(open(r))['runtime_generation']==o.get('runtime_generation') or o.get('cutover_phase')=='WARM_ROLLBACK_USING_SIGNED_PREDECESSOR'; assert not s.get('v22_cutover_complete') or s.get('active_technical_producer')=='v22'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -342,7 +344,7 @@ services:
     depends_on:
       - hummingbot-api
     healthcheck:
-      test: ["CMD", "python", "-c", "import datetime,json,time; s=json.load(open('/workspace/state/guard_state.json')); o=json.load(open('/workspace/technical/ethbtc_forced_exit_observation.json')); assert time.time()-s.get('last_success_at',0)<90; assert o.get('package_id')=='ethbtc-forced-exit' and set(o.get('pairs',{}))=={'BTC-FDUSD','ETH-FDUSD'}; assert time.time()-datetime.datetime.fromisoformat(o['generated_at'].replace('Z','+00:00')).timestamp()<150; assert s.get('roc_buy_guard',{}).get('active') is None"]
+      test: ["CMD", "python", "-c", "import datetime,json,os,time; s=json.load(open('/workspace/state/guard_state.json')); o=json.load(open('/workspace/technical/ethbtc_forced_exit_observation.json')); r='/workspace/technical/v22-runtime/current.json'; assert time.time()-s.get('last_success_at',0)<90; assert o.get('package_id')=='ethbtc-forced-exit' and set(o.get('pairs',{}))=={'BTC-FDUSD','ETH-FDUSD'}; assert time.time()-datetime.datetime.fromisoformat(o['generated_at'].replace('Z','+00:00')).timestamp()<150; assert not os.path.isfile(r) or json.load(open(r))['runtime_generation']==o.get('runtime_generation') or o.get('cutover_phase')=='WARM_ROLLBACK_USING_SIGNED_PREDECESSOR'; assert s.get('roc_buy_guard',{}).get('active') is None"]
       interval: 30s
       timeout: 5s
       retries: 3

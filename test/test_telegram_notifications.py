@@ -43,6 +43,18 @@ def event(**overrides):
     return build_event(**values)
 
 
+def test_model_cutover_lifecycle_events_are_channel_safe():
+    for transition in (
+        "MODEL_CUTOVER_PREWARMED", "MODEL_CUTOVER_STABLE",
+        "MODEL_CUTOVER_PRECHECK_FAILED", "MODEL_FOLD_ACTIVATED",
+    ):
+        value = event(
+            mechanism="parameter_update", transition=transition,
+            reason="candidate isolation status",
+        )
+        assert transition in format_event(value)
+
+
 def test_runtime_error_channel_alerts_once_then_reports_recovery(tmp_path):
     events = tmp_path / "events.jsonl"
     state = tmp_path / "runtime-errors.json"
@@ -355,7 +367,7 @@ def test_beijing_slot_only_sends_current_period_once():
         outbox.close()
 
 
-def test_mobile_card_is_one_robot_1440_by_2400_png():
+def test_mobile_card_is_one_robot_1440_by_3200_png_with_gate_table():
     with tempfile.TemporaryDirectory() as directory:
         output = Path(directory) / "grid_btc.png"
         render_mobile_profit_card({
@@ -367,10 +379,23 @@ def test_mobile_card_is_one_robot_1440_by_2400_png():
             "owned_base": "0.002", "fees_quote": 0, "buys": 3, "sells": 2,
             "phase": "ACTIVE", "v22_gate": "放行", "fomc_gate": "放行",
             "active_runtime": {"orders": 4},
+            "trading_status": {
+                "system_health": "HEALTHY", "trade_mode": "NORMAL",
+                "trading_normal": True, "phase": "ACTIVE",
+                "final_permissions": {"buy_enabled": True, "sell_enabled": True},
+                "runtime_generation": "a" * 64, "release_sha256": "b" * 64,
+                "model_week": 38, "cutover_phase": "ACTIVE",
+                "gate_statuses": [{
+                    "mechanism": "v22_weekly_buy_gate", "label": "v22周度BUY门",
+                    "enabled": True, "applicable": True, "health": "HEALTHY",
+                    "state": "RISK_ON", "buy_enabled": True, "sell_enabled": True,
+                    "reason": "long_risk_gate_clear",
+                }],
+            },
             "equity_series": [200, 203, 208], "drawdown_series": [0, 1, 0.95],
         }, output)
         with Image.open(output) as image:
-            assert image.size == (1440, 2400)
+            assert image.size == (1440, 3200)
             assert image.format == "PNG"
 
 

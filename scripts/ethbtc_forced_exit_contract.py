@@ -128,6 +128,19 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
         raw_pairs = payload.get("pairs")
         if not isinstance(raw_pairs, Mapping) or set(raw_pairs) != set(REQUIRED_PAIRS):
             raise ValueError("contract must contain exactly BTC-FDUSD and ETH-FDUSD")
+        runtime_generation = payload.get("runtime_generation")
+        if runtime_generation is not None:
+            if runtime_generation != "legacy" and not valid_sha256(runtime_generation):
+                raise ValueError("invalid runtime_generation")
+            predecessor = payload.get("predecessor_release_sha256")
+            if predecessor is not None and not valid_sha256(predecessor):
+                raise ValueError("invalid predecessor_release_sha256")
+            if not valid_sha256(payload.get("state_lineage_sha256")):
+                raise ValueError("invalid state_lineage_sha256")
+            if payload.get("system_health") not in {"HEALTHY", "FAILED"}:
+                raise ValueError("invalid system_health")
+            if payload.get("fold_boundary") is not None:
+                int(payload["fold_boundary"])
         pairs: dict[str, dict[str, Any]] = {}
         source_healthy = payload.get("source_healthy") is True
         if not source_healthy:
@@ -151,6 +164,8 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
                         or item.get("force_exit") is not True
                         or item.get("transition") != "fail_closed"):
                     raise ValueError(f"{pair} unhealthy contract is not fail-closed")
+                if runtime_generation is not None and item.get("model_signal") != "UNAVAILABLE":
+                    raise ValueError(f"{pair} unhealthy contract model signal is not unavailable")
                 pairs[pair] = item
             return {
                 **payload, "pairs": pairs, "runtime_gate_healthy": False,
@@ -183,6 +198,10 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
                 raise ValueError(f"{pair} effective BUY state mismatch")
             if bool(item.get("force_exit")) != bool(authorized and risk_off):
                 raise ValueError(f"{pair} force-exit state mismatch")
+            if runtime_generation is not None:
+                expected_signal = "RISK_OFF" if risk_off else "RISK_ON"
+                if item.get("model_signal") != expected_signal:
+                    raise ValueError(f"{pair} model signal mismatch")
             pairs[pair] = item
         return {
             **payload, "pairs": pairs,

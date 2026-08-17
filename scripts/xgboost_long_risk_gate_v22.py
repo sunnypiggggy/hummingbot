@@ -78,6 +78,11 @@ class GateState:
     previous_structure: tuple[float, float, float, float, float] | None = None
     last_signal_ts: int | None = None
     last_event_id: str | None = None
+    # A live release rollover may carry long-lived state while requiring all
+    # new Risk-Off entry evidence to come from the newly signed week.  The
+    # frozen/offline strategy leaves this unset, so historical semantics are
+    # unchanged.
+    entry_evidence_not_before: int | None = None
     probability_history: list[tuple[int, float]] = field(default_factory=list)
     structure_history: list[tuple[int, tuple[float, float, float, float, float]]] = field(default_factory=list)
 
@@ -297,11 +302,22 @@ def advance_gate(*, pair: str, probability: float, entry_threshold: float, signa
     if state.last_signal_ts is not None and signal_ts <= state.last_signal_ts:
         return state, snapshot(pair, probability, entry_threshold, state, "duplicate", False, False, state.previous_structure, config)
     current = _finite_structure(structure); state.probability_history.append((int(signal_ts), float(probability))); state.probability_history = state.probability_history[-48:]
-    state.above_entry_count = state.above_entry_count + 1 if probability >= entry_threshold else 0
-    if not state.active and state.above_entry_count >= config.entry_bars:
+    entry_eligible = (
+        state.entry_evidence_not_before is None
+        or signal_ts > int(state.entry_evidence_not_before)
+    )
+    state.above_entry_count = (
+        state.above_entry_count + 1
+        if entry_eligible and probability >= entry_threshold else 0
+    )
+    if not state.active and entry_eligible and state.above_entry_count >= config.entry_bars:
         armed = signal_ts + config.arm_hours * HOUR; state.armed_until = max(int(state.armed_until or armed), armed)
     new_4h = state.last_complete_4h_ts != int(last_complete_4h_ts)
-    entry_ok = new_4h and entry_confirm(current, state.previous_structure); recovery_ok = new_4h and recovery_confirm(current, state.previous_structure)
+    entry_structure_eligible = (
+        state.entry_evidence_not_before is None
+        or int(last_complete_4h_ts) > int(state.entry_evidence_not_before)
+    )
+    entry_ok = new_4h and entry_eligible and entry_structure_eligible and entry_confirm(current, state.previous_structure); recovery_ok = new_4h and recovery_confirm(current, state.previous_structure)
     transition = "hold" if state.active else "clear"; cooldown = int(state.cooldown_until or -1); armed_until = int(state.armed_until or -1)
     if not state.active and signal_ts >= cooldown and signal_ts <= armed_until and entry_ok:
         state.active = True; state.since = int(signal_ts); state.recovery_count = 0; transition = "enter"
@@ -339,7 +355,9 @@ def state_from_dict(value: Mapping[str, Any]) -> GateState:
     return GateState(active=bool(value.get("active",False)), since=value.get("since"), above_entry_count=int(value.get("above_entry_count",0)),
         armed_until=value.get("armed_until"), cooldown_until=value.get("cooldown_until"), recovery_count=int(value.get("recovery_count",0)),
         last_complete_4h_ts=value.get("last_complete_4h_ts"), previous_structure=_finite_structure(previous) if previous is not None else None,
-        last_signal_ts=value.get("last_signal_ts"), last_event_id=value.get("last_event_id"), probability_history=probabilities[-48:], structure_history=structures[-4:])
+        last_signal_ts=value.get("last_signal_ts"), last_event_id=value.get("last_event_id"),
+        entry_evidence_not_before=value.get("entry_evidence_not_before"),
+        probability_history=probabilities[-48:], structure_history=structures[-4:])
 
 
 def build_inference_panel(candles: Mapping[str, pd.DataFrame]) -> pd.DataFrame:

@@ -1601,11 +1601,18 @@ class Guard:
                 "source_pair": source_pair,
                 "buy_enabled": bool(source.get("buy_enabled")) if healthy else False,
                 "risk_off_active": bool(source.get("risk_off_active", True)),
+                "model_signal": (
+                    str(source.get("model_signal") or (
+                        "RISK_OFF" if source.get("risk_off_active", True) else "RISK_ON"
+                    )) if healthy else "UNAVAILABLE"
+                ),
                 "transition": source.get("transition", "fail_closed"),
                 "reason": source.get("reason", contract.get("reason", "v21_unhealthy")),
                 "event_id": source.get("event_id"),
                 "force_exit": bool(source.get("force_exit", False)),
                 "probability": source.get("probability"),
+                "model_week": source.get("model_week"),
+                "week_model_sha256": source.get("week_model_sha256"),
                 "execution_authorized": bool(contract.get("execution_authorized", False)),
             }
         return {"healthy": healthy, "reason": contract.get("reason"),
@@ -1614,6 +1621,12 @@ class Guard:
                 "model_sha256": contract.get("model_sha256"),
                 "execution_authorized": bool(contract.get("execution_authorized", False)),
                 "model_version": contract.get("model_version"),
+                "runtime_generation": contract.get("runtime_generation"),
+                "predecessor_release_sha256": contract.get("predecessor_release_sha256"),
+                "state_lineage_sha256": contract.get("state_lineage_sha256"),
+                "cutover_phase": contract.get("cutover_phase"),
+                "fold_boundary": contract.get("fold_boundary"),
+                "system_health": contract.get("system_health"),
                 "generated_at": contract.get("generated_at"), "pairs": mapped}
 
     def _integrity_failure_requires_latch(
@@ -1936,6 +1949,20 @@ class Guard:
                     controller_result = {"status": "failed"}
                     self._audit("aggregate_gate_update_failed", bot=bot_name,
                                 desired=aggregate["bots"][bot_name], error=controller_error)
+            actual_buy = controller_result.get("macro_buy_enabled")
+            actual_sell = controller_result.get("macro_sell_enabled")
+            controller_applied = bool(
+                risk_actions_enabled and not controller_error
+                and isinstance(actual_buy, bool) and isinstance(actual_sell, bool)
+                and actual_buy == buy_enabled and actual_sell == sell_enabled
+            )
+            aggregate["bots"][bot_name].update({
+                "controller_update_status": controller_result.get("status", "unknown"),
+                "controller_actual_buy_enabled": actual_buy,
+                "controller_actual_sell_enabled": actual_sell,
+                "controller_applied": controller_applied,
+                "controller_update_error": controller_error,
+            })
             common_transition_details = {
                 "effective_buy_enabled": buy_enabled,
                 "effective_sell_enabled": sell_enabled,

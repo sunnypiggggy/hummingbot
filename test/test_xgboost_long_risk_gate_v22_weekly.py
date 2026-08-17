@@ -71,6 +71,77 @@ def test_signed_contiguous_rollover_preserves_state_when_training_policy_hash_ch
     assert loaded["rollover_strategy_changed"] is True
 
 
+def test_risk_on_rollover_rebuilds_entry_evidence_after_new_fold_boundary(tmp_path: Path) -> None:
+    predecessor_lock = "a" * 64
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "schema": v22.STATE_SCHEMA, "model_version": v22.MODEL_VERSION,
+        "model_sha256": "b" * 64, "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "d" * 64,
+        "candidate_lock_sha256": predecessor_lock,
+        "training_data_sha256": "e" * 64, "manifest_effective_end": 100,
+        "pairs": {"BTC-FDUSD": {"gate_state": {
+            "active": False, "above_entry_count": 5, "armed_until": 999,
+        }}},
+    }), encoding="utf-8")
+    loaded = load_state(state_path, {
+        "model_sha256": "f" * 64, "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "1" * 64, "candidate_lock_sha256": "2" * 64,
+        "training_data_sha256": "3" * 64, "manifest_effective_end": 200,
+    }, rollover_from_lock_sha256=predecessor_lock)
+    gate = loaded["pairs"]["BTC-FDUSD"]["gate_state"]
+    assert gate["above_entry_count"] == 0
+    assert gate["armed_until"] is None
+    assert gate["entry_evidence_not_before"] == 100
+
+
+def test_new_fold_cannot_enter_on_boundary_or_old_4h_evidence() -> None:
+    state = v22.GateState(entry_evidence_not_before=100)
+    config = v22.GateConfig(
+        entry_quantile=0.9, entry_bars=1, arm_hours=48,
+        minimum_hours=1, cooldown_hours=1, recovery_4h_bars=1,
+    )
+    bearish = (-1.0, -1.0, -1.0, -1.0, 0.8)
+    state, at_boundary = v22.advance_gate(
+        pair="BTC-FDUSD", probability=1.0, entry_threshold=0.9,
+        signal_ts=100, last_complete_4h_ts=100, structure=bearish,
+        state=state, config=config,
+    )
+    assert at_boundary["transition"] == "clear"
+    assert state.above_entry_count == 0 and state.armed_until is None
+    state, after_boundary = v22.advance_gate(
+        pair="BTC-FDUSD", probability=1.0, entry_threshold=0.9,
+        signal_ts=101, last_complete_4h_ts=101, structure=bearish,
+        state=state, config=config,
+    )
+    assert after_boundary["transition"] == "enter"
+
+
+def test_existing_risk_off_rollover_preserves_recovery_state(tmp_path: Path) -> None:
+    predecessor_lock = "a" * 64
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "schema": v22.STATE_SCHEMA, "model_version": v22.MODEL_VERSION,
+        "model_sha256": "b" * 64, "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "d" * 64,
+        "candidate_lock_sha256": predecessor_lock,
+        "training_data_sha256": "e" * 64, "manifest_effective_end": 100,
+        "pairs": {"BTC-FDUSD": {"gate_state": {
+            "active": True, "since": 10, "recovery_count": 2,
+            "above_entry_count": 3, "armed_until": 999,
+        }}},
+    }), encoding="utf-8")
+    loaded = load_state(state_path, {
+        "model_sha256": "f" * 64, "feature_schema_sha256": "c" * 64,
+        "strategy_schema_sha256": "1" * 64, "candidate_lock_sha256": "2" * 64,
+        "training_data_sha256": "3" * 64, "manifest_effective_end": 200,
+    }, rollover_from_lock_sha256=predecessor_lock)
+    gate = loaded["pairs"]["BTC-FDUSD"]["gate_state"]
+    assert gate["active"] is True and gate["since"] == 10
+    assert gate["recovery_count"] == 2
+    assert "entry_evidence_not_before" not in gate
+
+
 def test_rollover_with_changed_strategy_still_requires_exact_predecessor(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({

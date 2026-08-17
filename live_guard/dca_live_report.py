@@ -38,6 +38,10 @@ try:
     from telegram_parameter_report import build_parameter_attachments
 except ModuleNotFoundError:
     from live_guard.telegram_parameter_report import build_parameter_attachments
+try:
+    from trading_status import evaluate_status, gate_row
+except ModuleNotFoundError:
+    from live_guard.trading_status import evaluate_status, gate_row
 
 try:
     from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE
@@ -885,8 +889,58 @@ class UnifiedTelegramReporting:
             "reason": row.get("dust_reason") or "below_exchange_minimum",
         }
 
+    def _inventory_row(self, asset: str) -> dict[str, Any]:
+        status = self._load(self.inventory_status_path)
+        row = status.get("assets", {}).get(asset, {})
+        deficit = Decimal(str(row.get("ownership_deficit") or "0")) > 0
+        healthy = bool(status.get("sources_healthy", status.get("healthy", False)))
+        return gate_row(
+            "inventory_ownership_gate", state="BLOCK" if deficit else "ALLOW",
+            buy_enabled=not deficit and healthy, sell_enabled=not deficit and healthy,
+            health="HEALTHY" if healthy and not deficit else "FAILED",
+            reason=("ownership_deficit" if deficit else
+                    row.get("confirmation_block_reason") or "ownership_reconciled"),
+            source="account_inventory_status",
+        )
+
+    @staticmethod
+    def _reported_cutover_phase(
+        cutover: Mapping[str, Any], contract: Mapping[str, Any], now: datetime,
+    ) -> str | None:
+        phase = str(cutover.get("phase") or "")
+        boundary = int(cutover.get("fold_boundary") or 0)
+        if (
+            cutover.get("schema") == "ethbtc-forced-exit-cutover-status-v1"
+            and phase == "PREWARMED_PENDING_ACTIVATION"
+            and now.timestamp() < boundary
+        ):
+            return "PREWARMING_CURRENT_MODEL_ACTIVE"
+        return contract.get("cutover_phase")
+
+    @staticmethod
+    def _breaker_rows(mechanisms: Mapping[str, Any], recovery: Mapping[str, Any]) -> list[dict[str, Any]]:
+        active_mechanism = str(recovery.get("mechanism") or "")
+        phase = str(recovery.get("phase") or "ACTIVE").upper()
+        rows = []
+        for mechanism in (
+            "strategy_loss_breaker", "strategy_drawdown_breaker",
+            "portfolio_loss_breaker", "portfolio_drawdown_breaker",
+            "position_protection",
+        ):
+            blocked = active_mechanism == mechanism and phase != "ACTIVE"
+            rows.append(gate_row(
+                mechanism, enabled=bool(mechanisms.get(mechanism, True)),
+                state=phase if blocked else "ALLOW",
+                buy_enabled=not blocked, sell_enabled=not blocked,
+                reason=str(recovery.get("reason") or active_mechanism) if blocked else "not_triggered",
+                source="risk_recovery",
+            ))
+        return rows
+
     def _dca_cards(self, report: Mapping[str, Any], now: datetime) -> list[dict[str, Any]]:
         guard = self._load(self.dca_state / "guard_state.json")
+        inventory_status = self._load(self.inventory_status_path)
+        cutover = self._load(self.grid_state / "v22_cutover_status.json")
         output = []
         for bot in report.get("bots", []):
             pair = str(bot["trading_pair"])
@@ -894,6 +948,10 @@ class UnifiedTelegramReporting:
             recovery = state.get("recovery", {})
             executor_counts = state.get("latest", {}).get("executor_counts", {})
             aggregate = guard.get("gate_aggregate", {}).get("bots", {}).get(bot["bot_name"], {})
+            v22_contract = guard.get("gate_aggregate", {}).get("v22", {})
+            macro_contract = guard.get("gate_aggregate", {}).get("macro", {})
+            capital = guard.get("gate_aggregate", {}).get("capital", {})
+            technical_row = v22_contract.get("pairs", {}).get(pair, {})
             all_time = bot.get("profit", {}).get("all_time_mtm_quote")
             initial_equity = float(STRATEGY_BUDGET_QUOTE)
             equity = None if all_time is None else initial_equity + float(all_time)
@@ -920,6 +978,89 @@ class UnifiedTelegramReporting:
                 warnings.append(f"{pair}: Binance行情过期或缺失")
             if data_age > MAX_DATA_AGE_SECONDS:
                 warnings.append(f"{pair}: 数据年龄{data_age:.0f}秒")
+            runtime_robot = inventory_status.get("runtime", {}).get("robots", {}).get(
+                bot["bot_name"], {}
+            )
+            process_running = bool(runtime_robot.get("running", False))
+            data_healthy = bool(
+                bot.get("database_available") and bot.get("market_data_healthy")
+                and data_age <= MAX_DATA_AGE_SECONDS
+            )
+            v22_healthy = bool(v22_contract.get("healthy"))
+            macro_healthy = bool(macro_contract.get("healthy"))
+            infra_healthy = bool(
+                data_healthy and v22_healthy and macro_healthy
+                and not guard.get("last_monitor_error")
+            )
+            mechanisms = guard.get("mechanisms", {})
+            phase = str(recovery.get("phase", "ACTIVE"))
+            gates = [
+                gate_row(
+                    "v22_weekly_buy_gate",
+                    enabled=bool(mechanisms.get("v22_weekly_buy_gate", True)),
+                    state=("UNAVAILABLE" if not v22_healthy else str(
+                        technical_row.get("model_signal") or (
+                            "RISK_ON" if aggregate.get("v22_buy_enabled") else "RISK_OFF"
+                        )
+                    )),
+                    buy_enabled=(aggregate.get("v22_buy_enabled") if v22_healthy else False),
+                    sell_enabled=True,
+                    health="HEALTHY" if v22_healthy else "FAILED",
+                    reason=str(technical_row.get("reason") or v22_contract.get("reason") or "unknown"),
+                    source="shared_v22_contract",
+                ),
+                gate_row(
+                    "fomc_gate", enabled=bool(mechanisms.get("fomc_gate", True)),
+                    state="ALLOW" if macro_healthy and macro_contract.get("buy_enabled")
+                    and macro_contract.get("sell_enabled") else "BLOCK",
+                    buy_enabled=bool(macro_contract.get("buy_enabled")) if macro_healthy else False,
+                    sell_enabled=bool(macro_contract.get("sell_enabled")) if macro_healthy else False,
+                    health="HEALTHY" if macro_healthy else "FAILED",
+                    reason=str(macro_contract.get("reason") or "unknown"), source="macro_contract",
+                ),
+                *self._breaker_rows(mechanisms, recovery),
+                gate_row(
+                    "infrastructure_integrity_breaker",
+                    state="ALLOW" if infra_healthy else "BLOCK",
+                    buy_enabled=infra_healthy, sell_enabled=infra_healthy,
+                    health="HEALTHY" if infra_healthy else "FAILED",
+                    reason="all_sources_fresh" if infra_healthy else str(
+                        guard.get("last_monitor_error") or v22_contract.get("reason")
+                        or macro_contract.get("reason") or "data_unhealthy"
+                    ), source="dca_guard",
+                ),
+                gate_row(
+                    "capital_budget_gate", state="ALLOW" if capital.get("buy_ready") else "BLOCK",
+                    buy_enabled=bool(capital.get("buy_ready")), sell_enabled=True,
+                    health="HEALTHY" if capital.get("healthy") else "DEGRADED",
+                    reason=str(capital.get("reason") or "unknown"), source="quote_budget",
+                ),
+                self._inventory_row(pair.split("-", 1)[0]),
+                gate_row(
+                    "recovery_phase_gate", state=phase,
+                    buy_enabled=phase == "ACTIVE", sell_enabled=phase == "ACTIVE",
+                    reason=str(recovery.get("reason") or phase), source="risk_recovery",
+                ),
+                gate_row(
+                    "controller_application_gate",
+                    state="APPLIED" if aggregate.get("controller_applied") else "MISMATCH",
+                    buy_enabled=bool(aggregate.get("controller_applied")),
+                    sell_enabled=bool(aggregate.get("controller_applied")),
+                    health="HEALTHY" if aggregate.get("controller_applied") else "FAILED",
+                    reason=str(aggregate.get("controller_update_error") or
+                               aggregate.get("controller_update_status") or "unknown"),
+                    source="dca_controller",
+                ),
+            ]
+            trading_status = evaluate_status(
+                process_running=process_running, phase=phase, gates=gates,
+                generated_at=now.astimezone(SHANGHAI).isoformat(), strategy="dca",
+                bot=bot["bot_name"], pair=pair,
+                runtime_generation=v22_contract.get("runtime_generation"),
+                release_sha256=v22_contract.get("release_sha256"),
+                model_week=technical_row.get("model_week"),
+                cutover_phase=self._reported_cutover_phase(cutover, v22_contract, now),
+            )
             item = {
                 "strategy": "dca", "bot": bot["bot_name"], "pair": pair,
                 "quote_asset": "USDT", "generated_at_bjt": now.astimezone(SHANGHAI).isoformat(),
@@ -932,7 +1073,7 @@ class UnifiedTelegramReporting:
                 "fees_quote": bot.get("profit", {}).get("all_time_fees_quote"),
                 "buys": bot.get("trades", {}).get("all_time_buys"),
                 "sells": bot.get("trades", {}).get("all_time_sells"),
-                "phase": recovery.get("phase", "ACTIVE"),
+                "phase": phase,
                 "active_runtime": {
                     "orders": executor_counts.get("open_orders"),
                     "buy_executors": executor_counts.get("active_buy_executors"),
@@ -950,6 +1091,7 @@ class UnifiedTelegramReporting:
                 ),
                 "warnings": warnings,
                 "unattributed_dust": dust,
+                "trading_status": trading_status,
             }
             output.append(item)
         return output
@@ -978,12 +1120,14 @@ class UnifiedTelegramReporting:
         bot = state.get("bots", {}).get(bot_name, {})
         latest = bot.get("latest", {})
         gate = state.get("xgboost_risk_gate", {})
+        cutover = self._load(self.grid_state / "v22_cutover_status.json")
         output = []
         runtime_candidates = sorted(
             self.bots_path.glob(f"instances/{bot_name}*/data/live_grid_runtime_state.json"),
             key=lambda path: path.stat().st_mtime, reverse=True,
         )
         runtime = self._load(runtime_candidates[0]) if runtime_candidates else {}
+        inventory_status = self._load(self.inventory_status_path)
         grid_open_orders = sum(
             len(value.get("open_order_ids", []))
             for value in runtime.get("ledgers", {}).values()
@@ -1007,6 +1151,98 @@ class UnifiedTelegramReporting:
                 )
             if data_age is not None and data_age > MAX_DATA_AGE_SECONDS:
                 warnings.append(f"{pair}: Grid快照年龄{data_age:.0f}秒")
+            pair_recovery = runtime.get("pair_recovery", {}).get(pair, {})
+            portfolio_recovery = runtime.get("portfolio_recovery", {})
+            recovery = (
+                portfolio_recovery
+                if str(portfolio_recovery.get("phase", "ACTIVE")) != "ACTIVE"
+                else pair_recovery
+            )
+            phase = str(recovery.get("phase") or "ACTIVE")
+            mechanisms = state.get("mechanisms", {})
+            technical_contract = gate.get("pairs", {}).get(pair, {})
+            runtime_technical = runtime.get("technical_buy_gate", {}).get(
+                "pairs", {}
+            ).get(pair, {})
+            runtime_macro = runtime.get("macro_gate", {})
+            v22_healthy = bool(
+                gate.get("source_healthy") and runtime_technical.get("healthy", True)
+            )
+            macro_healthy = bool(runtime_macro.get("healthy", not macro.get("pause_new_orders")))
+            process_running = bool(runtime and data_age is not None and data_age <= 90)
+            data_healthy = bool(data_age is not None and data_age <= MAX_DATA_AGE_SECONDS)
+            infra_healthy = bool(
+                process_running and data_healthy and v22_healthy and macro_healthy
+                and not state.get("last_monitor_error")
+            )
+            v22_buy = bool(runtime_technical.get(
+                "buy_enabled", technical_contract.get("buy_enabled", False)
+            )) if v22_healthy else False
+            macro_allow = bool(not runtime_macro.get(
+                "paused", macro.get("pause_new_orders", False)
+            )) if macro_healthy else False
+            controller_applied = bool(
+                runtime_technical
+                and v22_buy == bool(technical_contract.get("buy_enabled"))
+                and macro_allow == (not bool(macro.get("pause_new_orders")))
+            )
+            gates = [
+                gate_row(
+                    "v22_weekly_buy_gate",
+                    enabled=bool(mechanisms.get("v22_weekly_buy_gate", True)),
+                    state=("UNAVAILABLE" if not v22_healthy else str(
+                        technical_contract.get("model_signal") or (
+                            "RISK_OFF" if technical_contract.get("risk_off_active") else
+                            "RISK_ON"
+                        )
+                    )),
+                    buy_enabled=v22_buy, sell_enabled=True,
+                    health="HEALTHY" if v22_healthy else "FAILED",
+                    reason=str(technical_contract.get("reason") or gate.get("reason") or "unknown"),
+                    source="shared_v22_contract",
+                ),
+                gate_row(
+                    "fomc_gate", enabled=bool(mechanisms.get("fomc_gate", True)),
+                    state="ALLOW" if macro_allow else "BLOCK",
+                    buy_enabled=macro_allow, sell_enabled=macro_allow,
+                    health="HEALTHY" if macro_healthy else "FAILED",
+                    reason=str(runtime_macro.get("reason") or "macro_gate"), source="grid_runtime",
+                ),
+                *self._breaker_rows(mechanisms, recovery),
+                gate_row(
+                    "infrastructure_integrity_breaker",
+                    state="ALLOW" if infra_healthy else "BLOCK",
+                    buy_enabled=infra_healthy, sell_enabled=infra_healthy,
+                    health="HEALTHY" if infra_healthy else "FAILED",
+                    reason="all_sources_fresh" if infra_healthy else str(
+                        state.get("last_monitor_error") or gate.get("reason") or "runtime_unhealthy"
+                    ), source="grid_guard",
+                ),
+                gate_row("capital_budget_gate", applicable=False, reason="not_applicable_to_grid"),
+                self._inventory_row(pair.split("-", 1)[0]),
+                gate_row(
+                    "recovery_phase_gate", state=phase,
+                    buy_enabled=phase == "ACTIVE", sell_enabled=phase == "ACTIVE",
+                    reason=str(recovery.get("reason") or phase), source="grid_runtime",
+                ),
+                gate_row(
+                    "controller_application_gate",
+                    state="APPLIED" if controller_applied else "MISMATCH",
+                    buy_enabled=controller_applied, sell_enabled=controller_applied,
+                    health="HEALTHY" if controller_applied else "FAILED",
+                    reason="runtime_consumed_current_gates" if controller_applied
+                    else "runtime_gate_state_mismatch", source="grid_runtime",
+                ),
+            ]
+            trading_status = evaluate_status(
+                process_running=process_running, phase=phase, gates=gates,
+                generated_at=now.astimezone(SHANGHAI).isoformat(), strategy="grid",
+                bot=bot_name, pair=pair,
+                runtime_generation=gate.get("runtime_generation"),
+                release_sha256=gate.get("release_sha256"),
+                model_week=technical_contract.get("model_week"),
+                cutover_phase=self._reported_cutover_phase(cutover, gate, now),
+            )
             item = {
                 "strategy": "grid", "bot": bot_name, "pair": pair,
                 "quote_asset": "FDUSD", "generated_at_bjt": now.astimezone(SHANGHAI).isoformat(),
@@ -1017,14 +1253,17 @@ class UnifiedTelegramReporting:
                 "peak_equity": peak, "drawdown_pct": drawdown,
                 "owned_base": values.get("net_base"), "fees_quote": fees,
                 "buys": buys, "sells": sells,
-                "phase": runtime.get("pair_recovery", {}).get(pair, {}).get(
-                    "phase", runtime.get("portfolio_recovery", {}).get("phase", "ACTIVE")
-                ),
+                "phase": phase,
                 "active_runtime": {"orders": grid_open_orders},
-                "v22_gate": "Risk-Off" if gate.get("pairs", {}).get(pair, {}).get("risk_off_active") else "Risk-On",
+                "v22_gate": (
+                    "不可用" if not v22_healthy else
+                    "Risk-Off" if gate.get("pairs", {}).get(pair, {}).get("risk_off_active")
+                    else "Risk-On"
+                ),
                 "fomc_gate": "暂停" if macro.get("pause_new_orders") else "放行",
                 "warnings": warnings,
                 "unattributed_dust": dust,
+                "trading_status": trading_status,
             }
             output.append(item)
         return output
@@ -1042,6 +1281,16 @@ class UnifiedTelegramReporting:
                         None if current is None else float(current),
                     )
             self.outbox.record_profit(item, observed_at=now.timestamp())
+        status_contract = {
+            "schema": "grid-dca-trading-status-collection-v1",
+            "generated_at": now.astimezone(timezone.utc).isoformat(),
+            "robots": [item["trading_status"] for item in robots],
+        }
+        temporary = self.output / ".trading_status.json.tmp"
+        temporary.write_text(
+            json.dumps(status_contract, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        os.replace(temporary, self.output / "trading_status.json")
         return robots
 
     def _queue_profit_report(self, robots: list[dict[str, Any]], slot: str,
