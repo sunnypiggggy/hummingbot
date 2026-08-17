@@ -372,6 +372,18 @@ class WeeklyReleaseManager:
         atomic_json(target, pointer)
         self._switch_current(release_sha)
         atomic_json(self.authorization_path, receipt)
+        runtime_pointer = load_json(self.runtime_root / "current.json", {}) or {}
+        if runtime_pointer.get("runtime_generation") == state.get("runtime_generation"):
+            runtime_pointer["cutover_phase"] = (
+                "ACTIVE" if generation_healthy else "ACTIVE_UNAVAILABLE"
+            )
+            producer = V22LiveGateProducer(
+                package_dir=self.release_root, cache_dir=self.candle_dir,
+                seed_cache_dir=self.candle_dir, state_dir=self.grid_state_path.parent,
+                authorization_path=self.authorization_path, refresh_binance=False,
+                runtime_root=self.runtime_root,
+            )
+            producer.commit_generation(runtime_pointer)
         state.update({
             "phase": "ACTIVE" if generation_healthy else "ACTIVE_UNAVAILABLE",
             "activated_at": observed,
@@ -417,6 +429,13 @@ class WeeklyReleaseManager:
             state["last_error"] = (
                 "warm generation not observed healthy; signed predecessor remains active"
             )
+        if state.get("late_signed_week_recovery"):
+            if healthy and int(state.get("warm_verified_cycles", 0)) >= 3:
+                return self._finalize_fold(
+                    state, observed, generation_healthy=True,
+                )
+            self._save(state)
+            return state
         if observed >= int(state["activation_boundary"]):
             return self._finalize_fold(
                 state, observed, generation_healthy=healthy,
@@ -673,7 +692,7 @@ class WeeklyReleaseManager:
                 self._notify_blocked(state, {"approved_before_fold_boundary": False})
                 return state
             return self._activate(state, observed)
-        if state.get("phase") == "WARM_ACTIVE_PENDING_FOLD":
+        if state.get("phase") in {"WARM_ACTIVE_PENDING_FOLD", "ACTIVE_UNAVAILABLE"}:
             return self._monitor_warm_generation(state, observed)
         if state.get("phase") == "AWAITING_APPROVAL":
             decision = self._decision(str(state["candidate_release_sha256"]))

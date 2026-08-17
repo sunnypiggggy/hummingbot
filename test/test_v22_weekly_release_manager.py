@@ -115,6 +115,33 @@ def test_three_warm_failures_restore_signed_predecessor_before_boundary(tmp_path
     assert restored == old_pointer
 
 
+def test_late_recovery_waits_for_three_healthy_producer_cycles(tmp_path: Path):
+    boundary = 2_000_000_000
+    value = manager(tmp_path, boundary + 100, boundary)
+    generation = "d" * 64
+    observation = value.grid_state_path.parent / "ethbtc_forced_exit_observation.json"
+    atomic_json(observation, {
+        "source_healthy": True, "runtime_generation": generation,
+    })
+    state = {
+        "phase": "ACTIVE_UNAVAILABLE",
+        "candidate_release_sha256": "c" * 64,
+        "runtime_generation": generation,
+        "activation_boundary": boundary,
+        "late_signed_week_recovery": True,
+        "warm_verified_cycles": 0,
+        "warm_failures": 1,
+    }
+    with patch.object(value, "_finalize_fold", return_value={"phase": "ACTIVE"}) as finalize:
+        first = value._monitor_warm_generation(state, boundary + 100)
+        second = value._monitor_warm_generation(first, boundary + 101)
+        third = value._monitor_warm_generation(second, boundary + 102)
+    assert first["phase"] == "ACTIVE_UNAVAILABLE"
+    assert second["phase"] == "ACTIVE_UNAVAILABLE"
+    assert third == {"phase": "ACTIVE"}
+    finalize.assert_called_once()
+
+
 def test_t_minus_60m_rechecks_all_hard_gates_before_prewarm(tmp_path: Path):
     boundary = 2_000_000_000
     value = manager(tmp_path, boundary - 3_600, boundary)
