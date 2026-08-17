@@ -17,6 +17,7 @@ from live_guard.telegram_notifications import (
     TelegramOutbox,
     append_event,
     build_event,
+    dust_usdt_display,
     explain_event,
     format_event,
     hermes_recovery_prompt,
@@ -397,6 +398,16 @@ def test_mobile_card_is_one_robot_1440_by_3200_png_with_gate_table():
         with Image.open(output) as image:
             assert image.size == (1440, 3200)
             assert image.format == "PNG"
+
+
+def test_mobile_card_dust_text_only_contains_usdt_valuation():
+    value = dust_usdt_display({
+        "quantity": "0.002160779092935063",
+        "estimated_notional": "3.983318",
+    })
+    assert value == "约 3.9833 USDT"
+    assert "ETH" not in value
+    assert "0.002160" not in value
 
 
 def test_grid_parameter_report_marks_missing_evidence_without_fake_png():

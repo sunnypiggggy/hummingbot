@@ -12,6 +12,8 @@ from live_guard.dca_live_report import (
     CHART_SIZE,
     DcaLiveReportCollector,
     calculate_pair_report,
+    dca_report_infrastructure_status,
+    dust_usdt_text,
     healthcheck,
     render_chart,
 )
@@ -23,6 +25,51 @@ from macro_control.trading_report import (
 
 NOW = datetime(2026, 7, 25, 6, 0, tzinfo=timezone.utc)
 SCALE = Decimal("1000000")
+
+
+def test_quiet_sqlite_does_not_create_false_dca_integrity_failure():
+    healthy, reason = dca_report_infrastructure_status(
+        bot={
+            "database_available": True,
+            "database_age_seconds": 7_643,
+            "market_data_healthy": True,
+            "market_data_age_seconds": 26,
+        },
+        guard={"last_success_at": 995},
+        inventory_status={"sources_healthy": True, "healthy": False},
+        v22_contract={"healthy": True, "reason": "v22_live_healthy"},
+        macro_contract={"healthy": True, "reason": "macro_state_healthy"},
+        now_ts=1_000,
+    )
+    assert healthy is True
+    assert reason == "all_sources_fresh"
+
+
+def test_dca_integrity_failure_reports_the_actual_stale_source():
+    healthy, reason = dca_report_infrastructure_status(
+        bot={
+            "database_available": True,
+            "database_age_seconds": 1,
+            "market_data_healthy": False,
+            "market_data_age_seconds": 901,
+        },
+        guard={"last_success_at": 995},
+        inventory_status={"sources_healthy": True},
+        v22_contract={"healthy": True, "reason": "v22_live_healthy"},
+        macro_contract={"healthy": True},
+        now_ts=1_000,
+    )
+    assert healthy is False
+    assert reason == "market_data_stale_or_missing"
+
+
+def test_dust_report_text_only_contains_usdt_value():
+    value = dust_usdt_text({
+        "quantity": "0.002160779092935063",
+        "estimated_notional": "3.983318",
+    })
+    assert value == "共享账户 Dust：约 3.9833 USDT"
+    assert "0.002160" not in value
 
 
 def raw(value):

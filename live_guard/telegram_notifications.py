@@ -977,6 +977,14 @@ def _number(value: Any, suffix: str = "") -> str:
         return f"{value}{suffix}"
 
 
+def dust_usdt_display(dust: Mapping[str, Any]) -> str:
+    """Format mobile-card dust exclusively in quote-value terms."""
+    try:
+        return f"约 {float(dust.get('estimated_notional')):.4f} USDT"
+    except (TypeError, ValueError):
+        return "无可信美元估值"
+
+
 def _runtime_summary(value: Any) -> str:
     if not isinstance(value, Mapping) or not value:
         return "无可信数据"
@@ -1091,11 +1099,9 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     ]
     dust = report.get("unattributed_dust")
     if isinstance(dust, Mapping):
-        base_asset = str(report.get("pair", "")).split("-", 1)[0]
         metrics.append((
             "共享账户 Dust",
-            f"{dust.get('quantity', '-')} {base_asset} / "
-            f"约 {dust.get('estimated_notional', '-')} USDT",
+            dust_usdt_display(dust),
         ))
     top = 790
     draw.rounded_rectangle((70, top, 1370, top + 390), radius=18,

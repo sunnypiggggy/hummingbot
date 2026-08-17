@@ -54,6 +54,7 @@ SCALE = Decimal("1000000")
 WINDOW_DAYS = 7
 MAX_PUBLIC_FILLS = 2_000
 MAX_DATA_AGE_SECONDS = 900
+MAX_GUARD_STATUS_AGE_SECONDS = 90
 CHART_SIZE = (1280, 1000)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -77,6 +78,54 @@ def timestamp_seconds(value: Any) -> float:
     while timestamp > 10_000_000_000:
         timestamp /= 1000
     return timestamp
+
+
+def dust_usdt_text(dust: Mapping[str, Any]) -> str:
+    """Return a display-only dust value without exposing base-asset quantity."""
+    try:
+        value = float(dust.get("estimated_notional"))
+    except (TypeError, ValueError):
+        return "共享账户 Dust：无可信美元估值"
+    return f"共享账户 Dust：约 {value:.4f} USDT"
+
+
+def dca_report_infrastructure_status(
+    *, bot: Mapping[str, Any], guard: Mapping[str, Any],
+    inventory_status: Mapping[str, Any], v22_contract: Mapping[str, Any],
+    macro_contract: Mapping[str, Any], now_ts: float,
+) -> tuple[bool, str]:
+    """Evaluate source health without treating a quiet trade DB as stale.
+
+    A DCA SQLite file may not be written for hours when orders do not fill. Its
+    mtime remains report metadata, while Guard observations provide runtime
+    liveness and market candles provide valuation freshness.
+    """
+    monitor_error = str(guard.get("last_monitor_error") or "").strip()
+    if monitor_error:
+        return False, monitor_error
+    if not bot.get("database_available"):
+        return False, "sqlite_unavailable"
+    if not bot.get("market_data_healthy"):
+        return False, "market_data_stale_or_missing"
+    try:
+        market_age = float(bot.get("market_data_age_seconds"))
+    except (TypeError, ValueError):
+        return False, "market_data_age_unavailable"
+    if market_age > MAX_DATA_AGE_SECONDS:
+        return False, "market_data_stale"
+    try:
+        guard_age = max(0.0, now_ts - float(guard.get("last_success_at")))
+    except (TypeError, ValueError):
+        return False, "guard_observation_unavailable"
+    if guard_age > MAX_GUARD_STATUS_AGE_SECONDS:
+        return False, "guard_observation_stale"
+    if inventory_status.get("sources_healthy") is not True:
+        return False, "inventory_sources_unhealthy"
+    if not v22_contract.get("healthy"):
+        return False, str(v22_contract.get("reason") or "v22_contract_unhealthy")
+    if not macro_contract.get("healthy"):
+        return False, str(macro_contract.get("reason") or "macro_contract_unhealthy")
+    return True, "all_sources_fresh"
 
 
 def decimal_value(value: Any) -> Decimal:
@@ -964,33 +1013,30 @@ class UnifiedTelegramReporting:
                        equity or historic_peak)
             drawdown = None if equity is None or peak <= 0 else (peak - equity) / peak * 100
             technical = guard.get("v22_observation", {}).get("event_ids", {}).get(pair, "")
-            data_age = max(bot.get("market_data_age_seconds") or 0,
-                           bot.get("database_age_seconds") or 0)
+            # A quiet strategy can legitimately have no SQLite writes for
+            # hours. The visible age and valuation gate therefore use market
+            # freshness, not the age of the last persisted trade.
+            data_age = bot.get("market_data_age_seconds")
             warnings = list(report.get("warnings", []))
             dust = self._inventory_dust(pair.split("-", 1)[0])
             if dust:
-                warnings.append(
-                    f"共享账户 Dust {dust.get('quantity')} {pair.split('-', 1)[0]}"
-                )
+                warnings.append(dust_usdt_text(dust))
             if not bot.get("database_available"):
                 warnings.append(f"{bot['bot_name']}: SQLite无可信数据")
             if not bot.get("market_data_healthy"):
                 warnings.append(f"{pair}: Binance行情过期或缺失")
-            if data_age > MAX_DATA_AGE_SECONDS:
+            if data_age is not None and data_age > MAX_DATA_AGE_SECONDS:
                 warnings.append(f"{pair}: 数据年龄{data_age:.0f}秒")
             runtime_robot = inventory_status.get("runtime", {}).get("robots", {}).get(
                 bot["bot_name"], {}
             )
             process_running = bool(runtime_robot.get("running", False))
-            data_healthy = bool(
-                bot.get("database_available") and bot.get("market_data_healthy")
-                and data_age <= MAX_DATA_AGE_SECONDS
-            )
             v22_healthy = bool(v22_contract.get("healthy"))
             macro_healthy = bool(macro_contract.get("healthy"))
-            infra_healthy = bool(
-                data_healthy and v22_healthy and macro_healthy
-                and not guard.get("last_monitor_error")
+            infra_healthy, infra_reason = dca_report_infrastructure_status(
+                bot=bot, guard=guard, inventory_status=inventory_status,
+                v22_contract=v22_contract, macro_contract=macro_contract,
+                now_ts=now.timestamp(),
             )
             mechanisms = guard.get("mechanisms", {})
             phase = str(recovery.get("phase", "ACTIVE"))
@@ -1024,10 +1070,7 @@ class UnifiedTelegramReporting:
                     state="ALLOW" if infra_healthy else "BLOCK",
                     buy_enabled=infra_healthy, sell_enabled=infra_healthy,
                     health="HEALTHY" if infra_healthy else "FAILED",
-                    reason="all_sources_fresh" if infra_healthy else str(
-                        guard.get("last_monitor_error") or v22_contract.get("reason")
-                        or macro_contract.get("reason") or "data_unhealthy"
-                    ), source="dca_guard",
+                    reason=infra_reason, source="dca_guard",
                 ),
                 gate_row(
                     "capital_budget_gate", state="ALLOW" if capital.get("buy_ready") else "BLOCK",
@@ -1146,9 +1189,7 @@ class UnifiedTelegramReporting:
             warnings = [] if latest else ["Grid Guard快照无可信数据"]
             dust = self._inventory_dust(pair.split("-", 1)[0])
             if dust:
-                warnings.append(
-                    f"共享账户 Dust {dust.get('quantity')} {pair.split('-', 1)[0]}"
-                )
+                warnings.append(dust_usdt_text(dust))
             if data_age is not None and data_age > MAX_DATA_AGE_SECONDS:
                 warnings.append(f"{pair}: Grid快照年龄{data_age:.0f}秒")
             pair_recovery = runtime.get("pair_recovery", {}).get(pair, {})
