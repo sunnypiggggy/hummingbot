@@ -985,6 +985,92 @@ def dust_usdt_display(dust: Mapping[str, Any]) -> str:
         return "无可信美元估值"
 
 
+SYSTEM_HEALTH_DISPLAY = {
+    "HEALTHY": "健康",
+    "DEGRADED": "部分降级",
+    "FAILED": "故障",
+    "UNKNOWN": "未知",
+}
+TRADE_MODE_DISPLAY = {
+    "NORMAL": "正常交易",
+    "BUY_BLOCKED": "仅买入受限",
+    "BOTH_BLOCKED": "买卖均受限",
+    "EXITING": "清仓中，暂停交易",
+    "COOLDOWN": "冷却中，暂停交易",
+    "REENTRY": "等待重入，暂停交易",
+    "LATCHED": "已锁存，暂停交易",
+    "STOPPED": "机器人已停止",
+    "UNKNOWN": "交易状态未知",
+}
+PHASE_DISPLAY = {
+    "ACTIVE": "正常交易",
+    "EXITING": "清仓中",
+    "COOLDOWN": "冷却中",
+    "REENTRY": "等待重入",
+    "LATCHED": "已锁存",
+    "STOPPED": "已停止",
+    "UNKNOWN": "未知",
+}
+GATE_STATE_DISPLAY = {
+    "RISK_ON": "模型放行",
+    "RISK_OFF": "模型风控",
+    "ALLOW": "放行",
+    "BLOCK": "阻止",
+    "ACTIVE": "正常交易",
+    "APPLIED": "已落地",
+    "MISMATCH": "未同步",
+    "DISABLED": "已关闭",
+    "UNAVAILABLE": "不可用",
+    "N/A": "不适用",
+}
+GATE_REASON_DISPLAY = {
+    "long_risk_gate_clear": "模型风险解除",
+    "adaptive_structural_relief_confirmed": "结构性恢复已确认",
+    "no_active_fomc_window": "无生效FOMC限制",
+    "macro_state_healthy": "宏观数据正常",
+    "not_triggered": "未触发",
+    "all_sources_fresh": "全部数据源正常",
+    "not_applicable_to_grid": "Grid不适用",
+    "already_classified_dust": "已归类Dust，不影响交易",
+    "quote_budget_available": "资金预算充足",
+    "runtime_consumed_current_gates": "运行时已应用最新门控",
+    "unchanged": "控制器已同步",
+    "ACTIVE": "正常交易",
+}
+
+
+def system_health_display(value: Any) -> str:
+    text = str(value or "UNKNOWN").upper()
+    return SYSTEM_HEALTH_DISPLAY.get(text, text)
+
+
+def trade_mode_display(value: Any) -> str:
+    text = str(value or "UNKNOWN").upper()
+    return TRADE_MODE_DISPLAY.get(text, text)
+
+
+def phase_display(value: Any) -> str:
+    text = str(value or "UNKNOWN").upper()
+    return PHASE_DISPLAY.get(text, text)
+
+
+def gate_state_display(value: Any) -> str:
+    text = str(value or "UNKNOWN").upper()
+    return GATE_STATE_DISPLAY.get(text, str(value or "未知"))
+
+
+def gate_reason_display(value: Any) -> str:
+    text = str(value or "unknown")
+    return GATE_REASON_DISPLAY.get(text, text)
+
+
+def dust_metric(pair: Any, dust: Any) -> tuple[str, str]:
+    """Return one stable account-level dust row for every robot card."""
+    base_asset = str(pair or "").split("-", 1)[0] or "资产"
+    value = dust_usdt_display(dust) if isinstance(dust, Mapping) else "无"
+    return f"共享账户 {base_asset} Dust", value
+
+
 def _runtime_summary(value: Any) -> str:
     if not isinstance(value, Mapping) or not value:
         return "无可信数据"
@@ -1044,27 +1130,28 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     draw.rounded_rectangle((70, 180, 1370, 370), radius=18, fill=status_fill,
                            outline=status_color, width=3)
     permissions = status.get("final_permissions", {})
-    trade_text = "正常交易" if trading_normal else f"交易受限（{trade_mode}）"
-    draw.text((105, 205), f"系统：{system_health}   结论：{trade_text}",
+    trade_text = "正常交易" if trading_normal else trade_mode_display(trade_mode)
+    draw.text((105, 205), f"系统：{system_health_display(system_health)}   交易状态：{trade_text}",
               fill=status_color, font=report_font(36, bold=True))
     draw.text(
         (105, 262),
         f"最终权限：BUY={'放行' if permissions.get('buy_enabled') else '阻止'} / "
         f"SELL={'放行' if permissions.get('sell_enabled') else '阻止'}   "
-        f"阶段：{status.get('phase', '-')}",
+        f"阶段：{phase_display(status.get('phase'))}",
         fill="#334155", font=report_font(28),
     )
     generation = str(status.get("runtime_generation") or "-")
     release = str(status.get("release_sha256") or "-")
     cutover_phase = str(status.get("cutover_phase") or "-")
     cutover_label = (
-        "候选预热中（当前模型继续交易）"
-        if cutover_phase == "PREWARMING_CURRENT_MODEL_ACTIVE" else cutover_phase
+        "候选预热中，当前模型继续交易"
+        if cutover_phase == "PREWARMING_CURRENT_MODEL_ACTIVE" else
+        "已生效" if cutover_phase == "ACTIVE" else cutover_phase
     )
     draw.text(
         (105, 315),
-        f"Generation：{generation[:12]}  Release：{release[:12]}  "
-        f"模型周：{status.get('model_week', '-')}  切换：{cutover_label}",
+        f"运行代次：{generation[:12]}  发布版本：{release[:12]}  "
+        f"模型周：{status.get('model_week', '-')}  切换状态：{cutover_label}",
         fill="#64748b", font=report_font(23),
     )
     windows = report.get("profit", {})
@@ -1094,15 +1181,10 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         ("归属基础币", str(report.get("owned_base") or "无可信数据")),
         ("费用", _number(report.get("fees_quote"), f" {report.get('quote_asset', '')}")),
         ("买/卖成交", f"{report.get('buys', '-')} / {report.get('sells', '-') }"),
-        ("恢复阶段", str(report.get("phase") or "无可信数据")),
+        ("恢复状态", phase_display(report.get("phase"))),
         ("活动订单/执行器", _runtime_summary(report.get("active_runtime", {}))),
     ]
-    dust = report.get("unattributed_dust")
-    if isinstance(dust, Mapping):
-        metrics.append((
-            "共享账户 Dust",
-            dust_usdt_display(dust),
-        ))
+    metrics.append(dust_metric(report.get("pair"), report.get("unattributed_dust")))
     top = 790
     draw.rounded_rectangle((70, top, 1370, top + 390), radius=18,
                            fill="#ffffff", outline="#dce3ea", width=2)
@@ -1137,7 +1219,7 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
             "开" if row.get("enabled") else "关"
         )
         draw.text((390, y), switch, fill="#334155", font=report_font(22))
-        draw.text((520, y), str(row.get("state") or "-")[:14],
+        draw.text((520, y), gate_state_display(row.get("state"))[:14],
                   fill=color, font=report_font(22, bold=True))
         draw.text((720, y), "放行" if row.get("buy_enabled") is True else
                   "阻止" if row.get("buy_enabled") is False else "N/A",
@@ -1145,7 +1227,7 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         draw.text((840, y), "放行" if row.get("sell_enabled") is True else
                   "阻止" if row.get("sell_enabled") is False else "N/A",
                   fill=color, font=report_font(22))
-        draw.text((970, y), str(row.get("reason") or "-")[:30],
+        draw.text((970, y), gate_reason_display(row.get("reason"))[:30],
                   fill="#475569", font=report_font(20))
     draw.text((70, 2020), "单机器人连续权益", fill="#172033", font=report_font(34, bold=True))
     _line(draw, (70, 2070, 1370, 2430), [float(x) for x in report.get("equity_series", [])], "#2563eb")

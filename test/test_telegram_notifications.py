@@ -17,13 +17,17 @@ from live_guard.telegram_notifications import (
     TelegramOutbox,
     append_event,
     build_event,
+    dust_metric,
     dust_usdt_display,
     explain_event,
     format_event,
     hermes_recovery_prompt,
+    phase_display,
     render_mobile_profit_card,
     runtime_error_lines,
     sanitize_runtime_error,
+    system_health_display,
+    trade_mode_display,
 )
 from live_guard.telegram_parameter_report import (
     _resolve_report_inputs,
@@ -408,6 +412,23 @@ def test_mobile_card_dust_text_only_contains_usdt_valuation():
     assert value == "约 3.9833 USDT"
     assert "ETH" not in value
     assert "0.002160" not in value
+
+
+def test_mobile_card_status_and_phase_are_clear_chinese():
+    assert system_health_display("HEALTHY") == "健康"
+    assert system_health_display("FAILED") == "故障"
+    assert trade_mode_display("NORMAL") == "正常交易"
+    assert trade_mode_display("REENTRY") == "等待重入，暂停交易"
+    assert phase_display("ACTIVE") == "正常交易"
+    assert phase_display("LATCHED") == "已锁存"
+
+
+def test_every_robot_card_has_asset_scoped_dust_row():
+    assert dust_metric("ETH-FDUSD", {
+        "quantity": "0.002160779092935063",
+        "estimated_notional": "3.983318",
+    }) == ("共享账户 ETH Dust", "约 3.9833 USDT")
+    assert dust_metric("BTC-USDT", None) == ("共享账户 BTC Dust", "无")
 
 
 def test_grid_parameter_report_marks_missing_evidence_without_fake_png():
