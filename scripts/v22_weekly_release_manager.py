@@ -225,6 +225,7 @@ class WeeklyReleaseManager:
 
     def _generate(self, production: Mapping[str, Any], observed: int) -> dict[str, Any]:
         cutoff = int(production["effective_end"])
+        late_recovery = observed >= cutoff
         training_cutoff = min(cutoff, observed // 3600 * 3600)
         self._seed_candles()
         refreshed = {pair: self._refresh_pair(pair, training_cutoff) for pair in PAIRS}
@@ -258,6 +259,7 @@ class WeeklyReleaseManager:
             "release_sha256": release_sha, "model_sha256": self._production(release)["model_sha256"],
             "source_effective_end": cutoff, "candidate_effective_end": self._production(release)["effective_end"],
             "training_cutoff": training_cutoff, "activation_boundary": cutoff,
+            "late_signed_week_recovery": late_recovery,
             "review_started_at": observed, "review_deadline": deadline,
             "default_decision": "approve", "checks": checks, "prompt": prompt,
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
@@ -281,6 +283,7 @@ class WeeklyReleaseManager:
             "candidate_release_sha256": release_sha, "candidate_path": str(release),
             "request_path": str(request_path), "review_started_at": observed,
             "review_deadline": deadline, "activation_boundary": cutoff,
+            "late_signed_week_recovery": late_recovery,
             "last_event_id": event["event_id"], "last_error": None,
         }
         self._save(state)
@@ -456,6 +459,7 @@ class WeeklyReleaseManager:
                 self.grid_state_path.parent / "ethbtc_forced_exit_observation.json"
             ),
             final_preflight_sha256=canonical_sha256(state.get("final_checks", {})),
+            recovery_from_unavailable=bool(state.get("late_signed_week_recovery")),
         )
         pointer_path = self.work_root / f"runtime-pointer-{prepared['generation']}.json"
         atomic_json(pointer_path, prepared["pointer"])
@@ -507,6 +511,16 @@ class WeeklyReleaseManager:
 
     def _approve(self, state: dict[str, Any], observed: int, decision: Mapping[str, Any]) -> dict[str, Any]:
         release_sha, release = str(state["candidate_release_sha256"]), Path(state["candidate_path"])
+        boundary = int(state["activation_boundary"])
+        late_recovery = bool(state.get("late_signed_week_recovery"))
+        if observed >= boundary and not late_recovery:
+            state.update({
+                "phase": "SIGNED_WEEK_UNAVAILABLE",
+                "last_error": "signed_week_unavailable: candidate approval missed the signed week boundary",
+            })
+            self._save(state)
+            self._notify_blocked(state, {"approved_before_fold_boundary": False})
+            return state
         manual = decision.get("decision") == "approve"
         if not manual and observed < int(state["review_deadline"]):
             return state
@@ -521,15 +535,12 @@ class WeeklyReleaseManager:
             self._notify_blocked(state, checks)
             return state
         mode = "manual_hermes" if manual else "automatic_default_after_12h"
-        boundary = int(state["activation_boundary"])
-        if observed >= boundary:
-            state.update({"phase": "AWAITING_APPROVAL", "retry_after": observed + 300,
-                          "last_error": "candidate approval missed the signed week boundary"})
-            self._save(state)
-            self._notify_blocked(state, {"approved_before_fold_boundary": False})
-            return state
         preferred_activation = boundary - DEFAULT_ACTIVATION_LEAD_SECONDS
-        activate_at = max(preferred_activation, ((observed + 119) // 60) * 60)
+        activate_at = (
+            ((observed + 119) // 60) * 60
+            if late_recovery else
+            max(preferred_activation, ((observed + 119) // 60) * 60)
+        )
         prewarm_at = max(observed, activate_at - 5 * 60)
         production = self._production(release)
         evidence = {
@@ -561,6 +572,7 @@ class WeeklyReleaseManager:
                       "prewarm_at": prewarm_at,
                       "final_check_at": max(observed, boundary - 60 * 60),
                       "final_check_complete": False,
+                      "late_signed_week_recovery": late_recovery,
                       "pending_authorization_path": str(pending),
                       "authorization_sha256": sha256_file(pending),
                       "last_error": None})
@@ -589,7 +601,7 @@ class WeeklyReleaseManager:
         state = self._state()
         if state.get("phase") == "APPROVED_PENDING_PREWARM":
             boundary = int(state["activation_boundary"])
-            if observed >= boundary:
+            if observed >= boundary and not state.get("late_signed_week_recovery"):
                 state.update({
                     "phase": "SIGNED_WEEK_UNAVAILABLE",
                     "last_error": "signed_week_unavailable: candidate missed pre-boundary commit",
@@ -649,7 +661,10 @@ class WeeklyReleaseManager:
         if state.get("phase") == "PREWARMED_PENDING_ACTIVATION":
             if observed < int(state["activate_at"]):
                 return state
-            if observed >= int(state["activation_boundary"]):
+            if (
+                observed >= int(state["activation_boundary"])
+                and not state.get("late_signed_week_recovery")
+            ):
                 state.update({
                     "phase": "SIGNED_WEEK_UNAVAILABLE",
                     "last_error": "signed_week_unavailable: runtime commit missed T-30m window",

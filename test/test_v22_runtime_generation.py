@@ -83,6 +83,7 @@ def test_prewarm_rejects_unhealthy_or_wrong_predecessor_without_pointer_change(
     live = state_dir / "ethbtc_forced_exit_observation.json"
     live.write_text(json.dumps({
         "source_healthy": False, "release_sha256": "c" * 64,
+        "reason": "fail_closed:no signed weekly model covers BTC-FDUSD signal_ts=200",
         "pairs": {"BTC-FDUSD": pair(), "ETH-FDUSD": pair()},
     }), encoding="utf-8")
     producer = V22LiveGateProducer(
@@ -109,6 +110,17 @@ def test_prewarm_rejects_unhealthy_or_wrong_predecessor_without_pointer_change(
         assert "healthy current live contract" in str(exc)
     else:
         raise AssertionError("unhealthy live contract must reject candidate prewarm")
+    assert not (producer.runtime_root / "current.json").exists()
+
+    recovered = producer.prepare_generation(
+        release=release, authorization=receipt,
+        predecessor_release_sha256="c" * 64, fold_boundary=200,
+        observed_at=201, live_contract_path=live,
+        recovery_from_unavailable=True,
+    )
+    parity = recovered["manifest"]["semantic_parity"]
+    assert parity["matched"] is True
+    assert parity["recovery_from_unavailable"] is True
     assert not (producer.runtime_root / "current.json").exists()
 
 

@@ -157,11 +157,55 @@ def test_approval_wait_does_not_touch_current_release(tmp_path: Path):
         "phase": "AWAITING_APPROVAL", "candidate_release_sha256": "c" * 64,
         "candidate_path": str(tmp_path / "candidate"), "source_effective_end": 2_000,
         "review_started_at": 900, "review_deadline": 1_100,
+        "activation_boundary": 2_000,
     }
     before = (value.current / "production_lock.json").read_bytes()
     assert value._approve(state, 1_000, {}) == state
     assert (value.current / "production_lock.json").read_bytes() == before
     assert not value.authorization_path.exists()
+
+
+def test_missed_approval_boundary_is_terminal_before_hard_gate_recheck(tmp_path: Path):
+    boundary = 2_000
+    value = manager(tmp_path, boundary, boundary)
+    state = {
+        "phase": "AWAITING_APPROVAL", "candidate_release_sha256": "c" * 64,
+        "candidate_path": str(tmp_path / "candidate"), "source_effective_end": boundary,
+        "review_started_at": 1_000, "review_deadline": 1_500,
+        "activation_boundary": boundary,
+    }
+    with patch.object(value, "_candidate_checks") as candidate_checks, \
+            patch.object(value, "_runtime_checks") as runtime_checks:
+        result = value._approve(state, boundary, {})
+    assert result["phase"] == "SIGNED_WEEK_UNAVAILABLE"
+    assert "missed the signed week boundary" in result["last_error"]
+    candidate_checks.assert_not_called()
+    runtime_checks.assert_not_called()
+
+
+def test_late_signed_week_recovery_can_enter_approval_after_boundary(tmp_path: Path):
+    boundary = 2_000
+    value = manager(tmp_path, boundary + 100, boundary)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    state = {
+        "phase": "AWAITING_APPROVAL", "candidate_release_sha256": "c" * 64,
+        "candidate_path": str(candidate), "source_effective_end": boundary,
+        "review_started_at": boundary, "review_deadline": boundary + 100,
+        "activation_boundary": boundary, "late_signed_week_recovery": True,
+        "request_path": str(tmp_path / "request.json"),
+    }
+    atomic_json(Path(state["request_path"]), {"candidate": "c" * 64})
+    production = {
+        "model_sha256": MODEL, "effective_end": boundary + 7 * 86400,
+    }
+    with patch.object(value, "_candidate_checks", return_value={"package": True}), \
+            patch.object(value, "_runtime_checks", return_value={"runtime": True}), \
+            patch.object(value, "_production", return_value=production):
+        result = value._approve(state, boundary + 100, {})
+    assert result["phase"] == "APPROVED_PENDING_PREWARM"
+    assert result["late_signed_week_recovery"] is True
+    assert result["activate_at"] > boundary + 100
 
 
 def test_auto_authorization_requires_full_12h_review():
