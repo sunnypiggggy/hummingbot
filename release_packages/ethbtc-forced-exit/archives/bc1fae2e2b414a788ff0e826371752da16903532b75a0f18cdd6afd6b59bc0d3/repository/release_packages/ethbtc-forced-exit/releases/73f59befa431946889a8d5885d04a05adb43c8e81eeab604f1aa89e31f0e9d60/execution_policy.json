@@ -1,0 +1,16 @@
+{
+  "package_id": "ethbtc-forced-exit",
+  "execution_policy_version": "v22-risk-off-forced-exit-v2",
+  "bar_seconds": 300,
+  "technical_cooldown_seconds": 0,
+  "required_healthy_guard_cycles": 3,
+  "guard_cycle_seconds": 2,
+  "exit_fee_rate": 0.001,
+  "exit_adverse_slippage_bps": 2.0,
+  "grid_maker_fee_rate": 0.0,
+  "grid_reentry_quote_per_pair": 100.0,
+  "dca_reentry_quote_per_bot": 95.0,
+  "ownership": "strategy_ledger_only",
+  "risk_off_action": "cancel_orders_and_liquidate_owned_base",
+  "execution_policy_sha256": "396633156f0d8b7dd24a472b5a4556e9b390f57dafc6d96c8aa0ca5d578f526c"
+}

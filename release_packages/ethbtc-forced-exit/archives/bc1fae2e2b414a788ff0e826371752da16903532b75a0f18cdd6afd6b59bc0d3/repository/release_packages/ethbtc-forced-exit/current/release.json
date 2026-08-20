@@ -1,0 +1,13 @@
+{
+  "schema": "ethbtc-forced-exit-candidate-v1",
+  "package_id": "ethbtc-forced-exit",
+  "release_sha256": "2264ef1a735d777974f35ddeffc8e00b6be57423098d5ff06ff0a65ca6e4cd32",
+  "release_stage": "observation_candidate",
+  "offline_only": false,
+  "deployment_allowed": false,
+  "promotion_authorized": false,
+  "effective_start": 1763910000,
+  "effective_end": 1787497200,
+  "source_offline_verdict": "NO-GO",
+  "promotion_policy": "current_week_integrity_plus_24h_observation_plus_local_cli_approval"
+}

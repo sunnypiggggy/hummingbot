@@ -1,0 +1,20 @@
+{
+  "schema": "ethbtc-forced-exit-production-lock-v1",
+  "package_id": "ethbtc-forced-exit",
+  "execution_policy_version": "v22-risk-off-forced-exit-v2",
+  "model_sha256": "827f9626a33f88d82c3e4e5e6a4a55df331bda32627cccbab39dcd358734124a",
+  "feature_schema_sha256": "1fdc99293e83bd00b68b18174f3dc4f854f5b972c294f8c64e13ad26e8498da1",
+  "strategy_schema_sha256": "6c2afa89b1fa6d2838062871fd7222da95c1bef2ce4599a525dbee98d6b7fd5e",
+  "training_data_sha256": "e58dcb0d763bffe06b577474f4765a6c0518f222c8faa3aa768c40458588256e",
+  "effective_start": 1763910000,
+  "effective_end": 1787497200,
+  "execution_policy_sha256": "396633156f0d8b7dd24a472b5a4556e9b390f57dafc6d96c8aa0ca5d578f526c",
+  "lineage_manifest_sha256": "a9d230d95e64e3c2c8475b35764235e2432b59420b221511fc3bbe9d2402ad3d",
+  "documentation_sha256": "104cc8845cf8850fc792ab0850cc83d9c6164fe9169aa851f514612d907310a3",
+  "release_sha256": "c9ca450118682a0256289b7bb821e5fbe88a93a8c8689157a1ea50212ad881dd",
+  "shadow_lock_sha256": "12b56f66e7afdf49968b975ec3e0ba03c7e23530f89f5a68ad272a81677fd954",
+  "observation_required_seconds": 86400,
+  "deployment_allowed": false,
+  "promotion_authorized": false,
+  "previous_model_fallback_allowed": false
+}
