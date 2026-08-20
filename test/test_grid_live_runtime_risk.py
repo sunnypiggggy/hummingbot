@@ -272,6 +272,22 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertFalse(strategy._startup_order_reconciliation([]))
         self.assertTrue(strategy.startup_reconcile_complete)
 
+    def test_confirmed_inactive_orders_are_pruned_before_new_generation(self):
+        strategy = self.strategy()
+        strategy.buy_order_ids = {"old-buy", "still-active"}
+        strategy.sell_order_ids = {"old-sell"}
+        strategy.ledgers["BTC-FDUSD"].open_order_ids.update(
+            {"old-buy", "old-sell", "still-active"}
+        )
+
+        strategy._prune_inactive_order_ownership([Order("still-active")])
+
+        self.assertEqual({"still-active"}, strategy.buy_order_ids)
+        self.assertEqual(set(), strategy.sell_order_ids)
+        self.assertEqual(
+            {"still-active"}, strategy.ledgers["BTC-FDUSD"].open_order_ids,
+        )
+
     def test_grid_orders_are_capped_by_exchange_available_balances(self):
         strategy = self.strategy()
         strategy.config.trading_pairs = ["ETH-FDUSD"]

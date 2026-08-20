@@ -430,6 +430,14 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.awaiting_cancellation = True
                 self.next_refresh = self.current_timestamp + 5
             else:
+                # Cancellation callbacks can be lost across a fast parameter
+                # cutover or process restart even though the connector has
+                # already confirmed that the orders are gone.  This branch is
+                # reached only after the connector reports no owned active
+                # orders, so prune stale ownership before recording the new
+                # generation.  Otherwise reports double-count old and new
+                # layers and the persisted ID sets grow on every refresh.
+                self._prune_inactive_order_ownership(active)
                 self.awaiting_cancellation = False
                 self._place_grids(prices)
                 self.next_refresh = self.current_timestamp + self.config.order_refresh_time
@@ -1459,6 +1467,18 @@ class LivePortfolioGrid(StrategyV2Base):
             order for order in active
             if order.client_order_id in owned and order.client_order_id not in excluded
         ]
+
+    def _prune_inactive_order_ownership(self, active: list) -> None:
+        """Drop persisted IDs only after the connector confirms inactivity."""
+        active_ids = {
+            str(order.client_order_id)
+            for order in active
+            if getattr(order, "client_order_id", None)
+        }
+        self.buy_order_ids.intersection_update(active_ids)
+        self.sell_order_ids.intersection_update(active_ids)
+        for ledger in self.ledgers.values():
+            ledger.open_order_ids.intersection_update(active_ids)
 
     def _partition_flatten_orders(self, active) -> tuple[set[str], set[str]]:
         active_ids = {order.client_order_id for order in self._owned_active_orders(active)}
