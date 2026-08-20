@@ -294,7 +294,10 @@ def main() -> int:
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
     active_selection = {
-        "schema_version": ACTIVE_SELECTION_SCHEMA_VERSION,
+        # This validation helper still emits one shared parameter set. Keep it
+        # on the explicitly supported legacy contract instead of labelling the
+        # payload as schema v2, which requires immutable per-pair parameters.
+        "schema_version": 1,
         "parameter_version": "initial-30d-v1",
         "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
         "valid_from": end_ts,

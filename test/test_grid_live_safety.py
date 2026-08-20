@@ -14,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from grid_live_common import (  # noqa: E402
     ACTIVE_SELECTION_SCHEMA_VERSION,
+    BINANCE_AI_GRID_PROFILES,
     CAPITAL_LIMIT,
     FDUSD_RECOMMENDED_BALANCE,
     FDUSD_BUDGET,
@@ -214,7 +215,7 @@ class GridLiveSafetyTest(unittest.TestCase):
 
     def test_active_selection_is_bounded_and_fee_adjusted(self):
         payload = {
-            "schema_version": ACTIVE_SELECTION_SCHEMA_VERSION,
+            "schema_version": 1,
             "parameter_version": "weekly-2026-07-20",
             "trading_pairs": ["BTC-FDUSD", "ETH-FDUSD"],
             "parameters": {
@@ -229,6 +230,47 @@ class GridLiveSafetyTest(unittest.TestCase):
         self.assertEqual(params["grid_range"], Decimal("0.08"))
         self.assertEqual(params["grid_levels"], 10)
         self.assertEqual(params["take_profit"], Decimal("0.008"))
+        self.assertEqual(
+            params["pair_parameters"]["BTC-FDUSD"]["minimum_order_quote"],
+            Decimal("5.25"),
+        )
+
+    def test_schema_v2_locks_pair_specific_binance_ai_profiles(self):
+        payload = {
+            "schema_version": ACTIVE_SELECTION_SCHEMA_VERSION,
+            "parameter_version": "binance-ai-btc-medium-sideways-eth-long-volatility-v1",
+            "trading_pairs": ["BTC-FDUSD", "ETH-FDUSD"],
+            "pair_parameters": {
+                pair: {
+                    "profile": profile,
+                    **{
+                        key: float(value) if isinstance(value, Decimal) else value
+                        for key, value in BINANCE_AI_GRID_PROFILES[profile].items()
+                    },
+                }
+                for pair, profile in {
+                    "BTC-FDUSD": "medium_sideways",
+                    "ETH-FDUSD": "long_volatility",
+                }.items()
+            },
+        }
+        params = validate_active_selection(payload, Decimal("0"))
+        self.assertEqual(
+            params["pair_parameters"]["BTC-FDUSD"]["grid_range"],
+            Decimal("0.12698379475402316"),
+        )
+        self.assertEqual(
+            params["pair_parameters"]["ETH-FDUSD"]["take_profit"],
+            Decimal("0.014179761072002472"),
+        )
+        self.assertEqual(
+            params["pair_parameters"]["ETH-FDUSD"]["minimum_order_quote"],
+            Decimal("10"),
+        )
+
+        payload["pair_parameters"]["BTC-FDUSD"]["minimum_order_quote"] = 9
+        with self.assertRaisesRegex(ValueError, "immutable profile"):
+            validate_active_selection(payload, Decimal("0"))
 
     def test_rolling_windows_use_30_days_then_14_days(self):
         day = 86400

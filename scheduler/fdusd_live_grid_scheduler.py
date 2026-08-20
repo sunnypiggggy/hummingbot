@@ -25,6 +25,7 @@ import yaml
 from fdusd_live_grid_optimizer import select_candidate, weekly_cutoff
 from grid_live_common import (
     ACTIVE_SELECTION_SCHEMA_VERSION,
+    BINANCE_AI_GRID_PROFILES,
     PORTFOLIOS,
     build_live_config,
     effective_take_profit,
@@ -67,6 +68,10 @@ class Scheduler:
         )
         self.parameter_updates_enabled = (
             os.getenv("GRID_LIVE_PARAMETER_UPDATES_ENABLED", "false").lower()
+            == "true"
+        )
+        self.pair_parameter_schema_v2_enabled = (
+            os.getenv("GRID_PAIR_PARAMETER_SCHEMA_V2_ENABLED", "true").lower()
             == "true"
         )
         self.v22_automation_enabled = (
@@ -171,7 +176,7 @@ class Scheduler:
         report_dir.mkdir(parents=True, exist_ok=True)
         evaluations.to_csv(report_dir / "candidate_evaluations.csv", index=False)
         selection = {
-            "schema_version": ACTIVE_SELECTION_SCHEMA_VERSION,
+            "schema_version": 1,
             "parameter_version": period,
             "generated_at": datetime.now(SHANGHAI).isoformat(),
             "valid_from": train_end,
@@ -278,25 +283,31 @@ class Scheduler:
         )
 
     def ensure_fixed_selection(self) -> dict:
+        def serialise_profile(profile: str) -> dict:
+            values = BINANCE_AI_GRID_PROFILES[profile]
+            return {
+                "profile": profile,
+                **{
+                    key: float(value) if isinstance(value, Decimal) else value
+                    for key, value in values.items()
+                },
+            }
+
         selection = {
             "schema_version": ACTIVE_SELECTION_SCHEMA_VERSION,
-            "parameter_version": "fixed-grid-6pct-ethbtc-forced-exit-v22",
-            "generated_at": "2026-07-28T00:00:00+00:00",
+            "parameter_version": "binance-ai-btc-medium-sideways-eth-long-volatility-v1",
+            "generated_at": "2026-08-20T00:00:00+00:00",
             "valid_from": 0,
             "training_window": {
-                "mode": "fixed-approved-structure",
-                "source": "180d-parameter-search-2026-07-28",
+                "mode": "fixed-approved-pair-profiles",
+                "source": "binance-ai-grid-presets-360d-safety-validation",
             },
             "trading_pairs": list(PORTFOLIOS["FDUSD"].pairs),
             "maker_fee": None,
             "taker_fee": None,
-            "parameters": {
-                "half_range": 0.03,
-                "minimum_spread": 0.006,
-                "take_profit": 0.006,
-                "move_threshold": 0.015,
-                "levels": 10,
-                "min_grid_move_seconds": 1800,
+            "pair_parameters": {
+                "BTC-FDUSD": serialise_profile("medium_sideways"),
+                "ETH-FDUSD": serialise_profile("long_volatility"),
             },
             "technical_buy_gate": {
                 "schema": XGBOOST_GATE_SCHEMA,
@@ -307,6 +318,36 @@ class Scheduler:
                 "mechanism1_runtime_fallback": False,
             },
         }
+        if not self.pair_parameter_schema_v2_enabled:
+            selection = {
+                "schema_version": 1,
+                "parameter_version": "fixed-grid-6pct-ethbtc-forced-exit-v22",
+                "generated_at": "2026-07-28T00:00:00+00:00",
+                "valid_from": 0,
+                "training_window": {
+                    "mode": "fixed-approved-structure",
+                    "source": "180d-parameter-search-2026-07-28",
+                },
+                "trading_pairs": list(PORTFOLIOS["FDUSD"].pairs),
+                "maker_fee": None,
+                "taker_fee": None,
+                "parameters": {
+                    "half_range": 0.03,
+                    "minimum_spread": 0.006,
+                    "take_profit": 0.006,
+                    "move_threshold": 0.015,
+                    "levels": 10,
+                    "min_grid_move_seconds": 1800,
+                },
+                "technical_buy_gate": {
+                    "schema": XGBOOST_GATE_SCHEMA,
+                    "model_version": XGBOOST_MODEL_VERSION,
+                    "execution_policy_version": "v22-risk-off-forced-exit-v2",
+                    "combination": "long_only_per_pair",
+                    "short_spike_enabled": False,
+                    "mechanism1_runtime_fallback": False,
+                },
+            }
         current = self.read_json(self.canonical_selection, None)
         if current != selection:
             self.atomic_json(self.canonical_selection, selection)
@@ -315,11 +356,20 @@ class Scheduler:
                 bot=PORTFOLIOS["FDUSD"].bot_name,
                 pair=",".join(PORTFOLIOS["FDUSD"].pairs),
                 mechanism="parameter_update", transition="PARAMETER_ACTIVATED",
-                reason="固定审核参数已发布", severity="info",
-                action="publish_fixed_selection",
+                reason=(
+                    "BTC中短期横盘与ETH长期波动参数已原子发布"
+                    if self.pair_parameter_schema_v2_enabled else
+                    "schema v2消费者预部署中，继续使用现网6%参数"
+                ), severity="info",
+                action=(
+                    "publish_pair_parameter_selection"
+                    if self.pair_parameter_schema_v2_enabled else
+                    "publish_legacy_selection_during_consumer_upgrade"
+                ),
                 parameter_sha256=canonical_sha256(selection),
                 correlation_id=selection["parameter_version"],
                 details={"parameter_version": selection["parameter_version"],
+                         "pair_parameters": selection.get("pair_parameters"),
                          "report_request": "grid_360d"},
             ))
         self.publish_to_active_instances(selection)

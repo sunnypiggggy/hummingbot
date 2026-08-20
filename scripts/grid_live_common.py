@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+import hashlib
+import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Sequence
+from typing import Any, Callable, Dict, Iterable, Mapping, Sequence
 
 
 CONNECTOR = "binance"
@@ -66,12 +68,40 @@ PAIR_DRAWDOWN_LIMIT_PCT = Decimal("0.03")
 PORTFOLIO_DRAWDOWN_LIMIT_PCT = Decimal("0.06")
 CONFIRMATION = "LIVE-GRID-FDUSD-400"
 FDUSD_RECOMMENDED_BALANCE = FDUSD_BUDGET.recommended_balance
-ACTIVE_SELECTION_SCHEMA_VERSION = 1
+ACTIVE_SELECTION_SCHEMA_VERSION = 2
+SUPPORTED_ACTIVE_SELECTION_SCHEMA_VERSIONS = frozenset({1, 2})
 ALLOWED_HALF_RANGES = (Decimal("0.03"), Decimal("0.04"), Decimal("0.05"))
 ALLOWED_MIN_SPREADS = (Decimal("0.006"), Decimal("0.008"), Decimal("0.010"))
 ALLOWED_TAKE_PROFITS = (Decimal("0.006"), Decimal("0.008"), Decimal("0.010"))
 ALLOWED_MOVE_THRESHOLDS = (Decimal("0.015"), Decimal("0.020"), Decimal("0.030"))
 GRID_MOVE_COOLDOWN_SECONDS = 1800
+
+# Immutable production profiles.  Schema-v2 contracts must match these values
+# exactly; a profile name is not an escape hatch for arbitrary live settings.
+BINANCE_AI_GRID_PROFILES: Dict[str, Dict[str, Decimal | int]] = {
+    "medium_sideways": {
+        "grid_range": Decimal("0.12698379475402316"),
+        "grid_levels": 18,
+        "take_profit": Decimal("0.004"),
+        "minimum_order_quote": Decimal("10"),
+        "move_threshold": Decimal("0.015"),
+        "min_grid_move_seconds": 1800,
+        "order_refresh_seconds": ORDER_REFRESH_SECONDS,
+    },
+    "long_volatility": {
+        "grid_range": Decimal("0.5246511596640915"),
+        "grid_levels": 18,
+        "take_profit": Decimal("0.014179761072002472"),
+        "minimum_order_quote": Decimal("10"),
+        "move_threshold": Decimal("0.015"),
+        "min_grid_move_seconds": 1800,
+        "order_refresh_seconds": ORDER_REFRESH_SECONDS,
+    },
+}
+APPROVED_PAIR_PROFILES = {
+    "BTC-FDUSD": "medium_sideways",
+    "ETH-FDUSD": "long_volatility",
+}
 
 
 @dataclass(frozen=True)
@@ -221,6 +251,31 @@ def effective_take_profit(maker_rate: Decimal, configured: Decimal = Decimal("0.
     return max(configured, maker_rate * Decimal("2") + Decimal("0.004"))
 
 
+def clip_quantized_sell_levels(
+    levels: Sequence[Decimal],
+    sell_budget: Decimal,
+    minimum_order_quote: Decimal,
+    price_for_level: Callable[[Decimal], Decimal],
+    quantize_amount: Callable[[Decimal], Decimal],
+) -> list[tuple[Decimal, Decimal]]:
+    """Remove far SELL levels until every quantized order is executable."""
+    candidates = sorted(Decimal(str(level)) for level in levels)
+    while candidates:
+        amount = max(
+            Decimal(str(quantize_amount(sell_budget / Decimal(len(candidates))))),
+            Decimal("0"),
+        )
+        built = [(Decimal(str(price_for_level(level))), amount) for level in candidates]
+        if (
+            amount > 0
+            and amount * Decimal(len(built)) <= sell_budget
+            and all(price * quantity >= minimum_order_quote for price, quantity in built)
+        ):
+            return built
+        candidates.pop()
+    return []
+
+
 def required_balances(prices: Mapping[str, Decimal], quote_only_fdusd: bool = False) -> Dict[str, Decimal]:
     if quote_only_fdusd:
         return {"FDUSD": FDUSD_BUDGET.capital_limit}
@@ -278,12 +333,51 @@ def selection_grid_levels(half_range: Decimal, minimum_spread: Decimal) -> int:
 
 
 def validate_active_selection(payload: Mapping[str, Any], maker_rate: Decimal | None = None) -> Dict[str, Any]:
-    if int(payload.get("schema_version", -1)) != ACTIVE_SELECTION_SCHEMA_VERSION:
+    schema_version = int(payload.get("schema_version", -1))
+    if schema_version not in SUPPORTED_ACTIVE_SELECTION_SCHEMA_VERSIONS:
         raise ValueError("Unsupported active selection schema version.")
     if not str(payload.get("parameter_version", "")).strip():
         raise ValueError("Active selection requires a parameter_version.")
     if tuple(payload.get("trading_pairs", ())) != PORTFOLIOS["FDUSD"].pairs:
         raise ValueError("Active selection must target BTC-FDUSD and ETH-FDUSD.")
+    if schema_version == 2:
+        raw_pairs = payload.get("pair_parameters")
+        if not isinstance(raw_pairs, Mapping) or set(raw_pairs) != set(APPROVED_PAIR_PROFILES):
+            raise ValueError("Schema-v2 selection requires exactly BTC-FDUSD and ETH-FDUSD pair_parameters.")
+        pair_parameters: Dict[str, Dict[str, Any]] = {}
+        for pair, required_profile in APPROVED_PAIR_PROFILES.items():
+            raw_pair = raw_pairs[pair]
+            if not isinstance(raw_pair, Mapping):
+                raise ValueError(f"{pair} parameters are missing.")
+            profile = str(raw_pair.get("profile", ""))
+            if profile != required_profile:
+                raise ValueError(f"{pair} must use approved profile {required_profile}.")
+            approved = BINANCE_AI_GRID_PROFILES[profile]
+            candidate = {
+                "grid_range": Decimal(str(raw_pair["grid_range"])),
+                "grid_levels": int(raw_pair["grid_levels"]),
+                "take_profit": Decimal(str(raw_pair["take_profit"])),
+                "minimum_order_quote": Decimal(str(raw_pair["minimum_order_quote"])),
+                "move_threshold": Decimal(str(raw_pair["move_threshold"])),
+                "min_grid_move_seconds": int(raw_pair["min_grid_move_seconds"]),
+                "order_refresh_seconds": int(raw_pair["order_refresh_seconds"]),
+            }
+            if candidate != approved:
+                raise ValueError(f"{pair} parameters do not match immutable profile {profile}.")
+            if candidate["grid_levels"] < 4 or candidate["grid_levels"] % 2:
+                raise ValueError(f"{pair} grid_levels must be an even number of at least four.")
+            if candidate["minimum_order_quote"] < Decimal("10"):
+                raise ValueError(f"{pair} minimum_order_quote must be at least 10 FDUSD.")
+            pair_parameters[pair] = {"profile": profile, **candidate}
+        return {
+            "schema_version": schema_version,
+            "parameter_version": str(payload["parameter_version"]),
+            "selection_sha256": hashlib.sha256(json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), default=str,
+            ).encode("utf-8")).hexdigest(),
+            "pair_parameters": pair_parameters,
+        }
+
     raw = payload.get("parameters")
     if not isinstance(raw, Mapping):
         raise ValueError("Active selection parameters are missing.")
@@ -303,13 +397,27 @@ def validate_active_selection(payload: Mapping[str, Any], maker_rate: Decimal | 
     if move_cooldown != GRID_MOVE_COOLDOWN_SECONDS:
         raise ValueError("Grid move cooldown must remain 30 minutes.")
     effective_tp = effective_take_profit(maker_rate or Decimal("0"), configured_tp)
-    return {
+    legacy = {
         "grid_range": half_range * Decimal("2"),
         "grid_levels": selection_grid_levels(half_range, minimum_spread),
         "minimum_spread": minimum_spread,
         "take_profit": effective_tp,
         "move_threshold": move_threshold,
         "min_grid_move_seconds": move_cooldown,
+        "minimum_order_quote": MIN_ORDER_QUOTE,
+        "order_refresh_seconds": ORDER_REFRESH_SECONDS,
+    }
+    return {
+        **legacy,
+        "schema_version": schema_version,
+        "parameter_version": str(payload["parameter_version"]),
+        "selection_sha256": hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest(),
+        "pair_parameters": {
+            pair: {"profile": "legacy_shared", **legacy}
+            for pair in PORTFOLIOS["FDUSD"].pairs
+        },
     }
 
 

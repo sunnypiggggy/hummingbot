@@ -1186,10 +1186,9 @@ class UnifiedTelegramReporting:
         )
         runtime = self._load(runtime_candidates[0]) if runtime_candidates else {}
         inventory_status = self._load(self.inventory_status_path)
-        grid_open_orders = sum(
-            len(value.get("open_order_ids", []))
-            for value in runtime.get("ledgers", {}).values()
-        )
+        runtime_buy_ids = {str(value) for value in runtime.get("buy_order_ids", [])}
+        runtime_sell_ids = {str(value) for value in runtime.get("sell_order_ids", [])}
+        active_pair_parameters = runtime.get("active_pair_parameters", {})
         for pair in ("BTC-FDUSD", "ETH-FDUSD"):
             values = latest.get("pairs", {}).get(pair, {})
             pnl = float(values["pnl"]) if values.get("pnl") is not None else None
@@ -1215,6 +1214,13 @@ class UnifiedTelegramReporting:
                 else pair_recovery
             )
             phase = str(recovery.get("phase") or "ACTIVE")
+            pair_order_ids = {
+                str(value)
+                for value in runtime.get("ledgers", {}).get(pair, {}).get("open_order_ids", [])
+            }
+            pair_params = active_pair_parameters.get(pair, {})
+            effective_buy_layers = len(pair_order_ids & runtime_buy_ids)
+            effective_sell_layers = len(pair_order_ids & runtime_sell_ids)
             mechanisms = state.get("mechanisms", {})
             technical_contract = gate.get("pairs", {}).get(pair, {})
             runtime_technical = runtime.get("technical_buy_gate", {}).get(
@@ -1310,7 +1316,18 @@ class UnifiedTelegramReporting:
                 "owned_base": values.get("net_base"), "fees_quote": fees,
                 "buys": buys, "sells": sells,
                 "phase": phase,
-                "active_runtime": {"orders": grid_open_orders},
+                "active_runtime": {"orders": len(pair_order_ids)},
+                "grid_parameters": {
+                    "profile": pair_params.get("profile"),
+                    "grid_range": pair_params.get("grid_range"),
+                    "grid_levels": pair_params.get("grid_levels"),
+                    "take_profit": pair_params.get("take_profit"),
+                    "minimum_order_quote": pair_params.get("minimum_order_quote"),
+                    "effective_buy_layers": effective_buy_layers,
+                    "effective_sell_layers": effective_sell_layers,
+                    "parameter_version": runtime.get("active_parameter_version"),
+                    "parameter_sha256": runtime.get("active_parameter_sha256"),
+                },
                 "v22_gate": (
                     "不可用" if not v22_healthy else
                     "Risk-Off" if gate.get("pairs", {}).get(pair, {}).get("risk_off_active")

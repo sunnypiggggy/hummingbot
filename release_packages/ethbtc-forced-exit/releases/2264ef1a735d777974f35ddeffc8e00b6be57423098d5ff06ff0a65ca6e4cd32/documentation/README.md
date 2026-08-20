@@ -7,7 +7,6 @@ OCI 运维见 [TELEGRAM_NOTIFICATIONS.md](TELEGRAM_NOTIFICATIONS.md)。
 
 ## 文档索引
 
-- [GRID_PAIR_PARAMETER_CUTOVER.md](GRID_PAIR_PARAMETER_CUTOVER.md)：BTC中短期横盘、ETH长期波动的逐交易对合同、订单裁剪、混合回测和上线流程。
 - [NO_BNB_FEE_POLICY.md](NO_BNB_FEE_POLICY.md)：禁止使用 BNB 支付现货手续费、Guard 启动互锁、Grid Maker/Taker 费用口径及历史修正。
 - [ACCOUNT_INVENTORY.md](ACCOUNT_INVENTORY.md)：Grid/DCA 共享账户归属、事务租约、DCA 完整性清仓和无归属转 USDT。
 - [REAL_SCENARIO_TESTING.md](REAL_SCENARIO_TESTING.md)：隔离HTTP/容器故障注入、真实30秒确认、重启幂等和验收报告。

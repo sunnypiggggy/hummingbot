@@ -50,6 +50,7 @@ from scripts.grid_live_common import (
     STRATEGY_BUDGET,
     PairLedger,
     budget_for_quote,
+    clip_quantized_sell_levels,
     validate_active_selection,
 )
 from scripts.grid_macro_gate import load_runtime_macro_gate
@@ -65,7 +66,7 @@ try:
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
 
-RUNTIME_STATE_SCHEMA_VERSION = 8
+RUNTIME_STATE_SCHEMA_VERSION = 9
 
 
 @dataclass
@@ -75,6 +76,12 @@ class GridState:
     levels: List[Decimal]
     moves: int = 0
     last_move_ts: float = 0
+
+
+class ParameterBuildError(ValueError):
+    def __init__(self, pair: str, reason: str):
+        super().__init__(f"{pair}: {reason}")
+        self.pair = pair
 
 
 class LivePortfolioGridConfig(StrategyV2ConfigBase):
@@ -258,8 +265,23 @@ class LivePortfolioGrid(StrategyV2Base):
         self.peak_equity = config.capital_limit_quote
         self.portfolio_episode_baseline = config.capital_limit_quote
         self.active_parameter_version = config.active_parameter_version
+        self.active_parameter_sha256 = ""
+        self.pair_parameters: Dict[str, Dict[str, Any]] = {
+            pair: {
+                "profile": "configured_shared",
+                "grid_range": config.grid_range,
+                "grid_levels": config.grid_levels,
+                "take_profit": config.take_profit,
+                "minimum_order_quote": config.min_order_quote,
+                "move_threshold": config.move_threshold,
+                "min_grid_move_seconds": config.min_grid_move_seconds,
+                "order_refresh_seconds": config.order_refresh_time,
+            }
+            for pair in config.trading_pairs
+        }
         self.pending_parameter_version: Optional[str] = None
         self.pending_parameters: Optional[Dict[str, Any]] = None
+        self.parameter_blocked_pairs: Dict[str, str] = {}
         self.next_parameter_poll = 0.0
         self.selection_mtime_ns = -1
         self.state_invalid_reason: Optional[str] = None
@@ -344,6 +366,13 @@ class LivePortfolioGrid(StrategyV2Base):
             self.last_market_success = self.current_timestamp
             self._control_risk(prices)
             active = self.get_active_orders(self.config.exchange)
+            # The selection is one atomic BTC/ETH contract.  Commit it before
+            # evaluating runtime gates so Risk-Off/FOMC/cooldown can delay only
+            # ordinary order creation, never the parameter state itself.
+            self._poll_parameter_update()
+            if self.pending_parameters is not None:
+                self._activate_pending_parameters()
+                self.next_refresh = 0.0
 
             # Risk flattening always has priority over a macro pause.
             if self.pending_flatten:
@@ -381,15 +410,6 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.first_cycle_failure_at = None
                 return
 
-            self._poll_parameter_update()
-            if self.pending_parameters is not None:
-                if self._owned_active_orders(active):
-                    self.cancel_owned_orders()
-                    self.next_refresh = self.current_timestamp + 5
-                    self._persist(prices)
-                    self.first_cycle_failure_at = None
-                    return
-                self._activate_pending_parameters()
             if self.portfolio_tripped:
                 self._persist(prices)
                 self.first_cycle_failure_at = None
@@ -418,6 +438,16 @@ class LivePortfolioGrid(StrategyV2Base):
             self.first_cycle_failure_at = None
         except Exception as exc:
             self.logger().error("Live grid cycle failed: %s", exc)
+            if isinstance(exc, ParameterBuildError):
+                self.parameter_blocked_pairs[exc.pair] = str(exc)
+                self._record_runtime_event(
+                    "grid_parameter_pair_restricted",
+                    pair=exc.pair,
+                    parameter_version=self.active_parameter_version,
+                    parameter_sha256=self.active_parameter_sha256,
+                    reason=str(exc),
+                )
+                return
             if self._cycle_failure_requires_trip(self.current_timestamp):
                 self.portfolio_tripped = True
                 self.pending_flatten.update(self.config.trading_pairs)
@@ -742,16 +772,61 @@ class LivePortfolioGrid(StrategyV2Base):
         if self.pending_parameters is None or self.pending_parameter_version is None:
             return
         params = self.pending_parameters
-        self.config.grid_range = params["grid_range"]
-        self.config.grid_levels = params["grid_levels"]
-        self.config.take_profit = params["take_profit"]
-        self.config.move_threshold = params["move_threshold"]
-        self.config.min_grid_move_seconds = params["min_grid_move_seconds"]
+        self.pair_parameters = {
+            pair: dict(params["pair_parameters"][pair])
+            for pair in self.config.trading_pairs
+        }
         self.active_parameter_version = self.pending_parameter_version
+        self.active_parameter_sha256 = str(params["selection_sha256"])
         self.grid_states.clear()
+        self.parameter_blocked_pairs.clear()
         self.pending_parameters = None
         self.pending_parameter_version = None
         self.logger().warning("Activated live-grid parameter version %s.", self.active_parameter_version)
+
+    def _pair_params(self, pair: str) -> Dict[str, Any]:
+        params = self.pair_parameters.get(pair)
+        if params is None:
+            raise ParameterBuildError(pair, "no active pair parameters")
+        return params
+
+    def _pair_minimum_order_quote(self, pair: str) -> Decimal:
+        configured = Decimal(str(self._pair_params(pair)["minimum_order_quote"]))
+        rules = getattr(self.connector, "trading_rules", {}) or {}
+        rule = rules.get(pair) if isinstance(rules, Mapping) else None
+        exchange_minimum = Decimal(str(getattr(rule, "min_notional_size", "0") or "0"))
+        return max(configured, exchange_minimum)
+
+    def _quantized_amount(self, pair: str, amount: Decimal) -> Decimal:
+        quantizer = getattr(self.connector, "quantize_order_amount", None)
+        if callable(quantizer):
+            amount = Decimal(str(quantizer(pair, amount)))
+        return max(amount, Decimal("0"))
+
+    def _quantized_price(self, pair: str, price: Decimal) -> Decimal:
+        quantizer = getattr(self.connector, "quantize_order_price", None)
+        if callable(quantizer):
+            price = Decimal(str(quantizer(pair, price)))
+        if not price.is_finite() or price <= 0:
+            raise ParameterBuildError(pair, "price quantized to a non-positive value")
+        return price
+
+    def _build_sell_orders(
+        self, pair: str, levels: List[Decimal], sell_budget: Decimal,
+        reference_price: Decimal, cost_floor: Decimal,
+    ) -> List[tuple[Decimal, Decimal]]:
+        """Clip far SELL levels until every quantized order clears the floor."""
+        minimum = self._pair_minimum_order_quote(pair)
+        take_profit = Decimal(str(self._pair_params(pair)["take_profit"]))
+        return clip_quantized_sell_levels(
+            levels,
+            sell_budget,
+            minimum,
+            lambda level: self._quantized_price(pair, max(
+                level, reference_price * (Decimal("1") + take_profit), cost_floor,
+            )),
+            lambda amount: self._quantized_amount(pair, amount),
+        )
 
     def _place_grids(self, prices: Dict[str, Decimal]) -> None:
         # Exchange available balances already exclude quantities locked by
@@ -759,79 +834,98 @@ class LivePortfolioGrid(StrategyV2Base):
         # ownership; the exchange balances add a second, real-time cap.
         remaining_quote = self._available_balance(self.config.quote_asset)
         for pair in self.config.trading_pairs:
-            ledger = self.ledgers[pair]
-            if ledger.halted:
-                continue
-            price = prices[pair]
-            state = self.grid_states.get(pair)
-            if state is None:
-                state = self._new_grid(price)
+            try:
+                remaining_quote = self._place_pair_grid(pair, prices[pair], remaining_quote)
+                previous_reason = self.parameter_blocked_pairs.pop(pair, None)
+                if previous_reason is not None:
+                    self._record_runtime_event(
+                        "grid_parameter_pair_recovered", pair=pair,
+                        parameter_version=self.active_parameter_version,
+                        parameter_sha256=self.active_parameter_sha256,
+                        reason="pair_parameter_order_build_recovered",
+                        previous_reason=previous_reason,
+                    )
+            except ParameterBuildError as exc:
+                reason = str(exc)
+                previous_reason = self.parameter_blocked_pairs.get(pair)
+                self.parameter_blocked_pairs[pair] = reason
+                self.grid_states.pop(pair, None)
+                if previous_reason != reason:
+                    self._record_runtime_event(
+                        "grid_parameter_pair_restricted", pair=pair,
+                        parameter_version=self.active_parameter_version,
+                        parameter_sha256=self.active_parameter_sha256,
+                        reason=reason,
+                    )
+
+    def _place_pair_grid(
+        self, pair: str, price: Decimal, remaining_quote: Decimal,
+    ) -> Decimal:
+        ledger = self.ledgers[pair]
+        if ledger.halted:
+            return remaining_quote
+        params = self._pair_params(pair)
+        state = self.grid_states.get(pair)
+        if state is None:
+            state = self._new_grid(pair, price)
+            self.grid_states[pair] = state
+        elif (price > state.upper * (Decimal("1") + params["move_threshold"])
+              or price < state.lower * (Decimal("1") - params["move_threshold"])):
+            if self.current_timestamp - state.last_move_ts >= params["min_grid_move_seconds"]:
+                state = self._new_grid(pair, price, state.moves + 1)
                 self.grid_states[pair] = state
-            elif (price > state.upper * (Decimal("1") + self.config.move_threshold)
-                  or price < state.lower * (Decimal("1") - self.config.move_threshold)):
-                if self.current_timestamp - state.last_move_ts >= self.config.min_grid_move_seconds:
-                    state = self._new_grid(price, state.moves + 1)
-                    self.grid_states[pair] = state
-            lower_levels = [level for level in state.levels if level < price]
-            upper_levels = [level for level in state.levels if level > price]
-            buy_limits = [max(ledger.quote, Decimal("0")), self.config.side_budget_quote]
-            if self.config.inventory_exit_enabled:
-                extra_quote = max(ledger.inventory_delta(), Decimal("0")) * price
-                baseline_deficit_quote = max(-ledger.inventory_delta(), Decimal("0")) * price
-                buy_limits.append(max(
-                    baseline_deficit_quote + self.config.max_extra_inventory_quote - extra_quote,
-                    Decimal("0"),
-                ))
-            buy_budget = min(*buy_limits, remaining_quote)
-            if lower_levels and self.technical_buy_enabled_by_pair.get(pair, False):
-                # Do not silently disable BUY when the position-protection
-                # budget is valid in aggregate but splitting it across every
-                # grid level would put each order below MIN_NOTIONAL.  Prefer
-                # the closest levels and never exceed the existing cap.
-                affordable_levels = int(buy_budget // self.config.min_order_quote)
-                selected_lower_levels = sorted(lower_levels, reverse=True)[
-                    :affordable_levels
-                ]
-                order_quote = (
-                    buy_budget / Decimal(len(selected_lower_levels))
-                    if selected_lower_levels else Decimal("0")
-                )
-                if order_quote >= self.config.min_order_quote:
-                    for level in selected_lower_levels:
-                        order_id = self.buy(self.config.exchange, pair, order_quote / level,
-                                            OrderType.LIMIT_MAKER, level)
-                        ledger.open_order_ids.add(order_id)
-                        self.buy_order_ids.add(order_id)
-                    remaining_quote = max(
-                        remaining_quote - order_quote * Decimal(len(selected_lower_levels)),
-                        Decimal("0"),
-                    )
-            base_asset = pair.split("-", 1)[0]
-            sell_budget = min(
-                max(ledger.base, Decimal("0")),
-                ledger.initial_base,
-                self._available_balance(base_asset),
+        lower_levels = [level for level in state.levels if level < price]
+        upper_levels = [level for level in state.levels if level > price]
+        buy_limits = [max(ledger.quote, Decimal("0")), self.config.side_budget_quote]
+        if self.config.inventory_exit_enabled:
+            extra_quote = max(ledger.inventory_delta(), Decimal("0")) * price
+            baseline_deficit_quote = max(-ledger.inventory_delta(), Decimal("0")) * price
+            buy_limits.append(max(
+                baseline_deficit_quote + self.config.max_extra_inventory_quote - extra_quote,
+                Decimal("0"),
+            ))
+        buy_budget = min(*buy_limits, remaining_quote)
+        if lower_levels and self.technical_buy_enabled_by_pair.get(pair, False):
+            minimum_order_quote = self._pair_minimum_order_quote(pair)
+            affordable_levels = int(buy_budget // minimum_order_quote)
+            selected_lower_levels = sorted(lower_levels, reverse=True)[:affordable_levels]
+            order_quote = (
+                buy_budget / Decimal(len(selected_lower_levels))
+                if selected_lower_levels else Decimal("0")
             )
-            if upper_levels and sell_budget > 0:
-                amount = sell_budget / Decimal(len(upper_levels))
-                cost_floor = (
-                    ledger.minimum_profitable_sell_price(
-                        self._inventory_profit_floor_rate(pair)
+            submitted_quote = Decimal("0")
+            if order_quote >= minimum_order_quote:
+                for level in selected_lower_levels:
+                    order_price = self._quantized_price(pair, level)
+                    amount = self._quantized_amount(pair, order_quote / order_price)
+                    if amount * order_price < minimum_order_quote:
+                        continue
+                    order_id = self.buy(
+                        self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, order_price,
                     )
-                    if self.config.cost_floor_enabled
-                    else Decimal("0")
+                    ledger.open_order_ids.add(order_id)
+                    self.buy_order_ids.add(order_id)
+                    submitted_quote += amount * order_price
+            remaining_quote = max(remaining_quote - submitted_quote, Decimal("0"))
+        base_asset = pair.split("-", 1)[0]
+        sell_budget = min(
+            max(ledger.base, Decimal("0")), ledger.initial_base,
+            self._available_balance(base_asset),
+        )
+        if upper_levels and sell_budget > 0:
+            cost_floor = (
+                ledger.minimum_profitable_sell_price(self._inventory_profit_floor_rate(pair))
+                if self.config.cost_floor_enabled else Decimal("0")
+            )
+            for sell_price, amount in self._build_sell_orders(
+                pair, upper_levels, sell_budget, price, cost_floor,
+            ):
+                order_id = self.sell(
+                    self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, sell_price,
                 )
-                for level in upper_levels:
-                    sell_price = max(
-                        level,
-                        price * (Decimal("1") + self.config.take_profit),
-                        cost_floor,
-                    )
-                    if amount * sell_price >= self.config.min_order_quote:
-                        order_id = self.sell(self.config.exchange, pair, amount,
-                                             OrderType.LIMIT_MAKER, sell_price)
-                        ledger.open_order_ids.add(order_id)
-                        self.sell_order_ids.add(order_id)
+                ledger.open_order_ids.add(order_id)
+                self.sell_order_ids.add(order_id)
+        return remaining_quote
 
     def _available_balance(self, asset: str) -> Decimal:
         value = Decimal(str(self.connector.get_available_balance(asset)))
@@ -911,12 +1005,13 @@ class LivePortfolioGrid(StrategyV2Base):
         return True
 
     def _inventory_profit_floor_rate(self, pair: str) -> Decimal:
+        take_profit = Decimal(str(self._pair_params(pair)["take_profit"]))
         started = self.excess_inventory_started_at.get(pair)
         if started is None:
-            return self.config.take_profit
+            return take_profit
         age = max(0.0, self.current_timestamp - float(started))
         return (
-            self.config.take_profit
+            take_profit
             if age < self.config.profit_protection_seconds else Decimal("0")
         )
 
@@ -1303,6 +1398,8 @@ class LivePortfolioGrid(StrategyV2Base):
             "xgboost_buy_gate_recovered_immediate_refresh": ("v22_weekly_buy_gate", "RECOVERED", "info"),
             "fomc_gate_transition": ("fomc_gate", "TRIGGERED" if details.get("paused") else "RECOVERED", "warning" if details.get("paused") else "info"),
             "integrity_failure_latched": ("infrastructure_integrity_breaker", "EXITING", "critical"),
+            "grid_parameter_pair_restricted": ("parameter_update", "ACTION_FAILED", "critical"),
+            "grid_parameter_pair_recovered": ("parameter_update", "RECOVERED", "info"),
         }
         mapped = mapping.get(runtime_event)
         if not mapped or not mapped[0]:
@@ -1341,6 +1438,9 @@ class LivePortfolioGrid(StrategyV2Base):
                 model_sha256=str(
                     signal.get("model_sha256")
                     or getattr(self.config, "technical_model_sha256", "")
+                ),
+                parameter_sha256=str(
+                    details.get("parameter_sha256") or self.active_parameter_sha256
                 ),
                 requires_manual_action=manual_action,
                 occurred_at=occurred_at, correlation_id=correlation,
@@ -1458,11 +1558,16 @@ class LivePortfolioGrid(StrategyV2Base):
             price = self.connector.get_price_by_type(pair, PriceType.MidPrice)
         return price if price is not None and not price.is_nan() else Decimal("0")
 
-    def _new_grid(self, center: Decimal, moves: int = 0) -> GridState:
-        lower = center * (Decimal("1") - self.config.grid_range / Decimal("2"))
-        upper = center * (Decimal("1") + self.config.grid_range / Decimal("2"))
-        step = (upper - lower) / Decimal(self.config.grid_levels - 1)
-        levels = [lower + step * Decimal(index) for index in range(self.config.grid_levels)]
+    def _new_grid(self, pair: str, center: Decimal, moves: int = 0) -> GridState:
+        params = self._pair_params(pair)
+        grid_range = Decimal(str(params["grid_range"]))
+        grid_levels = int(params["grid_levels"])
+        if grid_range <= 0 or grid_levels < 4 or grid_levels % 2:
+            raise ParameterBuildError(pair, "invalid range or Grid level count")
+        lower = center * (Decimal("1") - grid_range / Decimal("2"))
+        upper = center * (Decimal("1") + grid_range / Decimal("2"))
+        step = (upper - lower) / Decimal(grid_levels - 1)
+        levels = [lower + step * Decimal(index) for index in range(grid_levels)]
         return GridState(lower, upper, levels, moves, self.current_timestamp)
 
     def _restore_state(self) -> None:
@@ -1472,7 +1577,7 @@ class LivePortfolioGrid(StrategyV2Base):
         try:
             state = json.loads(target.read_text(encoding="utf-8"))
             schema_version = int(state.get("schema_version", -1))
-            if schema_version not in {2, 3, 4, 5, 6, 7, RUNTIME_STATE_SCHEMA_VERSION}:
+            if schema_version not in {2, 3, 4, 5, 6, 7, 8, RUNTIME_STATE_SCHEMA_VERSION}:
                 raise ValueError("runtime state schema version mismatch")
             if tuple(state.get("trading_pairs", ())) != tuple(self.config.trading_pairs):
                 raise ValueError("runtime state trading pairs mismatch")
@@ -1546,6 +1651,12 @@ class LivePortfolioGrid(StrategyV2Base):
             self.active_parameter_version = str(
                 state.get("active_parameter_version", self.active_parameter_version)
             )
+            self.active_parameter_sha256 = str(state.get("active_parameter_sha256", ""))
+            self.parameter_blocked_pairs = {
+                pair: str(reason)
+                for pair, reason in state.get("parameter_blocked_pairs", {}).items()
+                if pair in restored
+            }
             self.runtime_events = [
                 value for value in state.get("runtime_events", [])
                 if isinstance(value, dict)
@@ -1559,7 +1670,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 }
             saved_gate = state.get("technical_buy_gate", {})
             saved_pairs = saved_gate.get("pairs", {}) if isinstance(saved_gate, dict) else {}
-            if schema_version == RUNTIME_STATE_SCHEMA_VERSION and set(saved_pairs) == set(restored):
+            if schema_version >= 8 and set(saved_pairs) == set(restored):
                 for pair in restored:
                     raw = saved_pairs[pair]
                     self.technical_buy_enabled_by_pair[pair] = bool(raw.get("buy_enabled", False))
@@ -1568,13 +1679,41 @@ class LivePortfolioGrid(StrategyV2Base):
                     self.technical_signal_by_pair[pair] = dict(raw.get("signal", {}))
                 self.technical_buy_enabled = all(self.technical_buy_enabled_by_pair.values())
                 self.technical_gate_healthy = all(self.technical_gate_healthy_by_pair.values())
+            saved_pair_parameters = state.get("active_pair_parameters", {})
+            if schema_version >= 9 and set(saved_pair_parameters) == set(restored):
+                converted: Dict[str, Dict[str, Any]] = {}
+                for pair, values in saved_pair_parameters.items():
+                    converted[pair] = {
+                        "profile": str(values.get("profile", "restored")),
+                        "grid_range": Decimal(str(values["grid_range"])),
+                        "grid_levels": int(values["grid_levels"]),
+                        "take_profit": Decimal(str(values["take_profit"])),
+                        "minimum_order_quote": Decimal(str(values["minimum_order_quote"])),
+                        "move_threshold": Decimal(str(values["move_threshold"])),
+                        "min_grid_move_seconds": int(values["min_grid_move_seconds"]),
+                        "order_refresh_seconds": int(values["order_refresh_seconds"]),
+                    }
+                self.pair_parameters = converted
             saved_parameters = state.get("active_parameters", {})
-            if saved_parameters:
+            if schema_version < 9 and saved_parameters:
                 self.config.grid_range = Decimal(str(saved_parameters["grid_range"]))
                 self.config.grid_levels = int(saved_parameters["grid_levels"])
                 self.config.take_profit = Decimal(str(saved_parameters["take_profit"]))
                 self.config.move_threshold = Decimal(str(saved_parameters["move_threshold"]))
                 self.config.min_grid_move_seconds = int(saved_parameters["min_grid_move_seconds"])
+                self.pair_parameters = {
+                    pair: {
+                        "profile": "legacy_shared",
+                        "grid_range": self.config.grid_range,
+                        "grid_levels": self.config.grid_levels,
+                        "take_profit": self.config.take_profit,
+                        "minimum_order_quote": self.config.min_order_quote,
+                        "move_threshold": self.config.move_threshold,
+                        "min_grid_move_seconds": self.config.min_grid_move_seconds,
+                        "order_refresh_seconds": self.config.order_refresh_time,
+                    }
+                    for pair in restored
+                }
         except Exception as exc:
             self.state_invalid_reason = str(exc)
 
@@ -1597,6 +1736,8 @@ class LivePortfolioGrid(StrategyV2Base):
             "peak_equity": str(self.peak_equity),
             "portfolio_episode_baseline": str(self.portfolio_episode_baseline),
             "active_parameter_version": self.active_parameter_version,
+            "active_parameter_sha256": self.active_parameter_sha256,
+            "parameter_blocked_pairs": self.parameter_blocked_pairs,
             "cost_floor_enabled": self.config.cost_floor_enabled,
             "pair_breakers_enabled": self.config.pair_breakers_enabled,
             "portfolio_breakers_enabled": self.config.portfolio_breakers_enabled,
@@ -1636,6 +1777,13 @@ class LivePortfolioGrid(StrategyV2Base):
                 "take_profit": str(self.config.take_profit),
                 "move_threshold": str(self.config.move_threshold),
                 "min_grid_move_seconds": self.config.min_grid_move_seconds,
+            },
+            "active_pair_parameters": {
+                pair: {
+                    key: str(value) if isinstance(value, Decimal) else value
+                    for key, value in params.items()
+                }
+                for pair, params in self.pair_parameters.items()
             },
             "ledgers": {
                 pair: {

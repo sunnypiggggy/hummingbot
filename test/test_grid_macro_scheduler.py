@@ -56,14 +56,45 @@ class GridMacroSchedulerTest(unittest.TestCase):
                 (state_root / "active_selection.json").read_text(encoding="utf-8")
             )
             self.assertEqual(
-                "fixed-grid-6pct-ethbtc-forced-exit-v22",
+                "binance-ai-btc-medium-sideways-eth-long-volatility-v1",
                 selection["parameter_version"],
             )
+            self.assertEqual(2, selection["schema_version"])
+            self.assertEqual("medium_sideways", selection["pair_parameters"]["BTC-FDUSD"]["profile"])
+            self.assertEqual("long_volatility", selection["pair_parameters"]["ETH-FDUSD"]["profile"])
             self.assertEqual("ethbtc-forced-exit-live-contract-v1", selection["technical_buy_gate"]["schema"])
             self.assertFalse(selection["technical_buy_gate"]["short_spike_enabled"])
             self.assertFalse(selection["technical_buy_gate"]["mechanism1_runtime_fallback"])
+            self.assertEqual(
+                0.12698379475402316,
+                selection["pair_parameters"]["BTC-FDUSD"]["grid_range"],
+            )
+            self.assertEqual(18, selection["pair_parameters"]["BTC-FDUSD"]["grid_levels"])
+            self.assertEqual(
+                0.5246511596640915,
+                selection["pair_parameters"]["ETH-FDUSD"]["grid_range"],
+            )
+            self.assertEqual(10.0, selection["pair_parameters"]["ETH-FDUSD"]["minimum_order_quote"])
+
+    def test_consumer_first_interlock_keeps_schema_v1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_root = root / "grid-state"
+            bots = root / "bots"
+            with patch.dict(os.environ, {
+                "GRID_LIVE_FDUSD_STATE_PATH": str(state_root),
+                "BOTS_PATH": str(bots),
+                "GRID_LIVE_PARAMETER_UPDATES_ENABLED": "false",
+                "GRID_PAIR_PARAMETER_SCHEMA_V2_ENABLED": "false",
+            }):
+                scheduler = Scheduler()
+                scheduler.ensure_fixed_selection()
+            selection = json.loads(
+                (state_root / "active_selection.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(1, selection["schema_version"])
+            self.assertEqual("fixed-grid-6pct-ethbtc-forced-exit-v22", selection["parameter_version"])
             self.assertEqual(0.03, selection["parameters"]["half_range"])
-            self.assertEqual(10, selection["parameters"]["levels"])
 
     def test_scheduler_publishes_active_fomc_gate_to_fixed_instance(self):
         now = datetime.now(timezone.utc)

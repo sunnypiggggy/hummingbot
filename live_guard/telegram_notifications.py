@@ -358,6 +358,7 @@ MECHANISM_EXPLANATIONS = {
     "position_protection": "机器人归属持仓达到止损或异常持仓保护条件",
     "capital_budget_gate": "可用 USDT 低于计划资金预算；该机制仅告警，不改变 BUY/SELL 权限",
     "infrastructure_integrity_breaker": "模型、合同、行情、API 或数据完整性检查失败",
+    "parameter_update": "逐交易对 Grid 参数或订单构建校验失败",
 }
 
 
@@ -1196,6 +1197,29 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         ("恢复状态", phase_display(report.get("phase"))),
         ("活动订单/执行器", _runtime_summary(report.get("active_runtime", {}))),
     ]
+    grid_parameters = report.get("grid_parameters")
+    if isinstance(grid_parameters, Mapping) and grid_parameters:
+        profile_labels = {
+            "medium_sideways": "中短横盘",
+            "long_volatility": "长期波动",
+            "legacy_shared": "原固定参数",
+            "configured_shared": "原固定参数",
+        }
+        profile = profile_labels.get(
+            str(grid_parameters.get("profile")), str(grid_parameters.get("profile") or "未知")
+        )
+        try:
+            range_pct = float(grid_parameters.get("grid_range")) * 100.0
+            minimum = float(grid_parameters.get("minimum_order_quote"))
+            parameter_value = (
+                f"{profile} {range_pct:.2f}%/{grid_parameters.get('grid_levels', '-')}格 "
+                f"B{grid_parameters.get('effective_buy_layers', '-')}/"
+                f"S{grid_parameters.get('effective_sell_layers', '-')} ≥{minimum:g} "
+                f"#{str(grid_parameters.get('parameter_sha256') or '-')[:8]}"
+            )
+        except (TypeError, ValueError):
+            parameter_value = "无可信逐交易对参数"
+        metrics.append(("Grid参数", parameter_value))
     metrics.append(dust_metric(report.get("pair"), report.get("unattributed_dust")))
     top = 790
     draw.rounded_rectangle((70, top, 1370, top + 390), radius=18,
