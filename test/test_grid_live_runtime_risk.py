@@ -101,6 +101,22 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.technical_reason_by_pair = {pair: "active" for pair in strategy.config.trading_pairs}
         strategy.technical_signal_by_pair = {pair: {} for pair in strategy.config.trading_pairs}
         strategy.technical_transition_key = None
+        strategy.pair_parameters = {
+            pair: {
+                "profile": "legacy_shared",
+                "grid_range": Decimal("0.06"),
+                "grid_levels": 10,
+                "take_profit": Decimal("0.006"),
+                "minimum_order_quote": Decimal("5"),
+                "move_threshold": Decimal("0.015"),
+                "min_grid_move_seconds": 1800,
+                "order_refresh_seconds": 7200,
+            }
+            for pair in strategy.config.trading_pairs
+        }
+        strategy.parameter_blocked_pairs = {}
+        strategy.active_parameter_version = "test-legacy-shared"
+        strategy.active_parameter_sha256 = "test"
         strategy.integrity_failure_grace = {}
         strategy.runtime_events = []
         strategy._append_notification_event = lambda *args, **kwargs: None
