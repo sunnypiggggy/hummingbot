@@ -10,6 +10,11 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 CONNECTOR = "binance"
 ACCOUNT_NAME = "binance_live_dca_200"
 STRATEGY_BUDGET_QUOTE = Decimal("190")
+# Keep the risk/equity boundary at 190 USDT, but reserve an additional 2 USDT
+# from ordinary executor creation. Both long-only bots share one quote balance;
+# the execution buffer prevents price quantization and fee reserve from making
+# the second bot miss budget by a few cents after the first bot locks orders.
+EXECUTION_BUDGET_QUOTE = Decimal("188")
 CAPITAL_LIMIT_QUOTE = Decimal("200")
 RESERVE_QUOTE = CAPITAL_LIMIT_QUOTE - STRATEGY_BUDGET_QUOTE
 SINGLE_BOT_LOSS_LIMIT = Decimal("16")
@@ -47,7 +52,7 @@ def live_controller_config(pair: str) -> Dict[str, Any]:
         "controller_type": "market_making",
         "connector_name": CONNECTOR,
         "trading_pair": pair,
-        "total_amount_quote": float(STRATEGY_BUDGET_QUOTE),
+        "total_amount_quote": float(EXECUTION_BUDGET_QUOTE),
         "buy_spreads": [0.0],
         "sell_spreads": [0.0],
         "buy_amounts_pct": [1.0],
@@ -115,8 +120,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Live DCA must use the Binance spot connector.")
     if config.get("leverage") != 1:
         raise ValueError("Live DCA leverage must be 1.")
-    if Decimal(str(config.get("total_amount_quote"))) != STRATEGY_BUDGET_QUOTE:
-        raise ValueError("Live DCA strategy budget must be 190 USDT.")
+    if Decimal(str(config.get("total_amount_quote"))) != EXECUTION_BUDGET_QUOTE:
+        raise ValueError("Live DCA execution budget must be 188 USDT.")
     if config.get("trading_pair") not in LIVE_PAIRS:
         raise ValueError("Only BTC-USDT and ETH-USDT are permitted.")
     if "perpetual" in str(config.get("connector_name", "")):

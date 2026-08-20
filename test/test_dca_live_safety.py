@@ -763,7 +763,7 @@ class DcaLiveSafetyTest(unittest.TestCase):
             validate_config(config)
             self.assertEqual("binance", config["connector_name"])
             self.assertEqual(1, config["leverage"])
-            self.assertEqual(190.0, config["total_amount_quote"])
+            self.assertEqual(188.0, config["total_amount_quote"])
             self.assertEqual(18000, config["time_limit"])
             self.assertEqual(18000, config["executor_refresh_time"])
             self.assertTrue(config["skip_rebalance"])
