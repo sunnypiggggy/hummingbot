@@ -1880,6 +1880,7 @@ class Guard:
             raise RuntimeError(f"controller config is unavailable for {bot_name}")
         actual_buy = bool(profile.get("macro_buy_enabled", True))
         actual_sell = bool(profile.get("macro_sell_enabled", True))
+        long_only_enabled = bool(profile.get("long_only_enabled", False))
         sell_stop_event = dict(reasons.get("sell_stop_event") or {})
         desired_stop_at = float(sell_stop_event.get("timestamp") or 0)
         desired_stop_id = str(sell_stop_event.get("executor_id") or "")
@@ -1894,6 +1895,7 @@ class Guard:
                 "status": "unchanged",
                 "macro_buy_enabled": actual_buy,
                 "macro_sell_enabled": actual_sell,
+                "long_only_enabled": long_only_enabled,
                 "macro_decision_id": str(profile.get("macro_decision_id", "")),
             }
         digest = hashlib.sha256(json.dumps(
@@ -1910,6 +1912,7 @@ class Guard:
             "status": "applied",
             "macro_buy_enabled": buy_enabled,
             "macro_sell_enabled": sell_enabled,
+            "long_only_enabled": bool(profile.get("long_only_enabled", False)),
             "macro_decision_id": profile["macro_decision_id"],
             "response": response,
         }
@@ -2161,6 +2164,7 @@ class Guard:
                 "controller_update_status": controller_result.get("status", "unknown"),
                 "controller_actual_buy_enabled": actual_buy,
                 "controller_actual_sell_enabled": actual_sell,
+                "long_only_enabled": bool(controller_result.get("long_only_enabled", False)),
                 "controller_applied": controller_applied,
                 "controller_update_error": controller_error,
             })

@@ -129,9 +129,17 @@ def run_pair_guarded(
     time_limit_seconds: int = LIVE_TIME_LIMIT_SECONDS,
     guarded_sides: tuple[str, ...] = ("BUY", "SELL"),
     flatten_on_risk_off: bool = True,
+    active_sides: tuple[str, ...] = ("BUY", "SELL"),
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     if len(frame) != len(gate):
         raise ValueError("gate and market frame lengths differ")
+    valid_sides = {"BUY", "SELL"}
+    if not active_sides or len(set(active_sides)) != len(active_sides):
+        raise ValueError("active_sides must contain one or two unique sides")
+    if not set(active_sides).issubset(valid_sides):
+        raise ValueError("active_sides contains an unsupported side")
+    if not set(guarded_sides).issubset(set(active_sides)):
+        raise ValueError("guarded_sides must be a subset of active_sides")
     active: dict[str, Executor | None] = {"BUY": None, "SELL": None}
     next_id = 1
     records: list[dict] = []
@@ -142,7 +150,7 @@ def run_pair_guarded(
 
     def ensure_executors(timestamp: int, reference: float, gate_enabled: bool = True) -> None:
         nonlocal next_id
-        for side in ("BUY", "SELL"):
+        for side in active_sides:
             if not gate_enabled and side in guarded_sides:
                 continue
             if active[side] is None:
@@ -247,6 +255,7 @@ def run_pair_guarded(
     wins = int((trades["net_pnl"] > 0).sum()) if positioned else 0
     summary = {
         "pair": pair,
+        "active_sides": ",".join(active_sides),
         "net_pnl_quote": realized_pnl,
         "return_on_190_pct": realized_pnl / TOTAL_BUDGET * 100,
         "max_drawdown_pct": drawdown.min() * 100,
@@ -264,6 +273,10 @@ def run_pair_guarded(
         "close_types": {str(k): int(v) for k, v in sorted(Counter(trades["close_type"]).items())} if positioned else {},
         "layer_fills": {side: {str(level): int(layer_fills[side][level]) for level in range(1, 5)}
                         for side in ("BUY", "SELL")},
+        "positioned_executors_by_side": {
+            side: int(trades["side"].eq(side).sum()) if positioned else 0
+            for side in ("BUY", "SELL")
+        },
     }
     return summary, trades, curve
 

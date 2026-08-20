@@ -20,6 +20,7 @@ GATE_LABELS = {
     "recovery_phase_gate": "退出/冷却/重入",
     "controller_application_gate": "控制器落地",
 }
+GATE_LABELS["strategy_mode_gate"] = "DCA只做多模式"
 GATE_ORDER = tuple(GATE_LABELS)
 
 

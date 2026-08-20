@@ -25,6 +25,9 @@ class DManMakerV3MacroConfig(_DManMakerV2Config):
     macro_sell_enabled: bool = Field(
         default=True, json_schema_extra={"is_updatable": True}
     )
+    long_only_enabled: bool = Field(
+        default=False, json_schema_extra={"is_updatable": True}
+    )
     macro_decision_id: str = Field(
         default="", json_schema_extra={"is_updatable": True}
     )
@@ -148,12 +151,27 @@ class DManMakerV3Macro(_DManMakerV2):
 
     @property
     def sell_creation_enabled(self) -> bool:
-        return self.config.macro_sell_enabled and not (
+        return not self.config.long_only_enabled and self.config.macro_sell_enabled and not (
             self.config.sell_trend_gate_enabled and self._sell_trend_blocked
         )
 
+    def creation_side_enabled(self, side: TradeType) -> bool:
+        if side == TradeType.BUY:
+            return self.macro_buy_enabled
+        if side == TradeType.SELL:
+            return self.sell_creation_enabled
+        return False
+
+    def force_stop_side_required(self, side: TradeType) -> bool:
+        """Risk gates may stop open exposure; long-only migration may not."""
+        if side == TradeType.BUY:
+            return not self.macro_buy_enabled
+        if side == TradeType.SELL:
+            return not self.config.macro_sell_enabled
+        return True
+
     def get_candles_config(self) -> List[CandlesConfig]:
-        if not self.config.sell_trend_gate_enabled:
+        if self.config.long_only_enabled or not self.config.sell_trend_gate_enabled:
             return []
         return [CandlesConfig(
             connector=self.config.connector_name,
@@ -205,6 +223,11 @@ class DManMakerV3Macro(_DManMakerV2):
         await super().update_processed_data()
         now = float(self.market_data_provider.time())
         self._observe_stop_losses(now)
+        if self.config.long_only_enabled:
+            self._sell_trend_data_healthy = True
+            self._sell_trend_reason = "long_only_policy"
+            self._sell_trend_metrics = {"strategy_mode": "LONG_ONLY"}
+            return
         if not self.config.sell_trend_gate_enabled:
             self._sell_trend_data_healthy = True
             return
@@ -287,6 +310,8 @@ class DManMakerV3Macro(_DManMakerV2):
             raise ValueError("macro DCA shutdown verification must run every second")
         if not new_config.sell_trend_gate_enabled:
             raise ValueError("macro DCA SELL trend gate must remain enabled")
+        if not new_config.long_only_enabled:
+            raise ValueError("live DCA must remain in long-only mode")
         if new_config.sell_stop_cooldown_seconds not in {1800, 7200, 21600}:
             raise ValueError("SELL stop cooldown must be a validated 30m, 2h, or 6h value")
         if new_config.policy_version != "dca-macro-v3":
@@ -315,17 +340,8 @@ class DManMakerV3Macro(_DManMakerV2):
             for action in actions
             if not (
                 isinstance(action, CreateExecutorAction)
-                and (
-                    (
-                        getattr(action.executor_config, "side", None)
-                        == TradeType.BUY
-                        and not self.macro_buy_enabled
-                    )
-                    or (
-                        getattr(action.executor_config, "side", None)
-                        == TradeType.SELL
-                        and not self.sell_creation_enabled
-                    )
+                and not self.creation_side_enabled(
+                    getattr(action.executor_config, "side", None)
                 )
             )
         ]
@@ -339,13 +355,7 @@ class DManMakerV3Macro(_DManMakerV2):
             )
             for executor in self.executors_info
             if executor.is_active
-            and (
-                (executor.side == TradeType.BUY and not self.macro_buy_enabled)
-                or (
-                    executor.side == TradeType.SELL
-                    and not self.config.macro_sell_enabled
-                )
-            )
+            and self.force_stop_side_required(executor.side)
         ]
 
     def get_custom_info(self) -> dict:
@@ -353,6 +363,8 @@ class DManMakerV3Macro(_DManMakerV2):
         return {
             "macro_buy_enabled": self.macro_buy_enabled,
             "macro_sell_enabled": self.config.macro_sell_enabled,
+            "long_only_enabled": self.config.long_only_enabled,
+            "strategy_mode": "LONG_ONLY" if self.config.long_only_enabled else "BILATERAL",
             "sell_creation_enabled": self.sell_creation_enabled,
             "sell_trend_gate": {
                 "enabled": self.config.sell_trend_gate_enabled,

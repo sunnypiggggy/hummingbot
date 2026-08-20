@@ -22,6 +22,7 @@ LIVE_EXECUTOR_REFRESH_SECONDS = 18000
 # because the trend-recovery condition was the binding constraint. Use the
 # least disruptive validated duration; trend recovery can keep it blocked longer.
 SELL_STOP_COOLDOWN_SECONDS = 1800
+LONG_ONLY_ENABLED = True
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,10 @@ def live_controller_config(pair: str) -> Dict[str, Any]:
         "skip_rebalance": True,
         "macro_buy_enabled": True,
         "macro_sell_enabled": True,
+        # Strategy direction and risk permissions are separate. Long-only
+        # disables only new ordinary SELL executors; protective SELL exits and
+        # macro/v22 emergency stops keep their existing authority.
+        "long_only_enabled": LONG_ONLY_ENABLED,
         "macro_decision_id": "bootstrap",
         "policy_version": "dca-macro-v3",
     }
@@ -128,6 +133,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Live DCA shutdown verification must run every second.")
     if config.get("sell_trend_gate_enabled") is not True:
         raise ValueError("The live DCA SELL trend gate must remain enabled.")
+    if config.get("long_only_enabled") is not True:
+        raise ValueError("Live DCA must run in long-only mode.")
     if int(config.get("sell_stop_cooldown_seconds", 0)) not in {1800, 7200, 21600}:
         raise ValueError("SELL stop cooldown must be a validated 30m, 2h, or 6h value.")
 

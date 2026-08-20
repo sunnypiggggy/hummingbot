@@ -767,6 +767,7 @@ class DcaLiveSafetyTest(unittest.TestCase):
             self.assertEqual(18000, config["time_limit"])
             self.assertEqual(18000, config["executor_refresh_time"])
             self.assertTrue(config["skip_rebalance"])
+            self.assertTrue(config["long_only_enabled"])
 
     def test_each_side_has_expected_layers(self):
         self.assertEqual(

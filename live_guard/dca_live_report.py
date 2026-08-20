@@ -1080,6 +1080,19 @@ class UnifiedTelegramReporting:
                     buy_enabled=True, sell_enabled=True, health="HEALTHY",
                     reason=str(capital.get("reason") or "unknown"), source="quote_budget",
                 ),
+                gate_row(
+                    "strategy_mode_gate",
+                    state=("LONG_ONLY" if aggregate.get("long_only_enabled") else "BILATERAL"),
+                    # Long-only changes ordinary executor creation, not the
+                    # controller's permission to close a BUY with a SELL.
+                    buy_enabled=True, sell_enabled=True, health="HEALTHY",
+                    reason=(
+                        "ordinary_sell_creation_disabled_protective_exits_allowed"
+                        if aggregate.get("long_only_enabled")
+                        else "ordinary_buy_and_sell_creation_enabled"
+                    ),
+                    source="dca_controller",
+                ),
                 self._inventory_row(pair.split("-", 1)[0]),
                 gate_row(
                     "recovery_phase_gate", state=phase,
