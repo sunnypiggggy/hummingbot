@@ -1,7 +1,6 @@
-"""Mobile PNG renderer for hash-bound v22 model-update evidence.
+"""Mobile PNG renderer for hash-bound Grid and v22 update evidence.
 
-The legacy Grid-only branch can still emit its historical missing-evidence
-PDF, while every v22 model update emits photos only.
+Parameter and model update reports intentionally emit photos only.
 """
 
 from __future__ import annotations
@@ -21,12 +20,12 @@ from PIL import Image, ImageDraw
 try:
     from runtime_endpoints import binance_api_base
     from telegram_notifications import (
-        report_font, render_analysis_pdf, sha256_file,
+        report_font, sha256_file,
     )
 except ModuleNotFoundError:
     from live_guard.runtime_endpoints import binance_api_base
     from live_guard.telegram_notifications import (
-        report_font, render_analysis_pdf, sha256_file,
+        report_font, sha256_file,
     )
 
 try:
@@ -271,8 +270,6 @@ def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
         return []
     directory = output_root / str(event["event_id"])
     directory.mkdir(parents=True, exist_ok=True)
-    pdf = directory / "parameter_analysis.pdf"
-    report_id = str(event["event_id"])[:24]
     if request == "grid_360d":
         evidence_root = Path(str(
             event.get("details", {}).get("evidence_root")
@@ -308,37 +305,7 @@ def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
                 "caption": f"GRID {row['pair']}｜{labels[str(row['window'])]}｜参数候选对照证据",
                 "evidence_complete": True,
             })
-        render_analysis_pdf({
-            "title": "Grid 参数分析报告", "report_id": report_id,
-            "status": event.get("transition"), "generated_at": event.get("occurred_at"),
-            "parameter_version": event.get("details", {}).get("parameter_version"),
-            "parameter_sha256": event.get("parameter_sha256"),
-            "evidence_complete": True, "conclusion": event.get("reason"),
-            "sections": [
-                {"title": "旧参数", "text": json.dumps(
-                    event.get("details", {}).get("previous_parameters", {}), ensure_ascii=False,
-                )},
-                {"title": "候选参数", "text": json.dumps(
-                    event.get("details", {}).get("candidate", {}), ensure_ascii=False,
-                )},
-                {"title": "最佳候选与拒绝原因", "text": json.dumps({
-                    "evaluation": event.get("details", {}).get(
-                        "best_rejected_candidate",
-                        event.get("details", {}).get("best_candidate_evaluation", {}),
-                    ),
-                    "reason": event.get("details", {}).get("rejection_reason", "已满足既有门槛"),
-                }, ensure_ascii=False)},
-                {"title": "证据状态", "text": (
-                    "已验证参数哈希绑定的BTC/ETH各三张PNG：过去360天、"
-                    "2026年1–2月和2026年5–6月；附件送达回执是后续审批前置条件。"
-                )},
-            ],
-        }, pdf)
-        return [
-            {"path": str(pdf), "kind": "document", "sha256": sha256_file(pdf),
-             "caption": "Grid参数分析PDF（360天证据完整）", "evidence_complete": True},
-            *photos,
-        ]
+        return photos
     identity_root, evidence_root = _resolve_report_inputs(release_root, event)
     summary = _read_summary(evidence_root)
     evidence_model = str(summary.get("frozen_inputs", {}).get("model_sha256", ""))

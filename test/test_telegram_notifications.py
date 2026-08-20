@@ -462,9 +462,9 @@ def test_grid_parameter_report_requires_hash_bound_six_png_evidence(monkeypatch)
         attachments = build_parameter_attachments(
             value, release_root=root / "release", output_root=root / "out",
         )
-        assert len(attachments) == 7
-        assert attachments[0]["kind"] == "document"
+        assert len(attachments) == 6
         assert sum(item["kind"] == "photo" for item in attachments) == 6
+        assert {item["kind"] for item in attachments} == {"photo"}
         assert all(item["evidence_complete"] is True for item in attachments)
         assert all(Path(item["path"]).is_file() for item in attachments)
 
