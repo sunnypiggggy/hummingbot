@@ -35,6 +35,7 @@ from live_guard.telegram_parameter_report import (
 )
 from live_guard.dca_live_guard import Guard as DcaGuard
 from live_guard.grid_live_guard import Guard as GridGuard
+from live_guard.dca_live_report import ParameterReportWorker
 
 
 def event(**overrides):
@@ -431,22 +432,41 @@ def test_every_robot_card_has_asset_scoped_dust_row():
     assert dust_metric("BTC-USDT", None) == ("共享账户 BTC Dust", "无")
 
 
-def test_grid_parameter_report_marks_missing_evidence_without_fake_png():
+def test_grid_parameter_report_requires_hash_bound_six_png_evidence(monkeypatch):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        evidence = root / "grid-evidence"
+        evidence.mkdir()
+        parameter_sha = "a" * 64
+        images = []
+        for pair in ("BTC-FDUSD", "ETH-FDUSD"):
+            for window in ("360d", "2026_jan_feb", "2026_may_june"):
+                path = evidence / f"{pair}_{window}.png"
+                Image.new("RGB", (1440, 2400), "white").save(path)
+                import hashlib
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                images.append({"pair": pair, "window": window, "path": path.name,
+                               "sha256": digest})
+        (evidence / "grid_parameter_evidence_manifest.json").write_text(json.dumps({
+            "schema": "grid-parameter-mobile-evidence-v1",
+            "parameter_sha256": parameter_sha,
+            "evidence_complete": True,
+            "images": images,
+        }), encoding="utf-8")
+        monkeypatch.setenv("GRID_PARAMETER_EVIDENCE_ROOT", str(evidence))
         value = event(
             mechanism="parameter_update", transition="PARAMETER_ACTIVATED",
-            parameter_sha256="a" * 64,
+            parameter_sha256=parameter_sha,
             details={"report_request": "grid_360d", "candidate": {"levels": 10}},
         )
         attachments = build_parameter_attachments(
             value, release_root=root / "release", output_root=root / "out",
         )
-        assert len(attachments) == 1
+        assert len(attachments) == 7
         assert attachments[0]["kind"] == "document"
-        assert attachments[0]["evidence_complete"] is False
-        assert Path(attachments[0]["path"]).is_file()
-        assert not list((root / "out").rglob("*.png"))
+        assert sum(item["kind"] == "photo" for item in attachments) == 6
+        assert all(item["evidence_complete"] is True for item in attachments)
+        assert all(Path(item["path"]).is_file() for item in attachments)
 
 
 def test_v22_parameter_report_is_twelve_pngs_without_documents(tmp_path):
@@ -489,6 +509,46 @@ def test_pending_weekly_candidate_uses_family_replay_evidence(tmp_path):
 
     assert identity_root == candidate
     assert evidence_root == family
+
+
+def test_evidence_receipt_is_written_only_after_all_photos_are_sent(tmp_path):
+    outbox = TelegramOutbox(tmp_path / "outbox.sqlite", channel_id="-100-test")
+    worker = ParameterReportWorker(
+        root=tmp_path / "telegram", release_root=tmp_path / "release", outbox=outbox,
+    )
+    event_id = "e" * 64
+    attachments = []
+    for index in range(12):
+        path = tmp_path / f"photo-{index}.png"
+        path.write_bytes(f"photo-{index}".encode())
+        import hashlib
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        attachments.append({"path": str(path), "kind": "photo", "sha256": digest,
+                            "evidence_complete": True})
+        outbox.enqueue(event_id=event_id, kind="photo", text=str(index),
+                       file_path=path, file_sha256=digest)
+    outbox.enqueue(event_id=event_id, kind="message", text="approval")
+    marker = worker.jobs / f"{event_id}.done"
+    marker.write_text(json.dumps({
+        "event_id": event_id, "release_sha256": "c" * 64,
+        "model_sha256": "b" * 64, "parameter_sha256": "",
+        "report_request": "v22_png_windows", "attachments": attachments,
+    }), encoding="utf-8")
+    assert worker.finalize_delivery_receipts() == 0
+    outbox.connection.execute(
+        "UPDATE outbox SET status='sent',sent_at=1,telegram_message_id='42' WHERE event_id=?",
+        (event_id,),
+    )
+    outbox.connection.commit()
+    assert worker.finalize_delivery_receipts() == 1
+    receipt = json.loads((
+        worker.receipts / f"{'c' * 64}.json"
+    ).read_text(encoding="utf-8"))
+    assert receipt["expected_photo_count"] == 12
+    assert len(receipt["photo_sha256"]) == 12
+    assert receipt["delivery_receipt_sha256"]
+    worker.executor.shutdown(wait=True)
+    outbox.close()
 
 
 def test_latched_prompt_contains_binding_but_no_secret_or_command():

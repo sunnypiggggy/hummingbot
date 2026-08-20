@@ -179,6 +179,8 @@ services:
       V22_WEEKLY_CANDLE_PATH: /workspace/weekly/candles
       V22_RUNTIME_ROOT: /workspace/state/v22-runtime
       DCA_LIVE_STATE_PATH: /workspace/dca-state
+      MODEL_EVIDENCE_RECEIPT_ROOT: /workspace/dca-state/telegram/evidence_receipts
+      PARAMETER_EVIDENCE_RECEIPT_ROOT: /workspace/dca-state/telegram/evidence_receipts
       GRID_V22_AUTHORIZATION_PATH: /workspace/state/ethbtc_forced_exit_authorization.json
       TELEGRAM_NOTIFICATION_EVENTS_PATH: /workspace/state/telegram_events.jsonl
     volumes:
@@ -369,6 +371,7 @@ services:
       DCA_LIVE_STATE_PATH: /workspace/state
       GRID_LIVE_STATE_PATH: /workspace/grid
       ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
+      GRID_PARAMETER_EVIDENCE_ROOT: /workspace/grid-parameter-evidence
       ACCOUNT_INVENTORY_LEDGER_PATH: /workspace/account-inventory
       # Approval requests and their PNG jobs are picked up within one minute.
       # The four-hour profit slot remains controlled by its persisted schedule.
@@ -391,6 +394,7 @@ services:
       - ./dca-live-data:/workspace/state
       - ./grid-live-fdusd-data:/workspace/grid:ro
       - ./release_packages/ethbtc-forced-exit:/workspace/releases:ro
+      - ./release_packages/ethbtc-forced-exit/parameter_evidence/grid_btc_medium_eth_long_v1:/workspace/grid-parameter-evidence:ro
       - ./account-inventory-data:/workspace/account-inventory:ro
     secrets:
       - telegram_notify_bot_token

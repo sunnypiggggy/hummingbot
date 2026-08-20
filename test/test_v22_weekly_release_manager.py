@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,12 +30,29 @@ def manager(tmp_path: Path, now: int, effective_end: int) -> WeeklyReleaseManage
         "package_id": "ethbtc-forced-exit", "release_sha256": HASH,
         "model_sha256": MODEL, "effective_end": effective_end,
     }), encoding="utf-8")
-    return WeeklyReleaseManager(
+    value = WeeklyReleaseManager(
         release_root=root, work_root=tmp_path / "work", candle_dir=tmp_path / "candles",
         state_path=tmp_path / "work/state.json", authorization_path=tmp_path / "auth.json",
         notification_path=tmp_path / "events.jsonl", grid_state_path=tmp_path / "grid.json",
         dca_state_path=tmp_path / "dca.json", policy=Policy(), now=lambda: now,
     )
+    receipt_root = tmp_path / "telegram" / "evidence_receipts"
+    receipt_root.mkdir(parents=True)
+    receipt = {
+        "schema": "telegram-evidence-delivery-receipt-v1",
+        "identity_sha256": "c" * 64, "source_event_id": "candidate-event",
+        "release_sha256": "c" * 64, "model_sha256": MODEL,
+        "parameter_sha256": "", "report_request": "v22_png_windows",
+        "expected_photo_count": 12, "photo_sha256": [str(i) * 64 for i in range(1, 10)] + [
+            "a" * 64, "b" * 64, "c" * 64,
+        ],
+        "delivered_at": "2033-05-18T03:33:20+00:00", "telegram_message_ids": ["1"] * 13,
+    }
+    receipt["delivery_receipt_sha256"] = hashlib.sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    (receipt_root / f"{'c' * 64}.json").write_text(json.dumps(receipt), encoding="utf-8")
+    return value
 
 
 def test_default_schedule_generates_16h_before_boundary_and_reviews_for_12h(tmp_path: Path):
@@ -189,6 +207,32 @@ def test_approval_wait_does_not_touch_current_release(tmp_path: Path):
     before = (value.current / "production_lock.json").read_bytes()
     assert value._approve(state, 1_000, {}) == state
     assert (value.current / "production_lock.json").read_bytes() == before
+    assert not value.authorization_path.exists()
+
+
+def test_model_approval_is_blocked_until_telegram_png_receipt_exists(tmp_path: Path):
+    boundary = 2_000_000_000
+    value = manager(tmp_path, boundary - 4_000, boundary)
+    (value.evidence_receipt_root / f"{'c' * 64}.json").unlink()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    request = tmp_path / "request.json"
+    atomic_json(request, {"candidate": "c" * 64})
+    state = {
+        "phase": "AWAITING_APPROVAL", "candidate_release_sha256": "c" * 64,
+        "candidate_path": str(candidate), "source_effective_end": boundary,
+        "review_started_at": boundary - 50_000, "review_deadline": boundary - 5_000,
+        "activation_boundary": boundary, "request_path": str(request),
+        "last_event_id": "candidate-event",
+    }
+    with patch.object(value, "_candidate_checks", return_value={"package": True}), \
+            patch.object(value, "_runtime_checks", return_value={"runtime": True}), \
+            patch.object(value, "_production", return_value={
+                "model_sha256": MODEL, "effective_end": boundary + 7 * 86400,
+            }):
+        result = value._approve(state, boundary - 4_000, {})
+    assert result["phase"] == "AWAITING_APPROVAL"
+    assert "telegram_model_evidence_delivered': False" in result["last_error"]
     assert not value.authorization_path.exists()
 
 

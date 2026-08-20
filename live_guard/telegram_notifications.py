@@ -106,7 +106,8 @@ def build_event(
 ) -> dict[str, Any]:
     transition = transition.upper()
     if transition not in LIFECYCLE_TRANSITIONS and transition not in INVENTORY_TRANSITIONS and transition not in RUNTIME_ERROR_TRANSITIONS and transition not in MODEL_CUTOVER_TRANSITIONS and transition not in {
-        "PARAMETER_CANDIDATE", "PARAMETER_ACTIVATED", "PARAMETER_RETAINED",
+        "PARAMETER_CANDIDATE", "PARAMETER_APPROVAL_PENDING",
+        "PARAMETER_ACTIVATED", "PARAMETER_RETAINED",
         "MODEL_APPROVAL_PENDING", "MODEL_DEFAULT_APPROVED",
         "MODEL_APPROVAL_REJECTED", "MODEL_UPDATE_BLOCKED",
         "REPORT_EVIDENCE_MISSING", "PROFIT_REPORT",
@@ -915,6 +916,25 @@ class TelegramOutbox:
             "retrying": int(retrying),
             "max_attempts": int(max_attempts),
             "last_error": sanitize_runtime_error(last_error or "") if retrying else None,
+        }
+
+    def event_delivery(self, event_id: str) -> dict[str, Any]:
+        """Return durable Telegram delivery evidence for one event."""
+        rows = self.connection.execute(
+            "SELECT kind,status,file_sha256,sent_at,telegram_message_id,last_error "
+            "FROM outbox WHERE event_id=? ORDER BY id", (str(event_id),),
+        ).fetchall()
+        return {
+            "event_id": str(event_id),
+            "items": [
+                {
+                    "kind": row[0], "status": row[1], "file_sha256": row[2],
+                    "sent_at": row[3], "telegram_message_id": row[4],
+                    "last_error": sanitize_runtime_error(row[5] or "") or None,
+                }
+                for row in rows
+            ],
+            "all_sent": bool(rows) and all(row[1] == "sent" for row in rows),
         }
 
     def record_profit(self, report: Mapping[str, Any], *, observed_at: float) -> None:

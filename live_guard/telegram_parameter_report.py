@@ -10,6 +10,7 @@ import csv
 import gzip
 import json
 import math
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -273,12 +274,46 @@ def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
     pdf = directory / "parameter_analysis.pdf"
     report_id = str(event["event_id"])[:24]
     if request == "grid_360d":
+        evidence_root = Path(str(
+            event.get("details", {}).get("evidence_root")
+            or os.getenv("GRID_PARAMETER_EVIDENCE_ROOT", "/workspace/grid-parameter-evidence")
+        ))
+        manifest_path = evidence_root / "grid_parameter_evidence_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Grid PNG evidence manifest is missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != "grid-parameter-mobile-evidence-v1":
+            raise ValueError("invalid Grid PNG evidence schema")
+        expected_parameter = str(event.get("parameter_sha256", ""))
+        if not expected_parameter or manifest.get("parameter_sha256") != expected_parameter:
+            raise ValueError("Grid PNG evidence is not bound to the requested parameter hash")
+        images = list(manifest.get("images", []))
+        if manifest.get("evidence_complete") is not True or len(images) != 6:
+            raise ValueError("Grid update requires BTC/ETH x three complete PNG windows")
+        labels = {
+            "360d": "过去360天",
+            "2026_jan_feb": "2026年1–2月重点窗口",
+            "2026_may_june": "2026年5–6月重点窗口",
+        }
+        photos: list[dict[str, Any]] = []
+        for row in images:
+            image_path = evidence_root / str(row["path"])
+            if not image_path.is_file() or sha256_file(image_path) != str(row["sha256"]):
+                raise ValueError(f"Grid PNG evidence hash mismatch: {image_path.name}")
+            with Image.open(image_path) as image:
+                if image.size != (WIDTH, HEIGHT):
+                    raise ValueError(f"Grid PNG is not mobile 1440x2400: {image_path.name}")
+            photos.append({
+                "path": str(image_path), "kind": "photo", "sha256": str(row["sha256"]),
+                "caption": f"GRID {row['pair']}｜{labels[str(row['window'])]}｜参数候选对照证据",
+                "evidence_complete": True,
+            })
         render_analysis_pdf({
             "title": "Grid 参数分析报告", "report_id": report_id,
             "status": event.get("transition"), "generated_at": event.get("occurred_at"),
             "parameter_version": event.get("details", {}).get("parameter_version"),
             "parameter_sha256": event.get("parameter_sha256"),
-            "evidence_complete": False, "conclusion": event.get("reason"),
+            "evidence_complete": True, "conclusion": event.get("reason"),
             "sections": [
                 {"title": "旧参数", "text": json.dumps(
                     event.get("details", {}).get("previous_parameters", {}), ensure_ascii=False,
@@ -294,14 +329,16 @@ def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
                     "reason": event.get("details", {}).get("rejection_reason", "已满足既有门槛"),
                 }, ensure_ascii=False)},
                 {"title": "证据状态", "text": (
-                    "当前候选没有哈希匹配的360天连续回放，因此不生成PNG；"
-                    "本缺失不改变原有参数部署门槛。"
+                    "已验证参数哈希绑定的BTC/ETH各三张PNG：过去360天、"
+                    "2026年1–2月和2026年5–6月；附件送达回执是后续审批前置条件。"
                 )},
             ],
         }, pdf)
-        return [{"path": str(pdf), "kind": "document",
-                 "sha256": sha256_file(pdf), "caption": "Grid参数分析PDF（360天证据缺失）",
-                 "evidence_complete": False}]
+        return [
+            {"path": str(pdf), "kind": "document", "sha256": sha256_file(pdf),
+             "caption": "Grid参数分析PDF（360天证据完整）", "evidence_complete": True},
+            *photos,
+        ]
     identity_root, evidence_root = _resolve_report_inputs(release_root, event)
     summary = _read_summary(evidence_root)
     evidence_model = str(summary.get("frozen_inputs", {}).get("model_sha256", ""))

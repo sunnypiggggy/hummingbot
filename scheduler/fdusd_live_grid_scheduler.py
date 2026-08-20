@@ -54,6 +54,10 @@ class Scheduler:
         self.fee_state_path = self.root / "private_preflight.json"
         self.canonical_selection = self.root / "active_selection.json"
         self.notification_path = self.root / "telegram_events.jsonl"
+        self.evidence_receipt_root = Path(os.getenv(
+            "PARAMETER_EVIDENCE_RECEIPT_ROOT",
+            "/workspace/dca-state/telegram/evidence_receipts",
+        ))
         self.canonical_config = self.root / PORTFOLIOS["FDUSD"].config_name
         self.macro_source = Path(
             os.getenv("GRID_LIVE_MACRO_STATE_PATH", "/workspace/macro/state.json")
@@ -228,6 +232,48 @@ class Scheduler:
             self.atomic_json(self.state_path, state)
             LOG.warning("No eligible FDUSD parameters for %s; previous version remains active.", period)
             return
+        receipt = self.read_json(
+            self.evidence_receipt_root / f"{selection_hash}.json", {}
+        ) or {}
+        unsigned_receipt = dict(receipt)
+        receipt_hash = str(unsigned_receipt.pop("delivery_receipt_sha256", ""))
+        evidence_delivered = (
+            receipt.get("schema") == "telegram-evidence-delivery-receipt-v1"
+            and receipt.get("identity_sha256") == selection_hash
+            and receipt.get("parameter_sha256") == selection_hash
+            and receipt.get("report_request") == "grid_360d"
+            and int(receipt.get("expected_photo_count", 0)) == 6
+            and len(receipt.get("photo_sha256", [])) == 6
+            and receipt_hash == canonical_sha256(unsigned_receipt)
+        )
+        if not evidence_delivered:
+            if state.get("pending_parameter_sha256") != selection_hash:
+                event = build_event(
+                    source="grid-live-fdusd-scheduler", strategy="grid",
+                    bot=PORTFOLIOS["FDUSD"].bot_name,
+                    pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                    mechanism="parameter_update", transition="PARAMETER_APPROVAL_PENDING",
+                    reason="Grid参数候选已通过计算门槛；等待6张回测PNG送达后再激活",
+                    severity="warning", action="wait_for_telegram_evidence_delivery",
+                    parameter_sha256=selection_hash, correlation_id=f"evidence:{period}",
+                    details={"parameter_version": period, "candidate": selection,
+                             "previous_parameters": previous_selection.get("parameters", {}),
+                             "best_candidate_evaluation": best_rejected,
+                             "candidate_evaluations": str(report_dir / "candidate_evaluations.csv"),
+                             "report_request": "grid_360d"},
+                )
+                append_event(self.notification_path, event)
+                state.update({
+                    "pending_parameter_sha256": selection_hash,
+                    "pending_event_id": event["event_id"],
+                    "pending_period": period,
+                    "last_evaluation": {"qualified": True, "candidate": selection,
+                                        "parameter_sha256": selection_hash,
+                                        "evidence_delivered": False},
+                })
+                self.atomic_json(self.state_path, state)
+            LOG.warning("Qualified FDUSD parameters %s are waiting for Telegram PNG evidence.", period)
+            return
         self.atomic_json(self.canonical_selection, selection)
         self.write_disabled_config(candles, selected, maker_fee, period)
         updated_instances = self.publish_to_active_instances(selection)
@@ -256,8 +302,8 @@ class Scheduler:
                      "previous_parameters": previous_selection.get("parameters", {}),
                      "best_candidate_evaluation": best_rejected,
                      "candidate_evaluations": str(report_dir / "candidate_evaluations.csv"),
-                     "report_request": "grid_360d",
-                     "candidate_and_activation_merged": True},
+                     "evidence_delivery_receipt_sha256": receipt_hash,
+                     "candidate_and_activation_merged": False},
         ))
         LOG.warning("Published FDUSD parameter version %s to %d instance(s).", period, updated_instances)
 
@@ -350,6 +396,56 @@ class Scheduler:
             }
         current = self.read_json(self.canonical_selection, None)
         if current != selection:
+            parameter_sha = canonical_sha256(selection)
+            receipt = self.read_json(
+                self.evidence_receipt_root / f"{parameter_sha}.json", {}
+            ) or {}
+            unsigned_receipt = dict(receipt)
+            receipt_hash = str(unsigned_receipt.pop("delivery_receipt_sha256", ""))
+            evidence_delivered = (
+                not self.pair_parameter_schema_v2_enabled
+                or (
+                    receipt.get("schema") == "telegram-evidence-delivery-receipt-v1"
+                    and receipt.get("identity_sha256") == parameter_sha
+                    and receipt.get("parameter_sha256") == parameter_sha
+                    and receipt.get("report_request") == "grid_360d"
+                    and int(receipt.get("expected_photo_count", 0)) == 6
+                    and len(receipt.get("photo_sha256", [])) == 6
+                    and receipt_hash == canonical_sha256(unsigned_receipt)
+                )
+            )
+            if not evidence_delivered:
+                saved = self.read_json(self.state_path, {}) or {}
+                if saved.get("pending_parameter_sha256") != parameter_sha:
+                    event = build_event(
+                        source="grid-live-fdusd-scheduler", strategy="grid",
+                        bot=PORTFOLIOS["FDUSD"].bot_name,
+                        pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                        mechanism="parameter_update", transition="PARAMETER_APPROVAL_PENDING",
+                        reason="Grid参数候选已准备；先发送6张哈希绑定PNG证据，送达后才允许激活",
+                        severity="warning", action="wait_for_telegram_evidence_delivery",
+                        parameter_sha256=parameter_sha,
+                        correlation_id=f"evidence:{selection['parameter_version']}",
+                        details={"parameter_version": selection["parameter_version"],
+                                 "pair_parameters": selection.get("pair_parameters"),
+                                 "candidate": selection,
+                                 "previous_parameters": (current or {}).get(
+                                     "pair_parameters", (current or {}).get("parameters", {})
+                                 ),
+                                 "report_request": "grid_360d"},
+                    )
+                    append_event(self.notification_path, event)
+                    saved.update({
+                        "mode": "fixed", "phase": "AWAITING_TELEGRAM_EVIDENCE",
+                        "pending_parameter_sha256": parameter_sha,
+                        "pending_event_id": event["event_id"],
+                        "parameter_updates_enabled": False,
+                    })
+                    self.atomic_json(self.state_path, saved)
+                if current:
+                    self.publish_to_active_instances(current)
+                    return current
+                return selection
             self.atomic_json(self.canonical_selection, selection)
             append_event(self.notification_path, build_event(
                 source="grid-live-fdusd-scheduler", strategy="grid",
@@ -366,15 +462,16 @@ class Scheduler:
                     if self.pair_parameter_schema_v2_enabled else
                     "publish_legacy_selection_during_consumer_upgrade"
                 ),
-                parameter_sha256=canonical_sha256(selection),
+                parameter_sha256=parameter_sha,
                 correlation_id=selection["parameter_version"],
                 details={"parameter_version": selection["parameter_version"],
                          "pair_parameters": selection.get("pair_parameters"),
-                         "report_request": "grid_360d"},
+                         "evidence_delivery_receipt_sha256": receipt_hash},
             ))
         self.publish_to_active_instances(selection)
         state = {
             "mode": "fixed",
+            "phase": "ACTIVE",
             "parameter_updates_enabled": False,
             "parameter_version": selection["parameter_version"],
             "trading_enabled": False,

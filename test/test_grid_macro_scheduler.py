@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "scheduler"))
 
 from fdusd_live_grid_scheduler import Scheduler  # noqa: E402
+from live_guard.telegram_notifications import canonical_sha256  # noqa: E402
 
 
 class GridMacroSchedulerTest(unittest.TestCase):
@@ -45,12 +46,33 @@ class GridMacroSchedulerTest(unittest.TestCase):
                 "BOTS_PATH": str(bots),
                 "GRID_LIVE_MACRO_STATE_PATH": str(macro),
                 "GRID_LIVE_PARAMETER_UPDATES_ENABLED": "false",
+                "PARAMETER_EVIDENCE_RECEIPT_ROOT": str(root / "receipts"),
             }):
                 scheduler = Scheduler()
                 with patch.object(scheduler, "ensure_staging"), patch.object(
                     scheduler, "publish_macro_gate"
                 ), patch.object(scheduler, "verified_fees") as fees:
                     scheduler.reconcile()
+                pending = json.loads((state_root / "scheduler_state.json").read_text(encoding="utf-8"))
+                self.assertEqual("AWAITING_TELEGRAM_EVIDENCE", pending["phase"])
+                self.assertFalse((state_root / "active_selection.json").exists())
+                parameter_sha = pending["pending_parameter_sha256"]
+                receipt = {
+                    "schema": "telegram-evidence-delivery-receipt-v1",
+                    "identity_sha256": parameter_sha, "source_event_id": pending["pending_event_id"],
+                    "release_sha256": "", "model_sha256": "",
+                    "parameter_sha256": parameter_sha, "report_request": "grid_360d",
+                    "expected_photo_count": 6, "photo_sha256": [str(i) * 64 for i in range(1, 7)],
+                    "delivered_at": "2026-08-20T00:00:00+00:00",
+                    "telegram_message_ids": ["1"] * 8,
+                }
+                receipt["delivery_receipt_sha256"] = canonical_sha256(receipt)
+                receipt_root = root / "receipts"
+                receipt_root.mkdir()
+                (receipt_root / f"{parameter_sha}.json").write_text(
+                    json.dumps(receipt), encoding="utf-8",
+                )
+                scheduler.ensure_fixed_selection()
             fees.assert_not_called()
             selection = json.loads(
                 (state_root / "active_selection.json").read_text(encoding="utf-8")

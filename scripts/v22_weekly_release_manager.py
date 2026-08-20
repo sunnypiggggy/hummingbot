@@ -101,6 +101,10 @@ class WeeklyReleaseManager:
         self.notification_path = notification_path
         self.grid_state_path = grid_state_path
         self.dca_state_path = dca_state_path
+        self.evidence_receipt_root = Path(os.getenv(
+            "MODEL_EVIDENCE_RECEIPT_ROOT",
+            str(dca_state_path.parent / "telegram" / "evidence_receipts"),
+        ))
         self.runtime_root = runtime_root or grid_state_path.parent / "v22-runtime"
         self.policy = policy
         self.now = now or (lambda: int(time.time()))
@@ -313,6 +317,29 @@ class WeeklyReleaseManager:
         if not str(value.get("operator", "")).strip():
             raise RuntimeError("review decision has no operator")
         return value
+
+    def _evidence_delivered(self, state: Mapping[str, Any], release: Path) -> bool:
+        """Require all twelve model-evidence PNGs to reach Telegram before approval."""
+        release_sha = str(state.get("candidate_release_sha256", ""))
+        receipt = load_json(self.evidence_receipt_root / f"{release_sha}.json", {}) or {}
+        if receipt.get("schema") != "telegram-evidence-delivery-receipt-v1":
+            return False
+        production = self._production(release)
+        if (
+            receipt.get("identity_sha256") != release_sha
+            or receipt.get("release_sha256") != release_sha
+            or receipt.get("model_sha256") != production.get("model_sha256")
+            or receipt.get("report_request") not in {"v22_png_windows", "v22_360d"}
+            or int(receipt.get("expected_photo_count", 0)) != 12
+            or len(receipt.get("photo_sha256", [])) != 12
+        ):
+            return False
+        if state.get("last_event_id") and receipt.get("source_event_id") != state.get("last_event_id"):
+            return False
+        expected = str(receipt.get("delivery_receipt_sha256", ""))
+        unsigned = dict(receipt)
+        unsigned.pop("delivery_receipt_sha256", None)
+        return expected == canonical_sha256(unsigned)
 
     def _switch_current(self, release_sha: str) -> None:
         if os.name == "nt":
@@ -546,6 +573,7 @@ class WeeklyReleaseManager:
         checks = {
             **self._candidate_checks(release, current_end=int(state["source_effective_end"])),
             **self._runtime_checks(release, observed),
+            "telegram_model_evidence_delivered": self._evidence_delivered(state, release),
         }
         if not all(checks.values()):
             state.update({"phase": "AWAITING_APPROVAL", "retry_after": observed + 300,
@@ -562,11 +590,17 @@ class WeeklyReleaseManager:
         )
         prewarm_at = max(observed, activate_at - 5 * 60)
         production = self._production(release)
+        delivery_receipt = load_json(
+            self.evidence_receipt_root / f"{release_sha}.json", {}
+        ) or {}
         evidence = {
             "schema": "ethbtc-forced-exit-12h-review-evidence-v1", "release_sha256": release_sha,
             "request_sha256": sha256_file(Path(state["request_path"])),
             "review_started_at": state["review_started_at"], "review_deadline": state["review_deadline"],
             "approved_at": observed, "approval_mode": mode, "checks": checks,
+            "telegram_evidence_delivery_sha256": delivery_receipt.get(
+                "delivery_receipt_sha256"
+            ),
         }
         evidence_path = self.work_root / f"approval-evidence-{release_sha}.json"
         atomic_json(evidence_path, evidence)
@@ -581,6 +615,9 @@ class WeeklyReleaseManager:
             "review_deadline": int(state["review_deadline"]),
             "approval_request_sha256": sha256_file(Path(state["request_path"])),
             "observation_report_sha256": sha256_file(evidence_path),
+            "telegram_evidence_delivery_sha256": delivery_receipt.get(
+                "delivery_receipt_sha256"
+            ),
             "preflight_sha256": canonical_sha256(checks),
             "auto_reentry_authorized": True, "consumed": False,
         }

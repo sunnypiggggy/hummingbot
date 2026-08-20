@@ -770,8 +770,10 @@ class ParameterReportWorker:
         self.outbox = outbox
         self.jobs = root / "jobs"
         self.results = root / "parameters"
+        self.receipts = root / "evidence_receipts"
         self.jobs.mkdir(parents=True, exist_ok=True)
         self.results.mkdir(parents=True, exist_ok=True)
+        self.receipts.mkdir(parents=True, exist_ok=True)
         self.executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=1, initializer=_low_priority_report_worker,
         )
@@ -834,6 +836,10 @@ class ParameterReportWorker:
             marker = self.active_path.with_suffix(".done")
             marker.write_text(json.dumps({
                 "event_id": event_id, "completed_at": datetime.now(timezone.utc).isoformat(),
+                "release_sha256": str(event.get("release_sha256", "")),
+                "model_sha256": str(event.get("model_sha256", "")),
+                "parameter_sha256": str(event.get("parameter_sha256", "")),
+                "report_request": str(event.get("details", {}).get("report_request", "")),
                 "attachments": attachments,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
@@ -862,6 +868,55 @@ class ParameterReportWorker:
         self.future = None
         self.active_path = None
         self.active_event = None
+
+    def finalize_delivery_receipts(self) -> int:
+        """Persist a hash-bound receipt only after Telegram accepted every item."""
+        written = 0
+        for marker in sorted(self.jobs.glob("*.done")):
+            local_receipt = marker.with_suffix(".receipt")
+            if local_receipt.exists():
+                continue
+            job = json.loads(marker.read_text(encoding="utf-8"))
+            event_id = str(job.get("event_id", ""))
+            delivery = self.outbox.event_delivery(event_id)
+            if not delivery["all_sent"]:
+                continue
+            attachments = list(job.get("attachments", []))
+            request = str(job.get("report_request", ""))
+            expected_photos = 12 if request in {"v22_png_windows", "v22_360d"} else 6
+            photos = [row for row in attachments if row.get("kind") == "photo"]
+            if len(photos) != expected_photos or any(
+                row.get("evidence_complete") is not True for row in attachments
+            ):
+                continue
+            identity = str(job.get("release_sha256") or job.get("parameter_sha256") or "")
+            if len(identity) != 64:
+                continue
+            payload = {
+                "schema": "telegram-evidence-delivery-receipt-v1",
+                "identity_sha256": identity,
+                "source_event_id": event_id,
+                "release_sha256": str(job.get("release_sha256", "")),
+                "model_sha256": str(job.get("model_sha256", "")),
+                "parameter_sha256": str(job.get("parameter_sha256", "")),
+                "report_request": request,
+                "expected_photo_count": expected_photos,
+                "photo_sha256": [str(row["sha256"]) for row in photos],
+                "delivered_at": datetime.now(timezone.utc).isoformat(),
+                "telegram_message_ids": [
+                    str(row.get("telegram_message_id") or "") for row in delivery["items"]
+                ],
+            }
+            payload["delivery_receipt_sha256"] = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            target = self.receipts / f"{identity}.json"
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, target)
+            local_receipt.write_text(str(target), encoding="utf-8")
+            written += 1
+        return written
 
     def poll(self) -> dict[str, Any]:
         if self.future is not None and self.future.done():
@@ -1406,8 +1461,10 @@ class UnifiedTelegramReporting:
             self.outbox.ingest(Path(source), attachment_builder=self.parameter_worker.schedule)
         worker = self.parameter_worker.poll()
         sent = self.outbox.drain(self.client) if self.enabled and self.client is not None else 0
+        evidence_receipts = self.parameter_worker.finalize_delivery_receipts()
         return {"enabled": self.enabled, "sent": sent, **self.outbox.health(),
-                "slot": slot, "parameter_worker": worker}
+                "slot": slot, "parameter_worker": worker,
+                "evidence_receipts_written": evidence_receipts}
 
 
 def main() -> int:
