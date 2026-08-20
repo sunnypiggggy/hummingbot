@@ -1276,6 +1276,11 @@ class UnifiedTelegramReporting:
             pair_params = active_pair_parameters.get(pair, {})
             effective_buy_layers = len(pair_order_ids & runtime_buy_ids)
             effective_sell_layers = len(pair_order_ids & runtime_sell_ids)
+            order_build = runtime.get("order_build_status", {}).get(pair, {})
+            order_build_state = str(order_build.get("state") or "UNKNOWN").upper()
+            order_build_healthy = order_build_state in {
+                "HEALTHY", "EXPECTED_EMPTY", "INTENTIONAL_IDLE",
+            }
             mechanisms = state.get("mechanisms", {})
             technical_contract = gate.get("pairs", {}).get(pair, {})
             runtime_technical = runtime.get("technical_buy_gate", {}).get(
@@ -1338,6 +1343,14 @@ class UnifiedTelegramReporting:
                 gate_row("capital_budget_gate", applicable=False, reason="not_applicable_to_grid"),
                 self._inventory_row(pair.split("-", 1)[0]),
                 gate_row(
+                    "order_execution_gate",
+                    state=order_build_state,
+                    buy_enabled=True, sell_enabled=True,
+                    health="HEALTHY" if order_build_healthy else "FAILED",
+                    reason=str(order_build.get("reason") or "runtime_order_status_unavailable"),
+                    source="grid_runtime",
+                ),
+                gate_row(
                     "recovery_phase_gate", state=phase,
                     buy_enabled=phase == "ACTIVE", sell_enabled=phase == "ACTIVE",
                     reason=str(recovery.get("reason") or phase), source="grid_runtime",
@@ -1371,7 +1384,20 @@ class UnifiedTelegramReporting:
                 "owned_base": values.get("net_base"), "fees_quote": fees,
                 "buys": buys, "sells": sells,
                 "phase": phase,
-                "active_runtime": {"orders": len(pair_order_ids)},
+                "active_runtime": {
+                    "orders": len(pair_order_ids),
+                    "expected_buy_layers": order_build.get("expected_buy_layers"),
+                    "expected_sell_layers": order_build.get("expected_sell_layers"),
+                    "actual_buy_layers": order_build.get(
+                        "actual_buy_layers", effective_buy_layers
+                    ),
+                    "actual_sell_layers": order_build.get(
+                        "actual_sell_layers", effective_sell_layers
+                    ),
+                    "order_build_state": order_build_state,
+                    "order_build_reason": order_build.get("reason"),
+                },
+                "order_build_status": order_build,
                 "grid_parameters": {
                     "profile": pair_params.get("profile"),
                     "grid_range": pair_params.get("grid_range"),

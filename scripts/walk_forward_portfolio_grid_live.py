@@ -50,6 +50,7 @@ from scripts.grid_live_common import (
     STRATEGY_BUDGET,
     PairLedger,
     budget_for_quote,
+    clip_quantized_buy_levels,
     clip_quantized_sell_levels,
     validate_active_selection,
 )
@@ -66,7 +67,8 @@ try:
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
 
-RUNTIME_STATE_SCHEMA_VERSION = 9
+RUNTIME_STATE_SCHEMA_VERSION = 10
+ORDER_REBUILD_BACKOFF_SECONDS = (5, 15, 30, 60)
 
 
 @dataclass
@@ -282,6 +284,9 @@ class LivePortfolioGrid(StrategyV2Base):
         self.pending_parameter_version: Optional[str] = None
         self.pending_parameters: Optional[Dict[str, Any]] = None
         self.parameter_blocked_pairs: Dict[str, str] = {}
+        self.order_build_status: Dict[str, Dict[str, Any]] = {
+            pair: self._empty_order_build_status() for pair in config.trading_pairs
+        }
         self.next_parameter_poll = 0.0
         self.selection_mtime_ns = -1
         self.state_invalid_reason: Optional[str] = None
@@ -414,6 +419,13 @@ class LivePortfolioGrid(StrategyV2Base):
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
+            if self._check_order_liveness_and_rebuild(prices, active):
+                self._persist(prices)
+                self.next_risk_persist = (
+                    self.current_timestamp + self.config.risk_state_persist_seconds
+                )
+                self.first_cycle_failure_at = None
+                return
             if self.current_timestamp < self.next_refresh:
                 if (
                     self.first_cycle_failure_at is not None
@@ -448,6 +460,7 @@ class LivePortfolioGrid(StrategyV2Base):
             self.logger().error("Live grid cycle failed: %s", exc)
             if isinstance(exc, ParameterBuildError):
                 self.parameter_blocked_pairs[exc.pair] = str(exc)
+                self._record_order_build_failure(exc.pair, str(exc))
                 self._record_runtime_event(
                     "grid_parameter_pair_restricted",
                     pair=exc.pair,
@@ -788,6 +801,9 @@ class LivePortfolioGrid(StrategyV2Base):
         self.active_parameter_sha256 = str(params["selection_sha256"])
         self.grid_states.clear()
         self.parameter_blocked_pairs.clear()
+        self.order_build_status = {
+            pair: self._empty_order_build_status() for pair in self.config.trading_pairs
+        }
         self.pending_parameters = None
         self.pending_parameter_version = None
         self.logger().warning("Activated live-grid parameter version %s.", self.active_parameter_version)
@@ -804,6 +820,46 @@ class LivePortfolioGrid(StrategyV2Base):
         rule = rules.get(pair) if isinstance(rules, Mapping) else None
         exchange_minimum = Decimal(str(getattr(rule, "min_notional_size", "0") or "0"))
         return max(configured, exchange_minimum)
+
+    @staticmethod
+    def _empty_order_build_status() -> Dict[str, Any]:
+        return {
+            "state": "UNKNOWN",
+            "expected_buy_layers": 0,
+            "expected_sell_layers": 0,
+            "actual_buy_layers": 0,
+            "actual_sell_layers": 0,
+            "reason": "not_built_yet",
+            "consecutive_empty_cycles": 0,
+            "first_empty_at": None,
+            "next_retry_at": None,
+            "retry_count": 0,
+            "first_failure_at": None,
+            "last_build_at": None,
+            "last_recovered_at": None,
+            "persistent_failure_notified": False,
+            "episode_id": None,
+            "last_price": None,
+            "buy_budget": None,
+            "minimum_order_quote": None,
+            "amount_step": None,
+        }
+
+    def _pair_amount_filters(self, pair: str) -> tuple[Decimal, Decimal]:
+        rules = getattr(self.connector, "trading_rules", {}) or {}
+        rule = rules.get(pair) if isinstance(rules, Mapping) else None
+        step = Decimal(str(
+            getattr(rule, "min_base_amount_increment", "0") or "0"
+        ))
+        minimum = Decimal(str(getattr(rule, "min_order_size", "0") or "0"))
+        if step < 0 or minimum < 0:
+            raise ParameterBuildError(pair, "invalid LOT_SIZE filters")
+        return step, minimum
+
+    def _order_status(self, pair: str) -> Dict[str, Any]:
+        if not hasattr(self, "order_build_status"):
+            self.order_build_status = {}
+        return self.order_build_status.setdefault(pair, self._empty_order_build_status())
 
     def _quantized_amount(self, pair: str, amount: Decimal) -> Decimal:
         quantizer = getattr(self.connector, "quantize_order_amount", None)
@@ -836,6 +892,177 @@ class LivePortfolioGrid(StrategyV2Base):
             lambda amount: self._quantized_amount(pair, amount),
         )
 
+    def _build_buy_orders(
+        self, pair: str, levels: List[Decimal], buy_budget: Decimal,
+    ) -> List[tuple[Decimal, Decimal]]:
+        """Build nearest BUY layers using upward amount-step normalization."""
+        minimum = self._pair_minimum_order_quote(pair)
+        amount_step, minimum_amount = self._pair_amount_filters(pair)
+        return clip_quantized_buy_levels(
+            levels,
+            buy_budget,
+            minimum,
+            lambda level: self._quantized_price(pair, level),
+            lambda amount: self._quantized_amount(pair, amount),
+            amount_step=amount_step,
+            minimum_amount=minimum_amount,
+        )
+
+    def _record_order_build_failure(self, pair: str, reason: str) -> None:
+        status = self._order_status(pair)
+        now = float(self.current_timestamp)
+        first_failure = status.get("first_failure_at")
+        if first_failure is None:
+            first_failure = now
+            status["first_failure_at"] = now
+            status["episode_id"] = f"{pair}:{now:.3f}"
+            self._record_runtime_event(
+                "grid_order_set_missing", pair=pair, reason=reason,
+                episode_id=status["episode_id"],
+                price=str(status.get("last_price") or ""),
+                buy_budget=str(status.get("buy_budget") or ""),
+                minimum_order_quote=str(status.get("minimum_order_quote") or ""),
+                amount_step=str(status.get("amount_step") or ""),
+            )
+        retry_count = int(status.get("retry_count", 0))
+        delay = ORDER_REBUILD_BACKOFF_SECONDS[min(
+            retry_count, len(ORDER_REBUILD_BACKOFF_SECONDS) - 1
+        )]
+        status.update({
+            "state": "RETRYING" if now - float(first_failure) < 60 else "RESTRICTED",
+            "reason": reason,
+            "next_retry_at": now + delay,
+            "retry_count": retry_count + 1,
+        })
+        if now - float(first_failure) >= 60 and not status.get("persistent_failure_notified"):
+            status["persistent_failure_notified"] = True
+            self._record_runtime_event(
+                "grid_order_rebuild_failed", pair=pair, reason=reason,
+                retry_count=status["retry_count"], episode_id=status.get("episode_id"),
+            )
+
+    def _mark_order_build_healthy(
+        self, pair: str, *, expected_buy: int, expected_sell: int,
+        actual_buy: int, actual_sell: int, reason: str = "orders_submitted",
+    ) -> None:
+        status = self._order_status(pair)
+        previous_state = str(status.get("state", "UNKNOWN"))
+        was_failure = status.get("first_failure_at") is not None
+        episode_id = status.get("episode_id")
+        previous_reason = str(status.get("reason") or "expected_orders_missing")
+        first_failure_at = status.get("first_failure_at")
+        status.update({
+            "state": "HEALTHY" if actual_buy + actual_sell > 0 else "EXPECTED_EMPTY",
+            "expected_buy_layers": int(expected_buy),
+            "expected_sell_layers": int(expected_sell),
+            "actual_buy_layers": int(actual_buy),
+            "actual_sell_layers": int(actual_sell),
+            "reason": reason,
+            "consecutive_empty_cycles": 0,
+            "first_empty_at": None,
+            "next_retry_at": None,
+            "retry_count": 0,
+            "first_failure_at": None,
+            "last_build_at": float(self.current_timestamp),
+            "persistent_failure_notified": False,
+            "episode_id": None,
+        })
+        if was_failure or previous_state in {"MISSING", "RETRYING", "RESTRICTED"}:
+            status["last_recovered_at"] = float(self.current_timestamp)
+            self._record_runtime_event(
+                "grid_order_set_recovered", pair=pair,
+                reason="pair_order_set_rebuilt",
+                actual_buy_layers=actual_buy, actual_sell_layers=actual_sell,
+                episode_id=episode_id,
+                error_summary=previous_reason,
+                duration_seconds=(
+                    max(0.0, float(self.current_timestamp) - float(first_failure_at))
+                    if first_failure_at is not None else 0.0
+                ),
+            )
+
+    def _pair_order_counts(self, pair: str, active_orders: list) -> tuple[int, int]:
+        active_ids = {
+            str(order.client_order_id)
+            for order in active_orders
+            if str(getattr(order, "trading_pair", "")) == pair
+        }
+        return (
+            len(active_ids & self.buy_order_ids),
+            len(active_ids & self.sell_order_ids),
+        )
+
+    def _check_order_liveness_and_rebuild(
+        self, prices: Dict[str, Decimal], active_orders: list,
+    ) -> bool:
+        """Detect and rebuild only the affected pair; never cancel its peer."""
+        rebuilt = False
+        now = float(self.current_timestamp)
+        for pair in self.config.trading_pairs:
+            status = self._order_status(pair)
+            buy_count, sell_count = self._pair_order_counts(pair, active_orders)
+            status["actual_buy_layers"] = buy_count
+            status["actual_sell_layers"] = sell_count
+            expected = int(status.get("expected_buy_layers", 0)) + int(
+                status.get("expected_sell_layers", 0)
+            )
+            actual = buy_count + sell_count
+            pair_active = (
+                self.pair_recovery.get(pair, {}).get("phase") == ACTIVE
+                and not self.ledgers[pair].halted
+                and not self.macro_paused
+                and self.technical_gate_healthy_by_pair.get(pair, False)
+            )
+            if (
+                not self.technical_buy_enabled_by_pair.get(pair, False)
+                and int(status.get("expected_sell_layers", 0)) == 0
+            ):
+                status.update({
+                    "state": "INTENTIONAL_IDLE",
+                    "expected_buy_layers": 0,
+                    "reason": "technical_buy_gate_blocks_buy",
+                    "consecutive_empty_cycles": 0,
+                    "first_empty_at": None,
+                })
+                continue
+            if not pair_active or expected <= 0:
+                status["consecutive_empty_cycles"] = 0
+                status["first_empty_at"] = None
+                continue
+            if actual > 0:
+                if status.get("state") in {"MISSING", "RETRYING", "RESTRICTED"}:
+                    self._mark_order_build_healthy(
+                        pair, expected_buy=int(status.get("expected_buy_layers", 0)),
+                        expected_sell=int(status.get("expected_sell_layers", 0)),
+                        actual_buy=buy_count, actual_sell=sell_count,
+                        reason="active_orders_confirmed",
+                    )
+                continue
+            if status.get("first_empty_at") is None:
+                status["first_empty_at"] = now
+            status["consecutive_empty_cycles"] = int(
+                status.get("consecutive_empty_cycles", 0)
+            ) + 1
+            empty_age = now - float(status["first_empty_at"])
+            if status["consecutive_empty_cycles"] < 3 or empty_age < 5:
+                continue
+            if status.get("state") not in {"MISSING", "RETRYING", "RESTRICTED"}:
+                status["state"] = "MISSING"
+                self._record_order_build_failure(pair, "expected_orders_missing")
+            next_retry = status.get("next_retry_at")
+            if next_retry is not None and now < float(next_retry):
+                continue
+            try:
+                # Available balance excludes quote locked by the other pair,
+                # so this targeted rebuild cannot consume or cancel peer orders.
+                self._place_pair_grid(
+                    pair, prices[pair], self._available_balance(self.config.quote_asset),
+                )
+                rebuilt = True
+            except ParameterBuildError as exc:
+                self._record_order_build_failure(pair, str(exc))
+        return rebuilt
+
     def _place_grids(self, prices: Dict[str, Decimal]) -> None:
         # Exchange available balances already exclude quantities locked by
         # orders from a previous process.  Ledger budgets retain strategy
@@ -855,6 +1082,7 @@ class LivePortfolioGrid(StrategyV2Base):
                     )
             except ParameterBuildError as exc:
                 reason = str(exc)
+                self._record_order_build_failure(pair, reason)
                 previous_reason = self.parameter_blocked_pairs.get(pair)
                 self.parameter_blocked_pairs[pair] = reason
                 self.grid_states.pop(pair, None)
@@ -893,46 +1121,67 @@ class LivePortfolioGrid(StrategyV2Base):
                 Decimal("0"),
             ))
         buy_budget = min(*buy_limits, remaining_quote)
+        minimum_order_quote = self._pair_minimum_order_quote(pair)
+        amount_step, _ = self._pair_amount_filters(pair)
+        buy_orders: List[tuple[Decimal, Decimal]] = []
         if lower_levels and self.technical_buy_enabled_by_pair.get(pair, False):
-            minimum_order_quote = self._pair_minimum_order_quote(pair)
-            affordable_levels = int(buy_budget // minimum_order_quote)
-            selected_lower_levels = sorted(lower_levels, reverse=True)[:affordable_levels]
-            order_quote = (
-                buy_budget / Decimal(len(selected_lower_levels))
-                if selected_lower_levels else Decimal("0")
+            buy_orders = self._build_buy_orders(pair, lower_levels, buy_budget)
+            if buy_budget >= minimum_order_quote and not buy_orders:
+                status = self._order_status(pair)
+                status.update({
+                    "last_price": str(price), "buy_budget": str(buy_budget),
+                    "minimum_order_quote": str(minimum_order_quote),
+                    "amount_step": str(amount_step),
+                })
+                raise ParameterBuildError(
+                    pair,
+                    f"BUY build produced no executable order: price={price} "
+                    f"budget={buy_budget} minimum={minimum_order_quote} step={amount_step}",
+                )
+        submitted_quote = Decimal("0")
+        submitted_buy = 0
+        for order_price, amount in buy_orders:
+            order_id = self.buy(
+                self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, order_price,
             )
-            submitted_quote = Decimal("0")
-            if order_quote >= minimum_order_quote:
-                for level in selected_lower_levels:
-                    order_price = self._quantized_price(pair, level)
-                    amount = self._quantized_amount(pair, order_quote / order_price)
-                    if amount * order_price < minimum_order_quote:
-                        continue
-                    order_id = self.buy(
-                        self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, order_price,
-                    )
-                    ledger.open_order_ids.add(order_id)
-                    self.buy_order_ids.add(order_id)
-                    submitted_quote += amount * order_price
-            remaining_quote = max(remaining_quote - submitted_quote, Decimal("0"))
+            ledger.open_order_ids.add(order_id)
+            self.buy_order_ids.add(order_id)
+            submitted_quote += amount * order_price
+            submitted_buy += 1
+        remaining_quote = max(remaining_quote - submitted_quote, Decimal("0"))
         base_asset = pair.split("-", 1)[0]
         sell_budget = min(
             max(ledger.base, Decimal("0")), ledger.initial_base,
             self._available_balance(base_asset),
         )
+        sell_orders: List[tuple[Decimal, Decimal]] = []
         if upper_levels and sell_budget > 0:
             cost_floor = (
                 ledger.minimum_profitable_sell_price(self._inventory_profit_floor_rate(pair))
                 if self.config.cost_floor_enabled else Decimal("0")
             )
-            for sell_price, amount in self._build_sell_orders(
+            sell_orders = self._build_sell_orders(
                 pair, upper_levels, sell_budget, price, cost_floor,
-            ):
+            )
+            for sell_price, amount in sell_orders:
                 order_id = self.sell(
                     self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, sell_price,
                 )
                 ledger.open_order_ids.add(order_id)
                 self.sell_order_ids.add(order_id)
+        expected_buy = len(buy_orders)
+        expected_sell = len(sell_orders)
+        if expected_buy + expected_sell == 0:
+            reason = (
+                "technical_buy_gate_blocks_buy" if not self.technical_buy_enabled_by_pair.get(pair, False)
+                else "insufficient_budget_or_inventory_for_legal_order"
+            )
+        else:
+            reason = "orders_submitted"
+        self._mark_order_build_healthy(
+            pair, expected_buy=expected_buy, expected_sell=expected_sell,
+            actual_buy=submitted_buy, actual_sell=len(sell_orders), reason=reason,
+        )
         return remaining_quote
 
     def _available_balance(self, asset: str) -> Decimal:
@@ -1408,6 +1657,9 @@ class LivePortfolioGrid(StrategyV2Base):
             "integrity_failure_latched": ("infrastructure_integrity_breaker", "EXITING", "critical"),
             "grid_parameter_pair_restricted": ("parameter_update", "ACTION_FAILED", "critical"),
             "grid_parameter_pair_recovered": ("parameter_update", "RECOVERED", "info"),
+            "grid_order_set_missing": ("runtime_error", "ERROR_OCCURRED", "warning"),
+            "grid_order_rebuild_failed": ("runtime_error", "ERROR_OCCURRED", "critical"),
+            "grid_order_set_recovered": ("runtime_error", "ERROR_RECOVERED", "info"),
         }
         mapped = mapping.get(runtime_event)
         if not mapped or not mapped[0]:
@@ -1420,6 +1672,7 @@ class LivePortfolioGrid(StrategyV2Base):
         signal = self.technical_signal_by_pair.get(pair, {}) if pair in self.technical_signal_by_pair else {}
         correlation = str(
             signal.get("event_id") or recovery.get("triggered_at")
+            or details.get("episode_id")
             or f"{runtime_event}:{pair}:{reason}"
         )
         target = Path(self.config.runtime_state_file).parent / "telegram_events.jsonl"
@@ -1429,6 +1682,21 @@ class LivePortfolioGrid(StrategyV2Base):
                 and not bool(getattr(self.config, "risk_auto_reentry_enabled", False))
             )
             event_details = dict(details)
+            if mechanism == "runtime_error":
+                event_details.update({
+                    "component": f"grid_order_execution:{pair}",
+                    "error_summary": str(
+                        details.get("error_summary") or reason
+                    ),
+                    "trading_impact": (
+                        "仅该交易对自动重建挂单；不清仓、不锁存，"
+                        "不影响另一个交易对或既有风控门"
+                    ),
+                    "trading_status": (
+                        f"已恢复 B{details.get('actual_buy_layers', 0)} / "
+                        f"S{details.get('actual_sell_layers', 0)} 个挂单"
+                    ),
+                })
             if mechanism == "fomc_gate" and details.get("paused") is not None:
                 event_details.update({
                     "buy_enabled": not bool(details.get("paused")),
@@ -1597,7 +1865,7 @@ class LivePortfolioGrid(StrategyV2Base):
         try:
             state = json.loads(target.read_text(encoding="utf-8"))
             schema_version = int(state.get("schema_version", -1))
-            if schema_version not in {2, 3, 4, 5, 6, 7, 8, RUNTIME_STATE_SCHEMA_VERSION}:
+            if schema_version not in {2, 3, 4, 5, 6, 7, 8, 9, RUNTIME_STATE_SCHEMA_VERSION}:
                 raise ValueError("runtime state schema version mismatch")
             if tuple(state.get("trading_pairs", ())) != tuple(self.config.trading_pairs):
                 raise ValueError("runtime state trading pairs mismatch")
@@ -1677,6 +1945,18 @@ class LivePortfolioGrid(StrategyV2Base):
                 for pair, reason in state.get("parameter_blocked_pairs", {}).items()
                 if pair in restored
             }
+            saved_order_status = state.get("order_build_status", {})
+            if schema_version >= 10 and isinstance(saved_order_status, dict):
+                normalized_status: Dict[str, Dict[str, Any]] = {}
+                for pair in restored:
+                    defaults = self._empty_order_build_status()
+                    raw = saved_order_status.get(pair, {})
+                    if isinstance(raw, dict):
+                        defaults.update({
+                            key: value for key, value in raw.items() if key in defaults
+                        })
+                    normalized_status[pair] = defaults
+                self.order_build_status = normalized_status
             self.runtime_events = [
                 value for value in state.get("runtime_events", [])
                 if isinstance(value, dict)
@@ -1758,6 +2038,7 @@ class LivePortfolioGrid(StrategyV2Base):
             "active_parameter_version": self.active_parameter_version,
             "active_parameter_sha256": self.active_parameter_sha256,
             "parameter_blocked_pairs": self.parameter_blocked_pairs,
+            "order_build_status": self.order_build_status,
             "cost_floor_enabled": self.config.cost_floor_enabled,
             "pair_breakers_enabled": self.config.pair_breakers_enabled,
             "portfolio_breakers_enabled": self.config.portfolio_breakers_enabled,

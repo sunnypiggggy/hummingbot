@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 import hashlib
 import json
 import os
@@ -271,6 +271,84 @@ def clip_quantized_sell_levels(
             and amount * Decimal(len(built)) <= sell_budget
             and all(price * quantity >= minimum_order_quote for price, quantity in built)
         ):
+            return built
+        candidates.pop()
+    return []
+
+
+def clip_quantized_buy_levels(
+    levels: Sequence[Decimal],
+    buy_budget_quote: Decimal,
+    minimum_order_quote: Decimal,
+    price_for_level: Callable[[Decimal], Decimal],
+    quantize_amount: Callable[[Decimal], Decimal],
+    *,
+    amount_step: Decimal = Decimal("0"),
+    minimum_amount: Decimal = Decimal("0"),
+) -> list[tuple[Decimal, Decimal]]:
+    """Build the nearest executable BUY levels without exceeding the budget.
+
+    Binance's amount quantizer rounds quantities down.  When the budget is an
+    exact multiple of the minimum notional this can turn every nominally valid
+    order into an order just below the exchange minimum.  BUY quantities are
+    therefore rounded *up* to the amount step before the connector performs its
+    final quantization.  If the rounded orders do not fit, the farthest level is
+    removed and the remaining budget is redistributed.
+
+    SELL orders deliberately keep using :func:`clip_quantized_sell_levels` and
+    downward quantization so this helper can never create an oversell.
+    """
+    budget = max(Decimal(str(buy_budget_quote)), Decimal("0"))
+    minimum_quote = max(Decimal(str(minimum_order_quote)), Decimal("0"))
+    step = max(Decimal(str(amount_step)), Decimal("0"))
+    min_amount = max(Decimal(str(minimum_amount)), Decimal("0"))
+    if budget <= 0 or minimum_quote <= 0 or budget < minimum_quote:
+        return []
+
+    # Lower Grid levels arrive below the market.  Descending order keeps the
+    # closest price first; reducing the candidate count removes the farthest.
+    candidates = sorted((Decimal(str(level)) for level in levels), reverse=True)
+    candidates = candidates[:min(len(candidates), int(budget // minimum_quote))]
+    initial_count = len(candidates)
+    if initial_count == 0:
+        return []
+    # Keep the original per-layer allocation while clipping. Re-dividing the
+    # entire budget after every removal would make an upward-rounded final
+    # layer exceed the budget forever (including when only one layer remains).
+    per_order_budget = budget / Decimal(initial_count)
+    while candidates:
+        built: list[tuple[Decimal, Decimal]] = []
+        valid = True
+        for level in candidates:
+            price = Decimal(str(price_for_level(level)))
+            if price <= 0:
+                valid = False
+                break
+            raw_amount = max(per_order_budget / price, minimum_quote / price, min_amount)
+            if step > 0:
+                raw_amount = (
+                    (raw_amount / step).to_integral_value(rounding=ROUND_CEILING) * step
+                )
+            amount = max(Decimal(str(quantize_amount(raw_amount))), Decimal("0"))
+            # A connector may apply a second downward normalization.  Advance
+            # one exchange step at a time until the actual quantized order is
+            # executable.  The budget check below still prevents overspending.
+            attempts = 0
+            while (
+                step > 0
+                and amount > 0
+                and (amount < min_amount or price * amount < minimum_quote)
+                and attempts < 4
+            ):
+                raw_amount += step
+                amount = max(Decimal(str(quantize_amount(raw_amount))), Decimal("0"))
+                attempts += 1
+            if amount <= 0 or amount < min_amount or price * amount < minimum_quote:
+                valid = False
+                break
+            built.append((price, amount))
+        total_quote = sum((price * amount for price, amount in built), Decimal("0"))
+        if valid and len(built) == len(candidates) and total_quote <= budget:
             return built
         candidates.pop()
     return []

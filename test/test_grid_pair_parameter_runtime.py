@@ -7,7 +7,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.grid_live_common import clip_quantized_sell_levels  # noqa: E402
+from scripts.grid_live_common import (  # noqa: E402
+    clip_quantized_buy_levels,
+    clip_quantized_sell_levels,
+)
 
 
 class PairParameterRuntimeTest(unittest.TestCase):
@@ -38,6 +41,52 @@ class PairParameterRuntimeTest(unittest.TestCase):
         self.assertEqual(len(orders), 9)
         self.assertTrue(all(price * amount >= Decimal("10") for price, amount in orders))
         self.assertLessEqual(sum(amount for _, amount in orders), Decimal("0.05069"))
+
+    def test_btc_exact_minimum_budget_rounds_buy_up_and_clips_farthest(self):
+        # Production incident: 13 lower levels, 100 FDUSD budget, a 10 FDUSD
+        # floor and BTC's 0.00001 amount step at roughly 71,532 FDUSD.
+        levels = [
+            Decimal("65143.50") + Decimal(index) * Decimal("679.46")
+            for index in range(13)
+        ]
+        orders = clip_quantized_buy_levels(
+            levels,
+            Decimal("100"),
+            Decimal("10"),
+            lambda level: level.quantize(Decimal("0.01")),
+            self.quantizer(Decimal("0.00001")),
+            amount_step=Decimal("0.00001"),
+            minimum_amount=Decimal("0.00001"),
+        )
+        self.assertGreaterEqual(len(orders), 1)
+        self.assertLess(len(orders), 10)  # ten upward-rounded orders exceed 100
+        self.assertTrue(all(price * amount >= Decimal("10") for price, amount in orders))
+        self.assertLessEqual(
+            sum((price * amount for price, amount in orders), Decimal("0")),
+            Decimal("100"),
+        )
+        self.assertEqual(
+            sorted((price for price, _ in orders), reverse=True),
+            [price for price, _ in orders],
+        )
+
+    def test_buy_builder_respects_dynamic_minimum_and_min_quantity(self):
+        levels = [Decimal("1800"), Decimal("1850"), Decimal("1900")]
+        orders = clip_quantized_buy_levels(
+            levels, Decimal("35"), Decimal("11"), lambda value: value,
+            self.quantizer(Decimal("0.0001")),
+            amount_step=Decimal("0.0001"), minimum_amount=Decimal("0.006"),
+        )
+        self.assertTrue(orders)
+        self.assertTrue(all(amount >= Decimal("0.006") for _, amount in orders))
+        self.assertTrue(all(price * amount >= Decimal("11") for price, amount in orders))
+        self.assertLessEqual(sum(price * amount for price, amount in orders), Decimal("35"))
+
+    def test_buy_builder_returns_explicit_empty_below_minimum_budget(self):
+        self.assertEqual([], clip_quantized_buy_levels(
+            [Decimal("70000")], Decimal("9.99"), Decimal("10"), lambda value: value,
+            self.quantizer(Decimal("0.00001")), amount_step=Decimal("0.00001"),
+        ))
 
 
 if __name__ == "__main__":

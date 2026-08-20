@@ -17,6 +17,7 @@ GATE_LABELS = {
     "infrastructure_integrity_breaker": "基础设施/完整性",
     "capital_budget_gate": "资金预算告警",
     "inventory_ownership_gate": "库存归属门",
+    "order_execution_gate": "挂单执行状态",
     "recovery_phase_gate": "退出/冷却/重入",
     "controller_application_gate": "控制器落地",
 }
@@ -80,6 +81,11 @@ def evaluate_status(
         trade_mode = phase_modes[normalized_phase]
     elif unknown_decision:
         trade_mode = "UNKNOWN"
+    elif failed and buy_enabled and sell_enabled:
+        # Diagnostic execution failures (for example an expected Grid with no
+        # live orders) do not revoke risk permissions, but must never be
+        # presented as normal trading.
+        trade_mode = "EXECUTION_DEGRADED"
     elif buy_enabled and sell_enabled:
         trade_mode = "NORMAL"
     elif not buy_enabled and sell_enabled:

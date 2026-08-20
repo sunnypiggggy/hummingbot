@@ -68,6 +68,19 @@ def test_capital_budget_alert_only_does_not_block_normal_trading():
     assert value["blockers"] == []
 
 
+def test_zero_order_execution_failure_is_not_reported_as_normal_trading():
+    value = status(
+        gate_row("v22_weekly_buy_gate"),
+        gate_row("order_execution_gate", state="RETRYING",
+                 buy_enabled=True, sell_enabled=True, health="FAILED",
+                 reason="expected_orders_missing"),
+    )
+    assert value["system_health"] == "FAILED"
+    assert value["trade_mode"] == "EXECUTION_DEGRADED"
+    assert value["trading_normal"] is False
+    assert value["final_permissions"] == {"buy_enabled": True, "sell_enabled": True}
+
+
 def test_report_marks_isolated_prewarm_without_changing_current_model_semantics():
     phase = UnifiedTelegramReporting._reported_cutover_phase(
         {

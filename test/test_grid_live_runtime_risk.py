@@ -2,7 +2,7 @@ import sys
 import signal
 import unittest
 from unittest.mock import patch
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +59,7 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             max_extra_inventory_hold_seconds=48 * 3600,
             take_profit=Decimal("0.006"),
             min_order_quote=Decimal("5"),
+            side_budget_quote=Decimal("100"),
             move_threshold=Decimal("0.015"),
             min_grid_move_seconds=1800,
             startup_order_reconcile_seconds=30,
@@ -114,13 +115,111 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             }
             for pair in strategy.config.trading_pairs
         }
+        strategy.grid_states = {}
+        strategy.pair_recovery = {
+            pair: active_state() for pair in strategy.config.trading_pairs
+        }
+        strategy.portfolio_recovery = active_state()
         strategy.parameter_blocked_pairs = {}
+        strategy.order_build_status = {
+            pair: strategy._empty_order_build_status()
+            for pair in strategy.config.trading_pairs
+        }
         strategy.active_parameter_version = "test-legacy-shared"
         strategy.active_parameter_sha256 = "test"
         strategy.integrity_failure_grace = {}
         strategy.runtime_events = []
         strategy._append_notification_event = lambda *args, **kwargs: None
         return strategy
+
+    def test_btc_incident_builds_executable_buy_orders_with_exact_budget(self):
+        strategy = self.strategy()
+        strategy.pair_parameters["BTC-FDUSD"].update({
+            "profile": "medium_sideways",
+            "grid_range": Decimal("0.12698379475402316"),
+            "grid_levels": 18,
+            "minimum_order_quote": Decimal("10"),
+        })
+        strategy.connector.trading_rules = {
+            "BTC-FDUSD": SimpleNamespace(
+                min_notional_size=Decimal("10"),
+                min_base_amount_increment=Decimal("0.00001"),
+                min_order_size=Decimal("0.00001"),
+            )
+        }
+        strategy.connector.quantize_order_amount = lambda pair, amount: (
+            (Decimal(amount) / Decimal("0.00001")).to_integral_value(
+                rounding=ROUND_DOWN
+            ) * Decimal("0.00001")
+        )
+        strategy.connector.quantize_order_price = lambda pair, order_price: (
+            Decimal(order_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        )
+        price = Decimal("71532")
+        strategy.grid_states["BTC-FDUSD"] = strategy._new_grid("BTC-FDUSD", price)
+        strategy.connector.available["FDUSD"] = Decimal("100")
+        strategy.connector.available["BTC"] = Decimal("0")
+        # Reproduce the live inventory deficit that makes the full 100 FDUSD
+        # BUY-side budget available (rather than the 10 FDUSD extra-inventory cap).
+        strategy.ledgers["BTC-FDUSD"].base = Decimal("0")
+        strategy.ledgers["BTC-FDUSD"].base_cost_quote = Decimal("0")
+        submitted = []
+        strategy.buy = lambda exchange, pair, amount, order_type, order_price: (
+            submitted.append((pair, amount, order_price)) or f"buy-{len(submitted)}"
+        )
+        strategy.sell = lambda *args, **kwargs: self.fail("unexpected sell")
+
+        remaining = strategy._place_pair_grid("BTC-FDUSD", price, Decimal("100"))
+
+        self.assertTrue(submitted)
+        self.assertTrue(all(amount * order_price >= Decimal("10")
+                            for _, amount, order_price in submitted))
+        total = sum((amount * order_price for _, amount, order_price in submitted), Decimal("0"))
+        self.assertLessEqual(total, Decimal("100"))
+        self.assertEqual(Decimal("100") - total, remaining)
+        self.assertEqual("HEALTHY", strategy.order_build_status["BTC-FDUSD"]["state"])
+
+    def test_targeted_btc_rebuild_does_not_touch_eth_orders(self):
+        strategy = self.strategy()
+        strategy.pair_recovery = {pair: active_state() for pair in strategy.config.trading_pairs}
+        strategy.ledgers["BTC-FDUSD"].halted = False
+        status = strategy.order_build_status["BTC-FDUSD"]
+        status.update({
+            "state": "RETRYING", "expected_buy_layers": 6,
+            "expected_sell_layers": 0, "consecutive_empty_cycles": 3,
+            "first_empty_at": 900.0, "first_failure_at": 900.0,
+            "next_retry_at": 999.0, "retry_count": 1,
+        })
+        eth_order = Order("eth-live", "ETH-FDUSD")
+        strategy.sell_order_ids.add("eth-live")
+        strategy.ledgers["ETH-FDUSD"].open_order_ids.add("eth-live")
+        rebuilt = []
+        strategy._place_pair_grid = lambda pair, price, quote: (
+            rebuilt.append((pair, price, quote)) or quote
+        )
+
+        changed = strategy._check_order_liveness_and_rebuild(
+            {"BTC-FDUSD": Decimal("71532"), "ETH-FDUSD": Decimal("2100")},
+            [eth_order],
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(["BTC-FDUSD"], [value[0] for value in rebuilt])
+        self.assertIn("eth-live", strategy.ledgers["ETH-FDUSD"].open_order_ids)
+
+    def test_risk_off_pair_does_not_trigger_zero_order_rebuild(self):
+        strategy = self.strategy()
+        strategy.order_build_status["BTC-FDUSD"].update({
+            "state": "HEALTHY", "expected_buy_layers": 6,
+            "expected_sell_layers": 0,
+        })
+        strategy.technical_gate_healthy_by_pair["BTC-FDUSD"] = False
+        calls = []
+        strategy._place_pair_grid = lambda *args: calls.append(args)
+        strategy._check_order_liveness_and_rebuild(
+            {"BTC-FDUSD": Decimal("71532"), "ETH-FDUSD": Decimal("2100")}, []
+        )
+        self.assertEqual([], calls)
 
     def test_market_fill_fee_conversion_failure_uses_taker_not_maker_rate(self):
         strategy = self.strategy()
@@ -435,6 +534,7 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy.config.trading_pairs = ["BTC-FDUSD"]
         strategy.config.side_budget_quote = Decimal("100")
         strategy.config.min_order_quote = Decimal("5.25")
+        strategy.pair_parameters["BTC-FDUSD"]["minimum_order_quote"] = Decimal("5.25")
         strategy.ledgers = {"BTC-FDUSD": strategy.ledgers["BTC-FDUSD"]}
         strategy.grid_states = {"BTC-FDUSD": GridState(
             lower=Decimal("37000"), upper=Decimal("41000"),

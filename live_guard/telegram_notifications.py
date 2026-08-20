@@ -1033,6 +1033,7 @@ TRADE_MODE_DISPLAY = {
     "REENTRY": "等待重入，暂停交易",
     "LATCHED": "已锁存，暂停交易",
     "STOPPED": "机器人已停止",
+    "EXECUTION_DEGRADED": "交易异常/自动重建中",
     "UNKNOWN": "交易状态未知",
 }
 PHASE_DISPLAY = {
@@ -1054,6 +1055,12 @@ GATE_STATE_DISPLAY = {
     "MISMATCH": "未同步",
     "DISABLED": "已关闭",
     "UNAVAILABLE": "不可用",
+    "HEALTHY": "挂单正常",
+    "EXPECTED_EMPTY": "预期无挂单",
+    "INTENTIONAL_IDLE": "门控预期暂停",
+    "MISSING": "挂单缺失",
+    "RETRYING": "自动重建中",
+    "RESTRICTED": "该交易对受限",
     "N/A": "不适用",
 }
 GATE_REASON_DISPLAY = {
@@ -1067,6 +1074,13 @@ GATE_REASON_DISPLAY = {
     "already_classified_dust": "已归类Dust，不影响交易",
     "quote_budget_available": "资金预算充足",
     "runtime_consumed_current_gates": "运行时已应用最新门控",
+    "orders_submitted": "挂单已提交",
+    "active_orders_confirmed": "活动挂单已确认",
+    "expected_orders_missing": "应有挂单但当前为零",
+    "pair_order_set_rebuilt": "挂单已自动恢复",
+    "technical_buy_gate_blocks_buy": "模型门预期阻止BUY",
+    "insufficient_budget_or_inventory_for_legal_order": "余额不足以形成合格订单",
+    "runtime_order_status_unavailable": "暂无挂单执行状态",
     "unchanged": "控制器已同步",
     "ACTIVE": "正常交易",
 }
@@ -1217,6 +1231,16 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         ("恢复状态", phase_display(report.get("phase"))),
         ("活动订单/执行器", _runtime_summary(report.get("active_runtime", {}))),
     ]
+    order_runtime = report.get("active_runtime", {})
+    if report.get("strategy") == "grid" and isinstance(order_runtime, Mapping):
+        metrics.append((
+            "挂单执行",
+            f"{order_runtime.get('order_build_state', 'UNKNOWN')} "
+            f"B{order_runtime.get('actual_buy_layers', '-')}/"
+            f"{order_runtime.get('expected_buy_layers', '-')} "
+            f"S{order_runtime.get('actual_sell_layers', '-')}/"
+            f"{order_runtime.get('expected_sell_layers', '-')}",
+        ))
     grid_parameters = report.get("grid_parameters")
     if isinstance(grid_parameters, Mapping) and grid_parameters:
         profile_labels = {
@@ -1258,8 +1282,8 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         draw.text((x, table_top + 16), label, fill="#172033",
                   font=report_font(24, bold=True))
     draw.line((85, table_top + 55, 1355, table_top + 55), fill="#cbd5e1", width=2)
-    for index, row in enumerate(status.get("gate_statuses", [])[:12]):
-        y = table_top + 65 + index * 53
+    for index, row in enumerate(status.get("gate_statuses", [])[:13]):
+        y = table_top + 65 + index * 49
         if index % 2:
             draw.rectangle((82, y - 5, 1358, y + 43), fill="#f8fafc")
         blocked = (
