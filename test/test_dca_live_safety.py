@@ -523,6 +523,52 @@ class DcaLiveSafetyTest(unittest.TestCase):
             self.assertFalse(profile["macro_buy_enabled"])
             self.assertFalse(profile["macro_sell_enabled"])
 
+    def test_aggregate_gate_persists_sell_stop_event_when_permissions_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "bot.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE Controllers (id TEXT, timestamp FLOAT, config JSON)"
+            )
+            connection.execute(
+                "INSERT INTO Controllers VALUES (?, ?, ?)",
+                (
+                    "dca_ethusdt_live_200",
+                    1,
+                    json.dumps({
+                        "macro_buy_enabled": True,
+                        "macro_sell_enabled": True,
+                        "sell_stop_event_at": 0,
+                        "sell_stop_event_id": "",
+                    }),
+                ),
+            )
+            connection.commit()
+            connection.close()
+            guard = Guard.__new__(Guard)
+            guard.api = FakeApi()
+
+            result = guard._set_effective_gates(
+                "dca-live-ethusdt-200",
+                {"database": str(database)},
+                buy_enabled=True,
+                sell_enabled=True,
+                reasons={
+                    "sell_stop_event": {
+                        "timestamp": 1234.5,
+                        "executor_id": "sell-stop-1",
+                        "side": "sell",
+                    },
+                },
+            )
+
+            self.assertEqual("applied", result["status"])
+            profile = guard.api.controller_updates[0][2]
+            self.assertEqual(1234.5, profile["sell_stop_event_at"])
+            self.assertEqual("sell-stop-1", profile["sell_stop_event_id"])
+            self.assertTrue(profile["macro_buy_enabled"])
+            self.assertTrue(profile["macro_sell_enabled"])
+
     def test_controller_profile_prefers_live_yaml_over_stale_database(self):
         with tempfile.TemporaryDirectory() as directory:
             instance = Path(directory) / "instances" / "bot"
@@ -1046,6 +1092,106 @@ class DcaLiveSafetyTest(unittest.TestCase):
                 },
                 Guard._executor_counts(database),
             )
+
+    def test_latest_stop_loss_reads_immediate_trigger_snapshot_before_terminal_flush(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "bot.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE Executors "
+                "(id TEXT, close_type INTEGER, close_timestamp INTEGER, custom_info JSON)"
+            )
+            connection.executemany(
+                "INSERT INTO Executors VALUES (?, ?, ?, ?)",
+                [
+                    ("terminal-old", 2, 100, json.dumps({"side": 1})),
+                    (
+                        "trigger-new", 2, None,
+                        json.dumps({"side": 2, "stop_loss_trigger_timestamp": 200}),
+                    ),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            event = Guard._latest_stop_loss_event(database)
+            self.assertEqual(200, event["timestamp"])
+            self.assertEqual("trigger-new", event["executor_id"])
+            self.assertEqual("executor_trigger_snapshot", event["source"])
+            self.assertEqual("sell", event["side"])
+
+    def test_stop_loss_cursor_upgrade_baselines_history_then_consumes_new_event(self):
+        bot_state = {"last_position_stop_seen": 0}
+        historical = {
+            "latest_stop_loss_at": 100,
+            "observed_at": 101,
+            "latest_stop_loss_event": {"timestamp": 100, "executor_id": "old-stop"},
+        }
+
+        event, migrated = Guard._consume_position_stop_event(bot_state, historical)
+
+        self.assertIsNone(event)
+        self.assertTrue(migrated)
+        self.assertEqual(100, bot_state["last_position_stop_seen"])
+        self.assertEqual("old-stop", bot_state["last_position_stop_event_id"])
+
+        event, migrated = Guard._consume_position_stop_event(bot_state, historical)
+        self.assertIsNone(event)
+        self.assertFalse(migrated)
+
+        fresh = {
+            "latest_stop_loss_at": 200,
+            "observed_at": 201,
+            "latest_stop_loss_event": {
+                "timestamp": 200,
+                "executor_id": "fresh-stop",
+                "source": "executor_trigger_snapshot",
+            },
+        }
+        event, migrated = Guard._consume_position_stop_event(bot_state, fresh)
+        self.assertFalse(migrated)
+        self.assertEqual("fresh-stop", event["executor_id"])
+        self.assertEqual(200, bot_state["last_position_stop_seen"])
+
+    def test_stop_loss_cursor_advances_during_non_active_recovery_phase(self):
+        bot_state = {
+            "position_stop_cursor_schema": "dca-stop-loss-event-v3",
+            "position_stop_monitor_started_at": 50,
+            "last_position_stop_seen": 100,
+            "last_position_stop_event_id": "first-stop",
+        }
+        snapshot = {
+            "latest_stop_loss_at": 150,
+            "latest_stop_loss_event": {"timestamp": 150, "executor_id": "during-cooldown"},
+        }
+
+        event, migrated = Guard._consume_position_stop_event(bot_state, snapshot)
+
+        self.assertFalse(migrated)
+        self.assertEqual("during-cooldown", event["executor_id"])
+        self.assertEqual(150, bot_state["last_position_stop_seen"])
+
+    def test_stop_loss_cursor_baselines_history_reappearing_after_database_restore(self):
+        bot_state = {
+            "position_stop_cursor_schema": "dca-stop-loss-event-v3",
+            "position_stop_monitor_started_at": 200,
+            "last_position_stop_seen": 0,
+            "last_position_stop_event_id": "",
+        }
+        restored_history = {
+            "observed_at": 300,
+            "latest_stop_loss_at": 150,
+            "latest_stop_loss_event": {"timestamp": 150, "executor_id": "restored-old"},
+        }
+
+        event, baselined = Guard._consume_position_stop_event(
+            bot_state, restored_history
+        )
+
+        self.assertIsNone(event)
+        self.assertTrue(baselined)
+        self.assertEqual(150, bot_state["last_position_stop_seen"])
+        self.assertEqual("restored-old", bot_state["last_position_stop_event_id"])
 
 
 if __name__ == "__main__":

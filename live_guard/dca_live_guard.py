@@ -81,6 +81,7 @@ LOG = logging.getLogger("dca-live-guard")
 BINANCE_API = OFFICIAL_BINANCE_API
 V21_PAIR_MAP = {"BTC-USDT": "BTC-FDUSD", "ETH-USDT": "ETH-FDUSD"}
 V22_PAIR_MAP = V21_PAIR_MAP
+STOP_LOSS_EVENT_CURSOR_SCHEMA = "dca-stop-loss-event-v3"
 
 
 def _read_retry_session() -> requests.Session:
@@ -1471,6 +1472,7 @@ class Guard:
             while last_fill_at > 10_000_000_000:
                 last_fill_at /= 1000
             database_event_at = max(database_event_at, last_fill_at)
+        latest_stop_loss = self._latest_stop_loss_event(database)
         return {
             "pair": pair,
             "database": str(database),
@@ -1480,22 +1482,108 @@ class Guard:
             "observed_at": observed_at,
             "database_event_at": database_event_at,
             "database_event_age_seconds": max(0.0, observed_at - database_event_at),
-            "latest_stop_loss_at": self._latest_stop_loss_at(database),
+            "latest_stop_loss_at": float(latest_stop_loss.get("timestamp", 0)),
+            "latest_stop_loss_event": latest_stop_loss,
         }
 
     @staticmethod
-    def _latest_stop_loss_at(database: Path) -> float:
+    def _latest_stop_loss_event(database: Path) -> Dict[str, Any]:
+        """Return the newest durable STOP_LOSS signal from either persistence path.
+
+        Final executor rows expose ``close_timestamp``.  The live DCA runtime also
+        writes a trigger snapshot immediately, before its in-memory closed-executor
+        retention buffer is flushed; that timestamp lives in ``custom_info``.
+        Reading both makes the event contract resilient to either writer lagging.
+        """
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10)
         try:
-            row = connection.execute(
-                "SELECT MAX(close_timestamp) FROM Executors WHERE close_type = 2"
-            ).fetchone()
+            rows = connection.execute(
+                "SELECT id, close_timestamp, custom_info FROM Executors WHERE close_type = 2"
+            ).fetchall()
         finally:
             connection.close()
-        value = float(row[0] or 0)
-        while value > 10_000_000_000:
-            value /= 1000
-        return value
+        latest = {"timestamp": 0.0, "executor_id": None, "source": None, "side": None}
+        for executor_id, close_timestamp, raw_custom_info in rows:
+            try:
+                custom_info = (
+                    json.loads(raw_custom_info)
+                    if isinstance(raw_custom_info, str)
+                    else (raw_custom_info or {})
+                )
+            except (TypeError, ValueError):
+                custom_info = {}
+            trigger_timestamp = custom_info.get("stop_loss_trigger_timestamp")
+            candidates = (
+                (trigger_timestamp, "executor_trigger_snapshot"),
+                (close_timestamp, "executor_terminal_row"),
+            )
+            for raw_timestamp, source in candidates:
+                try:
+                    value = float(raw_timestamp or 0)
+                except (TypeError, ValueError):
+                    continue
+                while value > 10_000_000_000:
+                    value /= 1000
+                if value > float(latest["timestamp"]):
+                    latest = {
+                        "timestamp": value,
+                        "executor_id": str(executor_id),
+                        "source": source,
+                        "side": Guard._side(custom_info.get("side")),
+                    }
+        return latest
+
+    @staticmethod
+    def _latest_stop_loss_at(database: Path) -> float:
+        """Compatibility wrapper retained for existing diagnostics and tests."""
+        return float(Guard._latest_stop_loss_event(database).get("timestamp", 0))
+
+    @staticmethod
+    def _consume_position_stop_event(
+        bot_state: Dict[str, Any], snapshot: Dict[str, Any]
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Advance the durable STOP_LOSS cursor without replaying upgrade history.
+
+        The v3 cursor records when monitoring began. On the first upgraded
+        cycle, baseline the newest durable row. A database restored or mounted
+        later may contain a row newer than the old cursor, but events predating
+        this monitoring epoch are still history and must never cause an exit.
+        A genuine STOP_LOSS written while Guard is temporarily unavailable is
+        newer than the epoch and remains consumable after Guard recovers.
+        """
+        event = dict(snapshot.get("latest_stop_loss_event") or {})
+        try:
+            timestamp = float(
+                event.get("timestamp") or snapshot.get("latest_stop_loss_at") or 0
+            )
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        event_id = str(event.get("executor_id") or "")
+        if bot_state.get("position_stop_cursor_schema") != STOP_LOSS_EVENT_CURSOR_SCHEMA:
+            bot_state["position_stop_cursor_schema"] = STOP_LOSS_EVENT_CURSOR_SCHEMA
+            bot_state["last_position_stop_seen"] = timestamp
+            bot_state["last_position_stop_event_id"] = event_id
+            bot_state["position_stop_monitor_started_at"] = float(
+                snapshot.get("observed_at") or time.time()
+            )
+            return None, True
+
+        try:
+            last_timestamp = float(bot_state.get("last_position_stop_seen") or 0)
+        except (TypeError, ValueError):
+            last_timestamp = 0.0
+        last_event_id = str(bot_state.get("last_position_stop_event_id") or "")
+        is_new = timestamp > last_timestamp or (
+            timestamp > 0 and timestamp == last_timestamp and event_id != last_event_id
+        )
+        if not is_new:
+            return None, False
+        bot_state["last_position_stop_seen"] = timestamp
+        bot_state["last_position_stop_event_id"] = event_id
+        monitor_started_at = float(bot_state.get("position_stop_monitor_started_at") or 0)
+        if timestamp < monitor_started_at:
+            return None, True
+        return event, False
 
     @staticmethod
     def _side(value: Any) -> str:
@@ -1792,7 +1880,16 @@ class Guard:
             raise RuntimeError(f"controller config is unavailable for {bot_name}")
         actual_buy = bool(profile.get("macro_buy_enabled", True))
         actual_sell = bool(profile.get("macro_sell_enabled", True))
-        if actual_buy == buy_enabled and actual_sell == sell_enabled:
+        sell_stop_event = dict(reasons.get("sell_stop_event") or {})
+        desired_stop_at = float(sell_stop_event.get("timestamp") or 0)
+        desired_stop_id = str(sell_stop_event.get("executor_id") or "")
+        actual_stop_at = float(profile.get("sell_stop_event_at") or 0)
+        actual_stop_id = str(profile.get("sell_stop_event_id") or "")
+        if (
+            actual_buy == buy_enabled and actual_sell == sell_enabled
+            and actual_stop_at == desired_stop_at
+            and actual_stop_id == desired_stop_id
+        ):
             return {
                 "status": "unchanged",
                 "macro_buy_enabled": actual_buy,
@@ -1805,6 +1902,8 @@ class Guard:
         ).encode()).hexdigest()[:16]
         profile["macro_buy_enabled"] = buy_enabled
         profile["macro_sell_enabled"] = sell_enabled
+        profile["sell_stop_event_at"] = desired_stop_at
+        profile["sell_stop_event_id"] = desired_stop_id
         profile["macro_decision_id"] = f"risk-aggregate:{digest}"
         response = self.api.update_controller(bot_name, controller_name, profile)
         return {
@@ -2012,6 +2111,9 @@ class Guard:
                 "capital_gate_mode": "alert_only",
                 "free_quote": capital.get("free_quote"),
                 "required_quote": capital.get("required_quote"),
+                "sell_stop_event": dict(
+                    bot_state.get("sell_stop_recovery_event") or {}
+                ),
             }
             aggregate["bots"][bot_name] = {
                 "pair": pair, "buy_enabled": buy_enabled,
@@ -2951,20 +3053,33 @@ class Guard:
                 ):
                     self._trip(spec.bot_name, bot_state.get("trip_reason", "retry"), snapshot)
                 continue
-            latest_stop = float(snapshot.get("latest_stop_loss_at", 0))
-            if "last_position_stop_seen" not in bot_state:
-                bot_state["last_position_stop_seen"] = latest_stop
-            last_seen_stop = float(bot_state.get("last_position_stop_seen", 0))
+            stop_event, cursor_migrated = self._consume_position_stop_event(
+                bot_state, snapshot
+            )
+            if cursor_migrated:
+                self._audit(
+                    "POSITION_STOP_CURSOR_BASELINED",
+                    bot=spec.bot_name,
+                    pair=pair,
+                    cursor_schema=STOP_LOSS_EVENT_CURSOR_SCHEMA,
+                    executor_id=bot_state.get("last_position_stop_event_id"),
+                    event_at=bot_state.get("last_position_stop_seen", 0),
+                )
+            if stop_event is not None and stop_event.get("side") == "sell":
+                bot_state["sell_stop_recovery_event"] = dict(stop_event)
             if (
                 risk_actions_enabled
                 and mechanisms.get("position_protection", True)
-                and latest_stop > last_seen_stop
+                and stop_event is not None
                 and bot_state["recovery"]["phase"] == ACTIVE
             ):
-                bot_state["last_position_stop_seen"] = latest_stop
                 self._trigger_recoverable(
                     spec.bot_name, snapshot, mechanism="position_protection",
-                    scope="position", trigger_value="5%", reason="executor_stop_loss",
+                    scope="position", trigger_value="5%",
+                    reason=(
+                        "executor_stop_loss:"
+                        f"{stop_event.get('executor_id') or 'unknown'}"
+                    ),
                 )
             strategy_loss_enabled = mechanisms.get("strategy_loss_breaker", True)
             strategy_drawdown_enabled = mechanisms.get("strategy_drawdown_breaker", True)

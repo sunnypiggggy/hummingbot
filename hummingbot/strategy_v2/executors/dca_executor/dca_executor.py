@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
@@ -63,6 +64,8 @@ class DCAExecutor(ExecutorBase):
         # not available
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._first_fill_timestamp: Optional[float] = None
+        self._stop_loss_trigger_timestamp: Optional[float] = None
+        self._stop_loss_snapshot_persisted = False
 
     @property
     def active_open_orders(self) -> List[TrackedOrder]:
@@ -358,12 +361,37 @@ class DCAExecutor(ExecutorBase):
                     or self.all_open_orders_executed
                 )
                 if protected and self.net_pnl_pct <= -self.config.stop_loss:
-                    self.close_type = CloseType.STOP_LOSS
+                    self._record_stop_loss_trigger()
                     self.place_close_order_and_cancel_open_orders()
             else:
                 if self.net_pnl_quote <= -self.max_loss_quote:
-                    self.close_type = CloseType.STOP_LOSS
+                    self._record_stop_loss_trigger()
                     self.place_close_order_and_cancel_open_orders()
+
+    def _record_stop_loss_trigger(self) -> None:
+        """Durably expose STOP_LOSS before the executor retention buffer flushes.
+
+        StrategyV2 normally keeps a buffer of recently closed executors in memory
+        and only writes older rows to SQLite.  The external live Guard cannot see
+        that memory, so a fresh stop could otherwise be invisible for many hours.
+        Persisting this snapshot at the trigger gives the Guard an immediate,
+        idempotent event source.  The terminal snapshot overwrites the same row.
+        """
+        if self.close_type == CloseType.STOP_LOSS and self._stop_loss_trigger_timestamp is not None:
+            return
+        self.close_type = CloseType.STOP_LOSS
+        self._stop_loss_trigger_timestamp = float(self._strategy.current_timestamp)
+        try:
+            MarketsRecorder.get_instance().store_or_update_executor(self)
+            self._stop_loss_snapshot_persisted = True
+        except Exception:
+            # Order protection must continue even if observability storage is
+            # temporarily unavailable. The normal orchestrator flush remains a
+            # secondary persistence path.
+            self.logger().exception(
+                "Failed to persist DCA STOP_LOSS trigger snapshot for %s",
+                self.config.id,
+            )
 
     def control_trailing_stop(self):
         """
@@ -436,6 +464,14 @@ class DCAExecutor(ExecutorBase):
         self.close_type = close_type
         self.close_timestamp = self._strategy.current_timestamp
         self.stop()
+        if self._stop_loss_snapshot_persisted:
+            try:
+                MarketsRecorder.get_instance().store_or_update_executor(self)
+            except Exception:
+                self.logger().exception(
+                    "Failed to persist terminal DCA STOP_LOSS snapshot for %s",
+                    self.config.id,
+                )
 
     def place_close_order(self, price):
         delta_amount_to_close = self.open_filled_amount - self.close_filled_amount
@@ -596,6 +632,8 @@ class DCAExecutor(ExecutorBase):
             "trailing_stop_trigger_pct": self._trailing_stop_trigger_pct,
             "total_executed_amount_backup": self._total_executed_amount_backup,
             "first_fill_timestamp": self.first_fill_timestamp,
+            "stop_loss_trigger_timestamp": self._stop_loss_trigger_timestamp,
+            "stop_loss_snapshot_persisted": self._stop_loss_snapshot_persisted,
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,
             "level_id": self.config.level_id,

@@ -67,6 +67,25 @@ class TestDCAExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         with self.assertRaises(ValueError):
             DCAExecutorConfig(**base, shutdown_retry_seconds=5.1)
 
+    @patch("hummingbot.strategy_v2.executors.dca_executor.dca_executor.MarketsRecorder.get_instance")
+    @patch.object(DCAExecutor, "get_price", MagicMock(return_value=Decimal("120")))
+    def test_stop_loss_trigger_is_persisted_immediately_and_idempotently(self, recorder_factory):
+        recorder = recorder_factory.return_value
+        config = DCAExecutorConfig(
+            id="durable-stop", timestamp=100, side=TradeType.SELL,
+            connector_name="binance", trading_pair="ETH-USDT",
+            amounts_quote=[Decimal("10")], prices=[Decimal("100")],
+            stop_loss=Decimal("0.05"),
+        )
+        executor = self.get_dca_executor_from_config(config)
+
+        executor._record_stop_loss_trigger()
+        executor._record_stop_loss_trigger()
+
+        self.assertEqual(CloseType.STOP_LOSS, executor.close_type)
+        self.assertEqual(123.0, executor.get_custom_info()["stop_loss_trigger_timestamp"])
+        recorder.store_or_update_executor.assert_called_once_with(executor)
+
     @patch.object(DCAExecutor, "get_price", MagicMock(return_value=Decimal("120")))
     async def test_control_task_open_orders(self):
         config = DCAExecutorConfig(id="test", timestamp=123, side=TradeType.BUY, connector_name="binance",

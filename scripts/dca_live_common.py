@@ -18,6 +18,10 @@ DCA_SPREADS = [Decimal("0.01"), Decimal("0.02"), Decimal("0.04"), Decimal("0.08"
 DCA_AMOUNTS = [Decimal("0.10"), Decimal("0.20"), Decimal("0.30"), Decimal("0.40")]
 LIVE_TIME_LIMIT_SECONDS = 18000
 LIVE_EXECUTOR_REFRESH_SECONDS = 18000
+# The 360-day ablation produced identical economic results for 30m/2h/6h
+# because the trend-recovery condition was the binding constraint. Use the
+# least disruptive validated duration; trend recovery can keep it blocked longer.
+SELL_STOP_COOLDOWN_SECONDS = 1800
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,21 @@ def live_controller_config(pair: str) -> Dict[str, Any]:
         "time_limit_from_first_fill": True,
         "stop_loss_on_partial_fills": True,
         "shutdown_retry_seconds": 1.0,
+        # SELL ladders are a mean-reversion position. Block only the creation
+        # of new SELL executors during a strong uptrend; existing positions and
+        # all protective exits remain executable.
+        "sell_trend_gate_enabled": True,
+        "sell_trend_interval": "5m",
+        "sell_trend_fast_ema": 12,
+        "sell_trend_slow_ema": 48,
+        "sell_trend_roc_bars": 12,
+        "sell_trend_trigger_roc": 0.006,
+        "sell_trend_trigger_ema_gap": 0.002,
+        "sell_trend_recovery_roc": 0.002,
+        "sell_trend_recovery_bars": 3,
+        "sell_stop_cooldown_seconds": SELL_STOP_COOLDOWN_SECONDS,
+        "sell_stop_event_at": 0.0,
+        "sell_stop_event_id": "",
         "take_profit_order_type": "LIMIT",
         "skip_rebalance": True,
         "macro_buy_enabled": True,
@@ -107,6 +126,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Live DCA stop loss must protect partial fills.")
     if float(config.get("shutdown_retry_seconds", 0)) != 1.0:
         raise ValueError("Live DCA shutdown verification must run every second.")
+    if config.get("sell_trend_gate_enabled") is not True:
+        raise ValueError("The live DCA SELL trend gate must remain enabled.")
+    if int(config.get("sell_stop_cooldown_seconds", 0)) not in {1800, 7200, 21600}:
+        raise ValueError("SELL stop cooldown must be a validated 30m, 2h, or 6h value.")
 
 
 def validate_exchange_filters(symbol_info: Mapping[str, Any], price: Decimal) -> None:

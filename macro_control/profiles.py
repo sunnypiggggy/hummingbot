@@ -7,6 +7,7 @@ from .policy import POLICY_VERSION
 MAX_TOTAL_AMOUNT_QUOTE = 190.0
 LIVE_TIME_LIMIT_SECONDS = 18000
 LIVE_EXECUTOR_REFRESH_SECONDS = 18000
+SELL_STOP_COOLDOWN_SECONDS = 1800
 
 LIVE_PROFILE = {
     "total_amount_quote": 190.0,
@@ -18,6 +19,18 @@ LIVE_PROFILE = {
     "executor_refresh_time": LIVE_EXECUTOR_REFRESH_SECONDS,
     "time_limit_from_first_fill": True,
     "stop_loss_on_partial_fills": True,
+    "sell_trend_gate_enabled": True,
+    "sell_trend_interval": "5m",
+    "sell_trend_fast_ema": 12,
+    "sell_trend_slow_ema": 48,
+    "sell_trend_roc_bars": 12,
+    "sell_trend_trigger_roc": 0.006,
+    "sell_trend_trigger_ema_gap": 0.002,
+    "sell_trend_recovery_roc": 0.002,
+    "sell_trend_recovery_bars": 3,
+    "sell_stop_cooldown_seconds": SELL_STOP_COOLDOWN_SECONDS,
+    "sell_stop_event_at": 0.0,
+    "sell_stop_event_id": "",
 }
 
 
@@ -78,3 +91,7 @@ def validate_profile(profile: dict) -> None:
         raise ValueError("the position time limit must start at first fill")
     if profile.get("stop_loss_on_partial_fills") is not True:
         raise ValueError("partial fills must remain protected by stop loss")
+    if profile.get("sell_trend_gate_enabled") is not True:
+        raise ValueError("SELL trend gate must remain enabled")
+    if int(profile.get("sell_stop_cooldown_seconds", 0)) not in {1800, 7200, 21600}:
+        raise ValueError("SELL stop cooldown must be a validated 30m, 2h, or 6h value")

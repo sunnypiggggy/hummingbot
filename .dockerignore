@@ -12,6 +12,13 @@
 /release_packages
 /.deploy-backups
 /deploy-backups
+/deploy_backups
+/results
+/backups
+/rollout-backups
+/rollout-smoke-v22*
+/.staging
+/.pytest_cache
 /build
 /dist
 /.git
