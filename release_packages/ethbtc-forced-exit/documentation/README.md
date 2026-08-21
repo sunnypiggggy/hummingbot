@@ -13,7 +13,7 @@ OCI 运维见 [TELEGRAM_NOTIFICATIONS.md](TELEGRAM_NOTIFICATIONS.md)。
 - [REAL_SCENARIO_TESTING.md](REAL_SCENARIO_TESTING.md)：隔离HTTP/容器故障注入、真实30秒确认、重启幂等和验收报告。
 
 - [ONLINE_MODELS.md](ONLINE_MODELS.md)：当前 OCI 实际启用的模型、release、哈希、周期、Grid/DCA映射和运行边界。
-- [CONTAINERS_AND_SIGNAL_FLOW.md](CONTAINERS_AND_SIGNAL_FLOW.md)：当前 v22 live 容器拓扑、唯一 producer、共享目录和交易链路。
+- [CONTAINERS_AND_SIGNAL_FLOW.md](CONTAINERS_AND_SIGNAL_FLOW.md)：OCI 实际运行容器、启动/信号/应急/观测依赖、唯一 producer、故障域与恢复顺序。
 - [RISK_MECHANISMS.md](RISK_MECHANISMS.md)：Grid/DCA 七类风控、阈值、作用范围和开关。
 - [V22_WEEKLY_MODEL.md](V22_WEEKLY_MODEL.md)：v22 周度模型、阈值、状态连续性、训练防泄漏和 Fail-Closed。
 - [WEEKLY_APPROVAL_NOTIFICATIONS.md](WEEKLY_APPROVAL_NOTIFICATIONS.md)：每周候选、默认审批、原子切换时间及 12 张回测 PNG 的同步通知链路。
