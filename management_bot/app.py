@@ -1,0 +1,1038 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import signal
+import time
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from typing import Any, Optional
+
+from management_bot.approvals import ApprovalStore
+from management_bot.clients import ContractReader, HummingbotClient, StocksClient
+from management_bot.config import Settings
+from management_bot.storage import BotStore
+from management_bot.telegram_api import TelegramAPI, TelegramError
+
+
+logger = logging.getLogger("trading-management-bot")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+
+
+HOME_ROWS = [
+    [("📊 系统总览", "m:overview"), ("💰 盈亏报告", "m:profit")],
+    [("🟦 Grid", "m:bot:grid"), ("🟩 DCA", "m:dca")],
+    [("📈 Stock", "m:stock"), ("🛡 风控状态", "m:risk")],
+    [("🧠 模型审批", "m:approvals"), ("⚠️ 当前异常", "m:errors")],
+    [("⚙️ 模型与参数", "m:models"), ("🔧 系统维护", "m:maintenance")],
+]
+
+
+def _d(value: Any, default: str = "0") -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError("请输入有效数字")
+    if not result.is_finite() or result <= 0:
+        raise ValueError("数值必须大于0")
+    return result
+
+
+def _quote_price(payload: dict, side: str) -> Decimal:
+    bid = Decimal(str(payload.get("bidPrice", payload.get("bid", "0")) or "0"))
+    ask = Decimal(str(payload.get("askPrice", payload.get("ask", "0")) or "0"))
+    price = ask if side == "BUY" else bid
+    if price <= 0:
+        price = bid if bid > 0 else ask
+    if price <= 0:
+        raise ValueError("没有可用的最新报价")
+    return price
+
+
+def _safe_text(value: Any, limit: int = 500) -> str:
+    return str(value).replace("`", "'")[:limit]
+
+
+class TradingManagementBot:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        settings.state_dir.mkdir(parents=True, exist_ok=True)
+        settings.approval_decision_root.mkdir(parents=True, exist_ok=True)
+        self.store = BotStore(settings.state_dir / "management_bot.sqlite", settings.session_ttl_seconds)
+        self.telegram = TelegramAPI(settings.read_token())
+        self.hummingbot = HummingbotClient(
+            settings.hummingbot_api_url,
+            settings.hummingbot_api_username,
+            settings.hummingbot_api_password,
+        )
+        self.stocks = StocksClient(
+            settings.stocks_api_url,
+            settings.stocks_api_username,
+            settings.stocks_api_password,
+        )
+        self.contracts = ContractReader(
+            settings.grid_guard_path, settings.dca_guard_path, settings.inventory_path
+        )
+        self.approvals = ApprovalStore(
+            settings.approval_request_root,
+            settings.approval_evidence_root,
+            settings.approval_decision_root,
+        )
+        self.running = True
+
+    @property
+    def mode_label(self) -> str:
+        return "执行模式" if self.settings.mutations_enabled else "只读观察模式"
+
+    def stop(self, *_: Any) -> None:
+        self.running = False
+
+    def _authorized(self, user_id: int, chat_id: int, chat_type: str) -> bool:
+        return user_id == self.settings.admin_user_id and chat_id == user_id and chat_type == "private"
+
+    def _home(self) -> tuple[str, list[list[tuple[str, str]]]]:
+        return (
+            "🐷 交易系统维护管理 Bot V3\n\n"
+            f"当前：{self.mode_label}\n"
+            "Grid / DCA / Stock 的交易判断仍由各自风控容器负责。\n"
+            "请选择功能：",
+            HOME_ROWS,
+        )
+
+    @staticmethod
+    def _back(target: str = "m:home") -> list[list[tuple[str, str]]]:
+        return [[("⬅️ 返回", target), ("🏠 主菜单", "m:home")]]
+
+    def _edit_or_send(self, chat_id: int, message_id: Optional[int], text: str,
+                      rows: Optional[list[list[tuple[str, str]]]] = None) -> dict:
+        if message_id:
+            try:
+                value = self.telegram.edit(chat_id, message_id, text, rows)
+                return value if isinstance(value, dict) else {"message_id": message_id}
+            except TelegramError:
+                pass
+        return self.telegram.send(chat_id, text, rows)
+
+    def _api_bots(self) -> dict:
+        value = self.hummingbot.status().get("data", {})
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _bot_line(name: str, raw: dict) -> str:
+        status = str(raw.get("status", "unknown")).lower()
+        chinese = {
+            "running": "运行中", "stopped": "已停止", "starting": "启动中",
+            "stopping": "停止中", "error": "错误",
+        }.get(status, "状态未知")
+        errors = raw.get("error_logs", [])
+        count = len(errors) if isinstance(errors, list) else 0
+        return f"• {name}：{chinese}" + (f"，错误{count}条" if count else "")
+
+    def _overview(self) -> str:
+        try:
+            bots = self._api_bots()
+            lines = ["📊 系统总览", f"模式：{self.mode_label}", ""]
+            wanted = {v["bot_name"] for v in self.settings.bots.values()}
+            for name in sorted(wanted):
+                lines.append(self._bot_line(name, bots.get(name, {})))
+            try:
+                stock = self.stocks.health()
+                stock_ok = stock.get("status") == "healthy"
+                lines.append(f"• Stock Runtime：{'健康' if stock_ok else '降级'} / {stock.get('runtime_mode', '-')}")
+            except Exception as exc:
+                lines.append(f"• Stock Runtime：不可用（{type(exc).__name__}）")
+            contracts = self.contracts.snapshot()
+            lines.append(f"• 风控合同：{'正常' if not contracts['errors'] else '存在缺失'}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"📊 系统总览\n\n数据不可用：{_safe_text(exc)}"
+
+    def _profit(self) -> str:
+        try:
+            bots = self._api_bots()
+        except Exception as exc:
+            return f"💰 盈亏报告\n\n无可信数据：{_safe_text(exc)}"
+        lines = ["💰 当前策略收益摘要", ""]
+        for definition in self.settings.bots.values():
+            name = definition["bot_name"]
+            raw = bots.get(name, {})
+            performance = raw.get("performance", {}) if isinstance(raw, dict) else {}
+            pnl: Any = None
+            if isinstance(performance, dict):
+                for report in performance.values():
+                    if isinstance(report, dict):
+                        metrics = report.get("performance", report)
+                        if isinstance(metrics, dict) and metrics.get("global_pnl_quote") is not None:
+                            pnl = metrics.get("global_pnl_quote")
+                            break
+            lines.append(f"• {name}：{pnl if pnl is not None else '无可信数据'}")
+        lines.append("\n详细4小时策略归属MTM仍由通知频道发送。")
+        return "\n".join(lines)
+
+    def _risk(self) -> str:
+        snapshot = self.contracts.snapshot()
+        lines = ["🛡 风控状态", ""]
+        if snapshot["errors"]:
+            lines.append("合同读取异常：" + "；".join(snapshot["errors"]))
+        for strategy in ("grid", "dca"):
+            value = snapshot["sources"].get(strategy, {})
+            allowed, reason = ContractReader.resume_allowed(strategy, snapshot)
+            phase = value.get("phase", value.get("recovery_phase", "-")) if isinstance(value, dict) else "-"
+            lines.append(f"• {strategy.upper()}：{'未发现完整性阻塞' if allowed else '受限'}；阶段={phase}；{reason}")
+        inventory = snapshot["sources"].get("inventory", {})
+        if inventory:
+            lines.append(f"• 库存归属：{'健康' if inventory.get('healthy') else '需检查'}")
+        return "\n".join(lines)
+
+    def _errors(self) -> str:
+        lines = ["⚠️ 当前异常", ""]
+        found = 0
+        try:
+            for name, raw in self._api_bots().items():
+                values = raw.get("error_logs", []) if isinstance(raw, dict) else []
+                if isinstance(values, list):
+                    for value in values[-3:]:
+                        found += 1
+                        lines.append(f"• {name}：{_safe_text(value, 260)}")
+        except Exception as exc:
+            lines.append(f"• Hummingbot API：{_safe_text(exc)}")
+            found += 1
+        snapshot = self.contracts.snapshot()
+        for error in snapshot["errors"]:
+            lines.append(f"• 合同：{error}")
+            found += 1
+        for strategy in ("grid", "dca"):
+            source = snapshot["sources"].get(strategy, {})
+            error = source.get("last_error") if isinstance(source, dict) else None
+            if error:
+                lines.append(f"• {strategy.upper()} Guard：{_safe_text(error)}")
+                found += 1
+        if not found:
+            lines.append("当前未发现已上报错误。")
+        return "\n".join(lines)
+
+    def _models(self) -> str:
+        candidates = self.approvals.pending()
+        pending = [item for item in candidates if item["status"] == "PENDING"]
+        lines = ["⚙️ 模型与参数", f"待审批模型：{len(pending)}"]
+        if candidates:
+            current = candidates[0]
+            lines.extend((
+                f"最近模型：{current['model_type']}",
+                f"Release：{current['release_sha256'][:16]}",
+                f"状态：{current['status']}",
+            ))
+        else:
+            lines.append("当前没有可读取的模型候选记录。")
+        lines.append("普通 Grid 参数更新不进入模型审批中心。")
+        return "\n".join(lines)
+
+    def _bot_menu(self, key: str) -> tuple[str, list[list[tuple[str, str]]]]:
+        definition = self.settings.bots[key]
+        name = definition["bot_name"]
+        try:
+            raw = self._api_bots().get(name, {})
+            status = self._bot_line(name, raw)
+        except Exception as exc:
+            status = f"{name}：数据不可用（{type(exc).__name__}）"
+        rows = [
+            [("⏸ 停止并撤单", f"b:{key}:stop"), ("▶️ 恢复", f"b:{key}:start")],
+            [("🔄 安全重启", f"b:{key}:restart"), ("刷新", f"b:{key}:view")],
+            [("🏠 主菜单", "m:home")],
+        ]
+        return f"🤖 机器人管理\n\n{status}\n\n变更前会再次预检并要求确认。", rows
+
+    def _dca_menu(self) -> tuple[str, list[list[tuple[str, str]]]]:
+        rows = [
+            [("BTC-USDT", "m:bot:dca_btc"), ("ETH-USDT", "m:bot:dca_eth")],
+            [("🏠 主菜单", "m:home")],
+        ]
+        return "🟩 DCA\n\n请选择机器人：", rows
+
+    def _stock_menu(self) -> tuple[str, list[list[tuple[str, str]]]]:
+        try:
+            health = self.stocks.health()
+            status = f"{health.get('status', 'unknown')} / {health.get('runtime_mode', '-')}"
+        except Exception as exc:
+            status = f"不可用（{type(exc).__name__}）"
+        rows = [
+            [("🧾 单笔订单", "s:new:order"), ("📈 仓位交易", "s:new:position")],
+            [("📋 白名单", "s:whitelist"), ("📏 交易限制", "s:limits")],
+            [("持仓", "s:positions"), ("刷新", "m:stock")],
+            [("🏠 主菜单", "m:home")],
+        ]
+        return f"📈 Stock 管理\n\nRuntime：{status}\n交易时段：盘前 + 正常时段 + 盘后（EXTENDED）", rows
+
+    def _enabled_symbols(self) -> list[str]:
+        return [str(row["symbol"]) for row in self.stocks.whitelist() if row.get("enabled")]
+
+    def _new_stock_session(self, flow: str, user_id: int, chat_id: int, message_id: int) -> tuple[str, list]:
+        session = self.store.create_session(user_id, chat_id, flow, message_id)
+        symbols = self._enabled_symbols()
+        rows = [[(symbol, f"w:{session['session_id']}:symbol:{symbol}")] for symbol in symbols[:12]]
+        rows.append([("取消", f"w:{session['session_id']}:cancel:-")])
+        return (f"📈 {'单笔订单' if flow == 'stock_order' else '仓位交易'}\n\n请选择白名单股票：", rows)
+
+    def _stock_order_step(self, session: dict, action: str, value: str) -> tuple[str, list]:
+        sid = session["session_id"]
+        if action == "symbol":
+            session = self.store.update_session(sid, step="side", payload={"symbol": value})
+            return "请选择方向：", [[("BUY", f"w:{sid}:side:BUY"), ("SELL", f"w:{sid}:side:SELL")], [("取消", f"w:{sid}:cancel:-")]]
+        if action == "side":
+            self.store.update_session(sid, step="order_type", payload={"side": value})
+            return "请选择订单类型：", [[("LIMIT（推荐）", f"w:{sid}:otype:LIMIT"), ("MARKET", f"w:{sid}:otype:MARKET")], [("取消", f"w:{sid}:cancel:-")]]
+        if action == "otype":
+            self.store.update_session(sid, step="amount", payload={"order_type": value})
+            return "请选择下单金额或输入自定义值：", [
+                [("100 USDC（推荐）", f"w:{sid}:amount:100"), ("50 USDC", f"w:{sid}:amount:50")],
+                [("自定义金额", f"w:{sid}:input:amount"), ("自定义股数", f"w:{sid}:input:shares")],
+                [("取消", f"w:{sid}:cancel:-")],
+            ]
+        if action == "amount":
+            session = self.store.update_session(sid, payload={"amount_usdc": value, "amount_basis": "quote"})
+            if session["payload"]["order_type"] == "LIMIT":
+                return self._limit_price_step(session)
+            return self._stock_preview(session)
+        if action == "price_latest":
+            self.store.update_session(sid, payload={"use_latest_price": True})
+            return self._stock_preview(self.store.get_session(sid) or session)
+        if action == "confirm":
+            return self._execute_stock(session)
+        if action == "refresh":
+            return self._executor_result(session)
+        raise ValueError("未知订单向导动作")
+
+    def _stock_position_step(self, session: dict, action: str, value: str) -> tuple[str, list]:
+        sid = session["session_id"]
+        if action == "symbol":
+            self.store.update_session(sid, step="amount", payload={"symbol": value, "side": "BUY"})
+            return "请选择目标仓位金额：", [
+                [("100 USDC（推荐）", f"w:{sid}:amount:100"), ("50 USDC", f"w:{sid}:amount:50")],
+                [("自定义金额", f"w:{sid}:input:amount")], [("取消", f"w:{sid}:cancel:-")],
+            ]
+        if action == "amount":
+            self.store.update_session(sid, step="entry", payload={"amount_usdc": value, "amount_basis": "quote"})
+            return "请选择入场方式：", [[("LIMIT（推荐）", f"w:{sid}:entry:LIMIT"), ("MARKET", f"w:{sid}:entry:MARKET")], [("取消", f"w:{sid}:cancel:-")]]
+        if action == "entry":
+            session = self.store.update_session(sid, step="barriers", payload={
+                "order_type": value, "take_profit": "0.03", "stop_loss": "0.02", "days": "7",
+            })
+            return (
+                "默认仓位参数：止盈3% / 止损2% / 最长7天",
+                [[("使用推荐值", f"w:{sid}:barriers:default"), ("自定义", f"w:{sid}:input:barriers")], [("取消", f"w:{sid}:cancel:-")]],
+            )
+        if action == "barriers":
+            session = self.store.get_session(sid) or session
+            if session["payload"]["order_type"] == "LIMIT":
+                return self._limit_price_step(session)
+            return self._stock_preview(session)
+        if action == "price_latest":
+            self.store.update_session(sid, payload={"use_latest_price": True})
+            return self._stock_preview(self.store.get_session(sid) or session)
+        if action == "confirm":
+            return self._execute_stock(session)
+        if action == "refresh":
+            return self._executor_result(session)
+        raise ValueError("未知仓位向导动作")
+
+    def _limit_price_step(self, session: dict) -> tuple[str, list]:
+        sid = session["session_id"]
+        self.store.update_session(sid, step="price")
+        return "限价设置：", [[("使用最新报价", f"w:{sid}:price_latest:-"), ("自定义价格", f"w:{sid}:input:price")], [("取消", f"w:{sid}:cancel:-")]]
+
+    def _build_stock_config(self, session: dict) -> tuple[dict, Decimal]:
+        data = session["payload"]
+        symbol = data["symbol"]
+        side = data.get("side", "BUY")
+        quote = self.stocks.quote(symbol)
+        market_price = _quote_price(quote, side)
+        price = _d(data.get("price", market_price))
+        if data.get("amount_basis") == "shares":
+            shares = _d(data["shares"])
+        else:
+            shares = (_d(data.get("amount_usdc", "100")) / price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        if shares <= 0:
+            raise ValueError("金额低于可表示的最小股数")
+        raw = f"{session['session_id']}|{symbol}|{side}|{shares}|{price}|{session['flow']}"
+        executor_id = "tg-" + hashlib.sha256(raw.encode()).hexdigest()[:24]
+        order_type = data.get("order_type", "LIMIT")
+        common = {
+            "id": executor_id,
+            "timestamp": time.time(),
+            "connector_name": "binance_stocks",
+            "trading_pair": f"{symbol}-USDC",
+            "side": side,
+            "amount": str(shares),
+            "controller_id": "telegram-management-bot",
+        }
+        if session["flow"] == "stock_order":
+            config = {**common, "type": "order_executor", "position_action": "OPEN", "execution_strategy": order_type}
+            if order_type == "LIMIT":
+                config["price"] = str(price)
+        else:
+            config = {
+                **common,
+                "type": "position_executor",
+                "entry_price": str(price) if order_type == "LIMIT" else None,
+                "triple_barrier_config": {
+                    "take_profit": data.get("take_profit", "0.03"),
+                    "stop_loss": data.get("stop_loss", "0.02"),
+                    "time_limit": int(Decimal(data.get("days", "7")) * 86400),
+                    "open_order_type": order_type,
+                    "take_profit_order_type": "LIMIT",
+                    "stop_loss_order_type": "MARKET",
+                    "time_limit_order_type": "MARKET",
+                },
+            }
+        return config, price
+
+    def _stock_preview(self, session: dict) -> tuple[str, list]:
+        config, price = self._build_stock_config(session)
+        preview = self.stocks.preview(config)
+        session = self.store.update_session(session["session_id"], step="confirm", payload={"config": config})
+        notional = Decimal(config["amount"]) * price
+        barriers = config.get("triple_barrier_config", {})
+        loss = notional * Decimal(str(barriers.get("stop_loss", "0")))
+        lines = [
+            "✅ Stock 权威预检通过",
+            f"股票：{session['payload']['symbol']} / {config['side']}",
+            f"类型：{config['type']} / {session['payload'].get('order_type', 'LIMIT')}",
+            f"数量：{config['amount']} 股",
+            f"参考价格：{price} USDC",
+            f"预计金额：{notional.quantize(Decimal('0.01'))} USDC",
+            f"预计费用预留：{preview.get('fee_reserve', '-')} USDC",
+        ]
+        if loss > 0:
+            lines.append(f"止损最大估算：{loss.quantize(Decimal('0.01'))} USDC（不含跳空滑点）")
+        lines.append("确认后由 Stock Runtime 再次执行同一套校验。")
+        return "\n".join(lines), [[("✅ 确认创建", f"w:{session['session_id']}:confirm:-"), ("取消", f"w:{session['session_id']}:cancel:-")]]
+
+    def _execute_stock(self, session: dict) -> tuple[str, list]:
+        config = dict(session["payload"].get("config", {}))
+        if not config:
+            raise ValueError("订单预览已失效，请重新创建")
+        if not self.settings.mutations_enabled:
+            return "🔒 当前为只读观察模式，预检已通过但未创建任何订单。", self._back("m:stock")
+        key = f"stock:{config['id']}"
+        claimed, existing = self.store.claim_action(key)
+        if claimed:
+            try:
+                result = self.stocks.create(config)
+                self.store.finish_action(key, "SUBMITTED", result)
+            except Exception as exc:
+                result = {"error": _safe_text(exc)}
+                self.store.finish_action(key, "FAILED", result)
+                raise
+        else:
+            result = existing or {}
+        self.store.update_session(session["session_id"], step="result", payload={"executor_id": config["id"]})
+        return (
+            f"📨 创建请求已处理\nExecutor：{config['id']}\n状态：{_safe_text(result.get('status', result))}",
+            [[("刷新执行结果", f"w:{session['session_id']}:refresh:-"), ("Stock菜单", "m:stock")]],
+        )
+
+    def _executor_result(self, session: dict) -> tuple[str, list]:
+        executor_id = str(session["payload"].get("executor_id", ""))
+        if not executor_id:
+            raise ValueError("没有可查询的Executor")
+        result = self.stocks.executor(executor_id)
+        ledger = result.get("ledger") or {}
+        runtime = result.get("runtime") or {}
+        orders = ledger.get("orders", []) if isinstance(ledger, dict) else []
+        filled = sum(Decimal(str(item.get("cumulative_base", 0))) for item in orders if isinstance(item, dict))
+        fees = sum(Decimal(str(item.get("cumulative_fee", 0))) for item in orders if isinstance(item, dict))
+        text = (
+            f"📈 Executor 执行结果\nID：{executor_id}\n"
+            f"账本状态：{ledger.get('status', '-')}\n运行状态：{runtime.get('status', '-')}\n"
+            f"累计成交：{filled} 股\n累计费用：{fees} USDC"
+        )
+        return text, [[("刷新", f"w:{session['session_id']}:refresh:-"), ("Stock菜单", "m:stock")]]
+
+    def _stock_whitelist(self) -> tuple[str, list]:
+        try:
+            items = self.stocks.whitelist()
+        except Exception as exc:
+            return f"📋 白名单\n\n数据不可用：{_safe_text(exc)}", self._back("m:stock")
+        lines = ["📋 Stock 白名单", ""]
+        rows: list[list[tuple[str, str]]] = []
+        for item in items[:20]:
+            symbol = str(item.get("symbol"))
+            enabled = bool(item.get("enabled"))
+            lines.append(f"• {symbol}：{'启用' if enabled else '停用'}；上限 {item.get('max_position_notional')} USDC")
+            rows.append([
+                (f"{'停用' if enabled else '启用'} {symbol}", f"s:wl_toggle:{symbol}:{int(not enabled)}"),
+                (f"删除 {symbol}", f"s:wl_delete:{symbol}"),
+            ])
+        rows.append([("➕ 添加/修改", "s:wl_input"), ("⬅️ 返回", "m:stock")])
+        return "\n".join(lines), rows
+
+    def _stock_limits(self) -> str:
+        value = self.stocks.limits()
+        active, hard = value.get("active", {}), value.get("hard_ceiling", {})
+        return (
+            "📏 Stock 交易限制\n\n"
+            f"单笔：{active.get('max_order_notional')} / 硬上限 {hard.get('max_order_notional')} USDC\n"
+            f"单股票：{active.get('max_symbol_exposure')} / 硬上限 {hard.get('max_symbol_exposure')} USDC\n"
+            f"总持仓：{active.get('max_managed_exposure')} / 硬上限 {hard.get('max_managed_exposure')} USDC"
+        )
+
+    def _stock_executors_menu(self, user_id: int, chat_id: int, message_id: int) -> tuple[str, list]:
+        items = self.stocks.executors(active_only=True)
+        lines = ["📈 Stock 活动仓位与订单", ""]
+        rows: list[list[tuple[str, str]]] = []
+        for item in items[:12]:
+            executor_id = str(item.get("executor_id", ""))
+            lines.append(
+                f"• {item.get('symbol', '-')} / {item.get('executor_type', '-')} / {item.get('status', '-')}"
+            )
+            session = self.store.create_session(user_id, chat_id, "executor_action", message_id)
+            self.store.update_session(session["session_id"], payload={"executor_id": executor_id})
+            rows.append([("管理 " + str(item.get("symbol", "-")), f"x:{session['session_id']}:exec_view")])
+        if not items:
+            lines.append("当前没有活动 Executor。")
+        rows.append([("刷新", "s:positions"), ("⬅️ 返回", "m:stock")])
+        return "\n".join(lines), rows
+
+    def _stock_executor_detail(self, session: dict) -> tuple[str, list]:
+        executor_id = session["payload"]["executor_id"]
+        result = self.stocks.executor(executor_id)
+        ledger = result.get("ledger") or {}
+        rows = [[
+            ("⏸ 暂停", f"x:{session['session_id']}:exec_pause"),
+            ("📉 减仓", f"x:{session['session_id']}:exec_reduce"),
+            ("🛑 平仓", f"x:{session['session_id']}:exec_close"),
+        ], [("⬅️ 返回", "s:positions")]]
+        return (
+            f"📈 Executor\nID：{executor_id}\n股票：{ledger.get('symbol', '-')}\n"
+            f"类型：{ledger.get('executor_type', '-')}\n状态：{ledger.get('status', '-')}",
+            rows,
+        )
+
+    def _approvals_menu(self) -> tuple[str, list]:
+        pending = [item for item in self.approvals.pending() if item["status"] == "PENDING"]
+        lines = ["🧠 模型审批", f"待审批：{len(pending)}", ""]
+        rows: list[list[tuple[str, str]]] = []
+        for item in pending[:10]:
+            deadline = item.get("review_deadline")
+            remain = max(0, int(deadline) - int(time.time())) if deadline else 0
+            lines.append(f"• {item['model_type']} / {item['candidate_id']} / 剩余{remain // 3600}小时")
+            rows.append([(f"查看 {item['candidate_id']}", f"a:{item['candidate_id']}:view")])
+        if not pending:
+            lines.append("当前没有待审批模型。")
+        rows.append([("刷新", "m:approvals"), ("🏠 主菜单", "m:home")])
+        return "\n".join(lines), rows
+
+    def _notify_new_model_candidates(self) -> None:
+        """Send one private inline approval card per hash-bound pending candidate."""
+        for item in self.approvals.pending():
+            if item.get("status") != "PENDING":
+                continue
+            release = item["release_sha256"]
+            marker = f"approval_notified:{release}"
+            if self.store.metadata(marker) == "true":
+                continue
+            deadline = item.get("review_deadline")
+            deadline_text = (
+                time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(deadline)))
+                if deadline else "-"
+            )
+            self.telegram.send(
+                self.settings.admin_user_id,
+                "🧠 新模型候选等待审批\n\n"
+                f"类型：{item['model_type']}\n候选：{item['candidate_id']}\n"
+                f"默认审批截止：{deadline_text}\n"
+                "截止前无人拒绝且硬门槛持续通过时自动批准；当前模型继续交易。",
+                [[("查看证据并审批", f"a:{item['candidate_id']}:view")]],
+            )
+            self.store.set_metadata(marker, "true")
+
+    def _approval_detail(self, candidate_id: str) -> tuple[str, list]:
+        item = self.approvals.find(candidate_id)
+        if not item:
+            return "模型候选不存在或已归档。", self._back("m:approvals")
+        evidence = self.approvals.evidence(item)
+        checks = item.get("checks", {})
+        check_lines = [f"• {key}：{'通过' if value else '失败'}" for key, value in checks.items()]
+        lines = [
+            f"🧠 {item['model_type']}",
+            f"候选：{item['candidate_id']}",
+            f"Release：{item['release_sha256']}",
+            f"模型：{item['model_sha256']}",
+            f"状态：{item['status']}",
+            f"证据附件：{len(evidence['attachments'])}",
+            "硬门槛：",
+            *(check_lines or ["• 无门槛数据"]),
+            "默认行为：截止前无人拒绝且硬门槛持续通过则自动批准。",
+        ]
+        rows = [
+            [("查看PNG/PDF证据", f"a:{candidate_id}:evidence")],
+            [("✅ 批准", f"a:{candidate_id}:approve"), ("❌ 拒绝", f"a:{candidate_id}:reject")],
+            [("⬅️ 返回", "m:approvals")],
+        ]
+        return "\n".join(lines), rows
+
+    def _handle_model_approval(self, data: str, callback: dict, update_id: int) -> tuple[str, list]:
+        _, candidate_id, action = data.split(":", 2)
+        if action == "view":
+            return self._approval_detail(candidate_id)
+        candidate = self.approvals.find(candidate_id)
+        if not candidate or candidate.get("status") != "PENDING":
+            return "候选已不再等待审批。", self._back("m:approvals")
+        if action == "evidence":
+            evidence = self.approvals.evidence(candidate)
+            attachments = [
+                item for item in evidence["attachments"]
+                if str(item["name"]).lower().endswith((".png", ".jpg", ".jpeg", ".pdf"))
+            ]
+            for item in attachments[:8]:
+                self.telegram.send_file(
+                    int(callback["message"]["chat"]["id"]),
+                    item["path"],
+                    f"{candidate_id} · {item['name']} · sha256 {item['sha256'][:16]}",
+                )
+            return (
+                f"已发送 {min(len(attachments), 8)} 个PNG/PDF证据附件。"
+                if attachments else "该候选当前没有可发送的PNG/PDF证据附件。",
+                self._back(f"a:{candidate_id}:view"),
+            )
+        if action == "approve":
+            return (
+                f"确认批准模型候选 {candidate_id}？\n决定将绑定请求和证据哈希。",
+                [[("确认批准", f"a:{candidate_id}:approve2"), ("取消", f"a:{candidate_id}:view")]],
+            )
+        if action == "reject":
+            session = self.store.create_session(
+                int(callback["from"]["id"]), int(callback["message"]["chat"]["id"]),
+                "model_reject", int(callback["message"]["message_id"]),
+            )
+            self.store.update_session(session["session_id"], step="reason", payload={"candidate_id": candidate_id})
+            return "请输入拒绝原因：", [[("取消", "m:approvals")]]
+        if action == "approve2":
+            if not self.settings.mutations_enabled:
+                return "🔒 当前为只读观察模式，未写入审批决定。", self._back("m:approvals")
+            key = f"approval:{candidate['release_sha256']}:approve"
+            claimed, existing = self.store.claim_action(key)
+            if claimed:
+                result = self.approvals.decide(
+                    candidate, "approve", operator=f"telegram:{self.settings.admin_user_id}", reason="",
+                    telegram_user_id=int(callback["from"]["id"]),
+                    telegram_chat_id=int(callback["message"]["chat"]["id"]),
+                    telegram_update_id=update_id,
+                    telegram_callback_query_id=str(callback["id"]),
+                )
+                self.store.finish_action(key, "APPROVED", result)
+            else:
+                result = existing or {}
+            return f"✅ 模型候选已批准\n{candidate_id}\nScheduler 将再次验证后预热和激活。", self._back("m:approvals")
+        raise ValueError("未知审批动作")
+
+    def _handle_text_session(self, message: dict, session: dict) -> tuple[str, list]:
+        text = str(message.get("text", "")).strip()
+        sid = session["session_id"]
+        flow, step = session["flow"], session["step"]
+        if flow in {"stock_order", "stock_position"}:
+            if step == "input_amount":
+                _d(text)
+                session = self.store.update_session(sid, payload={"amount_usdc": text, "amount_basis": "quote"})
+                if flow == "stock_position" and "order_type" not in session["payload"]:
+                    return "请选择入场方式：", [[("LIMIT（推荐）", f"w:{sid}:entry:LIMIT"), ("MARKET", f"w:{sid}:entry:MARKET")]]
+                if session["payload"].get("order_type") == "LIMIT":
+                    return self._limit_price_step(session)
+                return self._stock_preview(session)
+            if step == "input_shares":
+                _d(text)
+                session = self.store.update_session(sid, payload={"shares": text, "amount_basis": "shares"})
+                if session["payload"].get("order_type") == "LIMIT":
+                    return self._limit_price_step(session)
+                return self._stock_preview(session)
+            if step == "input_price":
+                _d(text)
+                session = self.store.update_session(sid, payload={"price": text})
+                return self._stock_preview(session)
+            if step == "input_barriers":
+                parts = [part.strip() for part in text.replace("，", ",").split(",")]
+                if len(parts) != 3:
+                    raise ValueError("请输入：止盈%,止损%,持仓天数，例如 3,2,7")
+                tp, sl, days = (_d(value) for value in parts)
+                if tp > 50 or sl > 20 or days > 365:
+                    raise ValueError("止盈≤50%，止损≤20%，持仓≤365天")
+                session = self.store.update_session(sid, payload={
+                    "take_profit": str(tp / 100), "stop_loss": str(sl / 100), "days": str(days),
+                })
+                if session["payload"].get("order_type") == "LIMIT":
+                    return self._limit_price_step(session)
+                return self._stock_preview(session)
+        if flow == "whitelist_input":
+            parts = text.upper().split()
+            if len(parts) not in {1, 2}:
+                raise ValueError("请输入：股票代码 [单股票上限]，例如 AAPL 200")
+            limit = str(_d(parts[1] if len(parts) == 2 else "200"))
+            session = self.store.update_session(sid, step="confirm", payload={"symbol": parts[0], "limit": limit})
+            return f"确认添加/更新 {parts[0]}，单股票上限 {limit} USDC？", [[("确认", f"x:{sid}:wl_confirm"), ("取消", "m:stock")]]
+        if flow == "limits_input":
+            parts = [part.strip() for part in text.replace("，", ",").split(",")]
+            if len(parts) != 3:
+                raise ValueError("请输入：单笔,单股票,总持仓，例如 200,200,2000")
+            values = [str(_d(part)) for part in parts]
+            if not (Decimal(values[0]) <= Decimal(values[1]) <= Decimal(values[2])):
+                raise ValueError("必须满足：单笔 ≤ 单股票 ≤ 总持仓")
+            self.store.update_session(sid, step="confirm", payload={"limits": values})
+            return f"确认更新限额为 {values[0]} / {values[1]} / {values[2]} USDC？", [[("确认", f"x:{sid}:limits_confirm"), ("取消", "m:stock")]]
+        if flow == "model_reject" and step == "reason":
+            if len(text) < 3:
+                raise ValueError("拒绝原因至少3个字符")
+            self.store.update_session(sid, step="confirm", payload={"reason": text})
+            return f"确认拒绝候选 {session['payload']['candidate_id']}？\n原因：{text}", [[("确认拒绝", f"x:{sid}:reject_confirm"), ("取消", "m:approvals")]]
+        if flow == "executor_action" and step == "input_reduce":
+            amount = str(_d(text))
+            self.store.update_session(sid, step="confirm", payload={"reduce_amount": amount})
+            return (
+                f"确认减仓 {amount} 股？\nExecutor：{session['payload']['executor_id']}",
+                [[("确认减仓", f"x:{sid}:exec_reduce_confirm"), ("取消", f"x:{sid}:exec_view")]],
+            )
+        raise ValueError("当前没有等待文本输入的向导")
+
+    def _handle_session_action(self, data: str, callback: dict, update_id: int) -> tuple[str, list]:
+        _, sid, action = data.split(":", 2)
+        session = self.store.get_session(sid)
+        if not session:
+            return "向导已过期，请重新开始。", self._back()
+        if action == "wl_toggle_confirm":
+            if not self.settings.mutations_enabled:
+                return "🔒 只读观察模式，白名单未修改。", self._back("s:whitelist")
+            payload = session["payload"]
+            result = self.stocks.put_whitelist(
+                payload["symbol"], bool(payload["enabled"]), payload["limit"]
+            )
+            self.store.delete_session(sid)
+            return f"✅ {payload['symbol']} 已{'启用' if payload['enabled'] else '停用'}\n{_safe_text(result)}", self._back("s:whitelist")
+        if action == "wl_delete_confirm":
+            if not self.settings.mutations_enabled:
+                return "🔒 只读观察模式，白名单未删除。", self._back("s:whitelist")
+            symbol = session["payload"]["symbol"]
+            result = self.stocks.delete_whitelist(symbol)
+            self.store.delete_session(sid)
+            return (
+                f"✅ {symbol} 已从白名单移除\n已有仓位保持不变，仍可SELL或平仓。\n{_safe_text(result)}",
+                self._back("s:whitelist"),
+            )
+        if action == "wl_confirm":
+            if not self.settings.mutations_enabled:
+                return "🔒 只读观察模式，白名单未修改。", self._back("m:stock")
+            payload = session["payload"]
+            result = self.stocks.put_whitelist(payload["symbol"], True, payload["limit"])
+            self.store.delete_session(sid)
+            return f"✅ 白名单已更新\n{_safe_text(result)}", self._back("s:whitelist")
+        if action == "limits_confirm":
+            if not self.settings.mutations_enabled:
+                return "🔒 只读观察模式，限额未修改。", self._back("m:stock")
+            order, symbol, total = session["payload"]["limits"]
+            result = self.stocks.put_limits(order, symbol, total)
+            self.store.delete_session(sid)
+            return f"✅ 限额已更新\n{_safe_text(result)}", self._back("m:stock")
+        if action == "reject_confirm":
+            if not self.settings.mutations_enabled:
+                return "🔒 只读观察模式，未写入拒绝决定。", self._back("m:approvals")
+            candidate = self.approvals.find(session["payload"]["candidate_id"])
+            if not candidate:
+                raise ValueError("候选已不存在")
+            result = self.approvals.decide(
+                candidate, "reject", operator=f"telegram:{self.settings.admin_user_id}",
+                reason=session["payload"]["reason"],
+                telegram_user_id=int(callback["from"]["id"]),
+                telegram_chat_id=int(callback["message"]["chat"]["id"]),
+                telegram_update_id=update_id,
+                telegram_callback_query_id=str(callback["id"]),
+            )
+            self.store.delete_session(sid)
+            return f"❌ 模型候选已拒绝\n{result['release_sha256'][:16]}", self._back("m:approvals")
+        if action == "exec_view":
+            return self._stock_executor_detail(session)
+        if action in {"exec_pause", "exec_close"}:
+            label = "暂停并保留仓位" if action == "exec_pause" else "关闭并退出仓位"
+            return (
+                f"确认{label}？\nExecutor：{session['payload']['executor_id']}",
+                [[("确认执行", f"x:{sid}:{action}2"), ("取消", f"x:{sid}:exec_view")]],
+            )
+        if action in {"exec_pause2", "exec_close2"}:
+            if not self.settings.mutations_enabled:
+                return "🔒 只读观察模式，未执行Executor变更。", self._back("s:positions")
+            executor_id = session["payload"]["executor_id"]
+            key = f"executor:{executor_id}:{action}"
+            claimed, existing = self.store.claim_action(key)
+            if claimed:
+                result = self.stocks.pause(executor_id) if action == "exec_pause2" else self.stocks.close(executor_id)
+                self.store.finish_action(key, "COMPLETE", result)
+            else:
+                result = existing or {}
+            return f"✅ Executor 操作完成\n{_safe_text(result)}", self._back("s:positions")
+        if action == "exec_reduce":
+            self.store.update_session(sid, step="input_reduce")
+            return "请输入需要减仓的股数：", [[("取消", f"x:{sid}:exec_view")]]
+        if action == "exec_reduce_confirm":
+            if not self.settings.mutations_enabled:
+                return "🔒 只读观察模式，未执行减仓。", self._back("s:positions")
+            executor_id = session["payload"]["executor_id"]
+            amount = session["payload"]["reduce_amount"]
+            request_id = hashlib.sha256(f"{sid}|{executor_id}|{amount}".encode()).hexdigest()[:24]
+            key = f"executor:{executor_id}:reduce:{request_id}"
+            claimed, existing = self.store.claim_action(key)
+            if claimed:
+                result = self.stocks.reduce(executor_id, amount, request_id)
+                self.store.finish_action(key, "COMPLETE", result)
+            else:
+                result = existing or {}
+            return f"✅ 减仓请求已处理\n{_safe_text(result)}", self._back("s:positions")
+        raise ValueError("未知确认动作")
+
+    def _maintenance_action(self, key: str, action: str) -> tuple[str, list]:
+        definition = self.settings.bots[key]
+        if action == "view":
+            return self._bot_menu(key)
+        if action in {"stop", "start", "restart"}:
+            allowed, reason = ContractReader.resume_allowed(
+                "grid" if key == "grid" else "dca", self.contracts.snapshot()
+            )
+            if action in {"start", "restart"} and not allowed:
+                return f"⛔ 当前不能恢复/重启交易\n原因：{reason}", self._back(f"m:bot:{key}")
+            label = {"stop": "停止并撤单", "start": "恢复交易", "restart": "安全重启"}[action]
+            return (
+                f"确认{label} {definition['bot_name']}？\n风控预检：{reason}",
+                [[("确认执行", f"c:{key}:{action}"), ("取消", f"m:bot:{key}")]],
+            )
+        raise ValueError("未知机器人动作")
+
+    def _confirm_maintenance(self, key: str, action: str) -> tuple[str, list]:
+        if not self.settings.mutations_enabled:
+            return "🔒 当前为只读观察模式，未执行机器人变更。", self._back(f"m:bot:{key}")
+        definition = self.settings.bots[key]
+        idempotency = f"bot:{definition['bot_name']}:{action}:{int(time.time()) // 30}"
+        claimed, existing = self.store.claim_action(idempotency)
+        if claimed:
+            try:
+                if action == "stop":
+                    result = self.hummingbot.stop(definition["bot_name"])
+                elif action == "start":
+                    result = self.hummingbot.start(definition)
+                else:
+                    result = self.hummingbot.restart(definition)
+                self.store.finish_action(idempotency, "COMPLETE", result)
+            except Exception as exc:
+                self.store.finish_action(idempotency, "FAILED", {"error": _safe_text(exc)})
+                raise
+        else:
+            result = existing or {}
+        return f"✅ 操作已执行\n机器人：{definition['bot_name']}\n结果：{_safe_text(result)}", self._back(f"m:bot:{key}")
+
+    def _handle_callback(self, update_id: int, callback: dict) -> None:
+        user_id = int(callback.get("from", {}).get("id", 0))
+        message = callback.get("message", {})
+        chat = message.get("chat", {})
+        chat_id = int(chat.get("id", 0))
+        message_id = int(message.get("message_id", 0))
+        callback_id = str(callback.get("id", ""))
+        data = str(callback.get("data", ""))
+        if not self._authorized(user_id, chat_id, str(chat.get("type", ""))):
+            self.store.audit("ACCESS_DENIED", user_id=user_id, chat_id=chat_id, update_id=update_id,
+                             callback_id=callback_id, details={"surface": "callback"})
+            self.telegram.answer_callback(callback_id, "无权访问", True)
+            return
+        try:
+            if data.startswith("m:") or data in {"s:whitelist", "s:limits", "s:positions"}:
+                self.store.clear_sessions(user_id, chat_id)
+            if data == "m:home":
+                text, rows = self._home()
+            elif data == "m:overview":
+                text, rows = self._overview(), self._back()
+            elif data == "m:profit":
+                text, rows = self._profit(), self._back()
+            elif data == "m:risk":
+                text, rows = self._risk(), self._back()
+            elif data == "m:errors":
+                text, rows = self._errors(), self._back()
+            elif data == "m:models":
+                text, rows = self._models(), self._back()
+            elif data == "m:approvals":
+                text, rows = self._approvals_menu()
+            elif data == "m:stock":
+                text, rows = self._stock_menu()
+            elif data == "m:dca":
+                text, rows = self._dca_menu()
+            elif data == "m:maintenance":
+                text, rows = "🔧 系统维护\n\n所有变更都需二次确认；恢复不会绕过风控门。", [[("Grid", "m:bot:grid"), ("DCA", "m:dca")], [("🏠 主菜单", "m:home")]]
+            elif data.startswith("m:bot:"):
+                text, rows = self._bot_menu(data.split(":", 2)[2])
+            elif data.startswith("b:"):
+                _, key, action = data.split(":", 2)
+                text, rows = self._maintenance_action(key, action)
+            elif data.startswith("c:"):
+                _, key, action = data.split(":", 2)
+                text, rows = self._confirm_maintenance(key, action)
+            elif data == "s:new:order":
+                text, rows = self._new_stock_session("stock_order", user_id, chat_id, message_id)
+            elif data == "s:new:position":
+                text, rows = self._new_stock_session("stock_position", user_id, chat_id, message_id)
+            elif data == "s:whitelist":
+                text, rows = self._stock_whitelist()
+            elif data == "s:limits":
+                text, rows = self._stock_limits(), [[("修改", "s:limits_input"), ("⬅️ 返回", "m:stock")]]
+            elif data == "s:positions":
+                text, rows = self._stock_executors_menu(user_id, chat_id, message_id)
+            elif data == "s:wl_input":
+                session = self.store.create_session(user_id, chat_id, "whitelist_input", message_id)
+                self.store.update_session(session["session_id"], step="input")
+                text, rows = "请输入：股票代码 [单股票上限]\n例如：AAPL 200", [[("取消", "m:stock")]]
+            elif data == "s:limits_input":
+                session = self.store.create_session(user_id, chat_id, "limits_input", message_id)
+                self.store.update_session(session["session_id"], step="input")
+                text, rows = "请输入：单笔,单股票,总持仓\n例如：200,200,2000", [[("取消", "m:stock")]]
+            elif data.startswith("s:wl_toggle:"):
+                _, _, symbol, enabled = data.split(":", 3)
+                row = next((item for item in self.stocks.whitelist() if item.get("symbol") == symbol), None)
+                if not row:
+                    raise ValueError("白名单项目不存在")
+                session = self.store.create_session(user_id, chat_id, "whitelist_toggle", message_id)
+                self.store.update_session(session["session_id"], step="confirm", payload={
+                    "symbol": symbol,
+                    "enabled": bool(int(enabled)),
+                    "limit": str(row["max_position_notional"]),
+                })
+                target = "启用" if int(enabled) else "停用（已有仓位不会自动卖出）"
+                text, rows = (
+                    f"确认{target} {symbol}？",
+                    [[("确认", f"x:{session['session_id']}:wl_toggle_confirm"), ("取消", "s:whitelist")]],
+                )
+            elif data.startswith("s:wl_delete:"):
+                symbol = data.split(":", 2)[2]
+                row = next((item for item in self.stocks.whitelist() if item.get("symbol") == symbol), None)
+                if not row:
+                    raise ValueError("白名单项目不存在")
+                session = self.store.create_session(user_id, chat_id, "whitelist_delete", message_id)
+                self.store.update_session(session["session_id"], step="confirm", payload={"symbol": symbol})
+                text, rows = (
+                    f"确认删除 {symbol}？\n这会立即禁止新增BUY，但不会自动卖出已有仓位。",
+                    [[("确认删除", f"x:{session['session_id']}:wl_delete_confirm"), ("取消", "s:whitelist")]],
+                )
+            elif data.startswith("w:"):
+                _, sid, action, value = data.split(":", 3)
+                session = self.store.get_session(sid)
+                if not session:
+                    text, rows = "向导已过期，请重新开始。", self._back("m:stock")
+                elif action == "cancel":
+                    self.store.delete_session(sid)
+                    text, rows = "已取消，未执行任何变更。", self._back("m:stock")
+                elif action == "input":
+                    step = {"amount": "input_amount", "shares": "input_shares", "price": "input_price", "barriers": "input_barriers"}[value]
+                    self.store.update_session(sid, step=step)
+                    prompts = {
+                        "amount": "请输入USDC金额：", "shares": "请输入股数：", "price": "请输入限价：",
+                        "barriers": "请输入：止盈%,止损%,持仓天数，例如 3,2,7",
+                    }
+                    text, rows = prompts[value], [[("取消", f"w:{sid}:cancel:-")]]
+                elif session["flow"] == "stock_order":
+                    text, rows = self._stock_order_step(session, action, value)
+                else:
+                    text, rows = self._stock_position_step(session, action, value)
+            elif data.startswith("a:"):
+                text, rows = self._handle_model_approval(data, callback, update_id)
+            elif data.startswith("x:"):
+                text, rows = self._handle_session_action(data, callback, update_id)
+            else:
+                raise ValueError("未知操作")
+            self._edit_or_send(chat_id, message_id, text, rows)
+            self.telegram.answer_callback(callback_id, "已处理")
+            self.store.audit("CALLBACK_COMPLETE", user_id=user_id, chat_id=chat_id, update_id=update_id,
+                             callback_id=callback_id, details={"action": data})
+        except Exception as exc:
+            logger.warning("callback failed action=%s type=%s", data, type(exc).__name__)
+            self.telegram.answer_callback(callback_id, _safe_text(exc, 180), True)
+            self.store.audit("CALLBACK_FAILED", user_id=user_id, chat_id=chat_id, update_id=update_id,
+                             callback_id=callback_id, details={"action": data, "error": _safe_text(exc)})
+
+    def _handle_message(self, update_id: int, message: dict) -> None:
+        user_id = int(message.get("from", {}).get("id", 0))
+        chat = message.get("chat", {})
+        chat_id = int(chat.get("id", 0))
+        if not self._authorized(user_id, chat_id, str(chat.get("type", ""))):
+            self.store.audit("ACCESS_DENIED", user_id=user_id, chat_id=chat_id, update_id=update_id,
+                             details={"surface": "message"})
+            return
+        text = str(message.get("text", "")).strip()
+        try:
+            if text in {"/start", "/menu", "菜单"}:
+                self.store.clear_sessions(user_id, chat_id)
+                rendered, rows = self._home()
+            else:
+                session = self.store.active_session(user_id, chat_id)
+                if not session:
+                    rendered, rows = "请使用菜单按钮开始操作。", HOME_ROWS
+                else:
+                    rendered, rows = self._handle_text_session(message, session)
+            self.telegram.send(chat_id, rendered, rows)
+            self.store.audit("MESSAGE_COMPLETE", user_id=user_id, chat_id=chat_id, update_id=update_id,
+                             details={"command": text[:50]})
+        except Exception as exc:
+            self.telegram.send(chat_id, f"输入无效：{_safe_text(exc)}", [[("🏠 主菜单", "m:home")]])
+            self.store.audit("MESSAGE_FAILED", user_id=user_id, chat_id=chat_id, update_id=update_id,
+                             details={"error": _safe_text(exc)})
+
+    def handle_update(self, update: dict) -> None:
+        update_id = int(update.get("update_id", -1))
+        if update_id < 0 or not self.store.claim_update(update_id):
+            return
+        if isinstance(update.get("callback_query"), dict):
+            self._handle_callback(update_id, update["callback_query"])
+        elif isinstance(update.get("message"), dict):
+            self._handle_message(update_id, update["message"])
+        self.store.set_metadata("telegram_offset", update_id + 1)
+
+    def _health(self, error: str = "") -> None:
+        payload = {
+            "schema": "trading-management-bot-health-v1",
+            "generated_at": time.time(),
+            "mode": self.mode_label,
+            "admin_configured": self.settings.admin_user_id > 0,
+            "last_error": error,
+        }
+        temporary = self.settings.health_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, self.settings.health_path)
+
+    def run(self) -> None:
+        if self.store.metadata("telegram_initialized") != "true":
+            self.telegram.delete_webhook(drop_pending_updates=True)
+            self.store.set_metadata("telegram_initialized", "true")
+        offset = int(self.store.metadata("telegram_offset", "0") or 0)
+        self._health()
+        while self.running:
+            try:
+                for update in self.telegram.get_updates(offset, timeout=25):
+                    self.handle_update(update)
+                    offset = max(offset, int(update.get("update_id", -1)) + 1)
+                    self.store.set_metadata("telegram_offset", offset)
+                self._notify_new_model_candidates()
+                self._health()
+            except TelegramError as exc:
+                logger.warning("Telegram polling transient failure: %s", exc)
+                self._health(str(exc))
+                time.sleep(3)
+            except Exception as exc:
+                logger.exception("management loop failed")
+                self._health(f"{type(exc).__name__}: {_safe_text(exc)}")
+                time.sleep(3)
+
+
+def main() -> int:
+    bot = TradingManagementBot(Settings.from_env())
+    signal.signal(signal.SIGTERM, bot.stop)
+    signal.signal(signal.SIGINT, bot.stop)
+    try:
+        bot.run()
+    finally:
+        bot.store.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,12 @@
+{
+  "base_image": "hummingbot-api-orchestration:local",
+  "external_positions_unknown": true,
+  "generated_at": "2026-08-21T15:16:56.461351+00:00",
+  "live_authorized": false,
+  "package_id": "binance-stocks-runtime",
+  "position_source": "managed_ledger_non_authoritative",
+  "release_sha256": "128735e244f832affb64560a0ded256a4b2e09defc2e02c4fe13475a665a8225",
+  "runtime_mode": "PAPER",
+  "schema": "binance-stocks-runtime-package-v1",
+  "secrets_included": false
+}

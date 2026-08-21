@@ -62,6 +62,38 @@ services:
     networks:
       - hummingbot-control
 
+  binance-stocks-runtime:
+    profiles:
+      - stocks
+    container_name: binance-stocks-runtime
+    build:
+      context: .
+      dockerfile: Dockerfile.binance-stocks-runtime
+    image: hummingbot/binance-stocks-runtime:local
+    restart: unless-stopped
+    env_file:
+      - .env.control
+    environment:
+      BINANCE_STOCKS_CREDENTIALS_FILE: /run/secrets/binance_stocks_credentials
+      BINANCE_STOCKS_ACCOUNT: stocks_managed
+      BINANCE_STOCKS_DATABASE_NAME: hummingbot_stocks
+      BINANCE_STOCKS_ORDER_PREFIX: x-HBSTK
+      BINANCE_STOCKS_MAX_ORDER_USDC: "200"
+      BINANCE_STOCKS_MAX_SYMBOL_USDC: "200"
+      BINANCE_STOCKS_MAX_EXPOSURE_USDC: "2000"
+      BINANCE_STOCKS_DAILY_LOSS_USDC: "200"
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - ./api-files/stocks-runtime/bots:/hummingbot-api/bots
+      - ./api-files/stocks-runtime/logs:/hummingbot-api/logs
+    secrets:
+      - binance_stocks_credentials
+    depends_on:
+      - postgres
+    networks:
+      - hummingbot-control
+
   hummingbot-mcp:
     container_name: hummingbot-mcp
     image: hummingbot/hummingbot-mcp:latest
@@ -181,6 +213,7 @@ services:
       DCA_LIVE_STATE_PATH: /workspace/dca-state
       MODEL_EVIDENCE_RECEIPT_ROOT: /workspace/dca-state/telegram/evidence_receipts
       PARAMETER_EVIDENCE_RECEIPT_ROOT: /workspace/dca-state/telegram/evidence_receipts
+      MODEL_APPROVAL_DECISION_ROOT: /workspace/weekly/decisions
       GRID_V22_AUTHORIZATION_PATH: /workspace/state/ethbtc_forced_exit_authorization.json
       TELEGRAM_NOTIFICATION_EVENTS_PATH: /workspace/state/telegram_events.jsonl
     volumes:
@@ -434,21 +467,39 @@ services:
     networks:
       - hummingbot-control
 
-  condor:
-    container_name: hummingbot-condor
+  sunnypiggy-trade-bot:
+    container_name: sunnypiggy-trade-bot
     build:
       context: .
-      dockerfile: Dockerfile.condor
+      dockerfile: Dockerfile.trading-management-bot
+    image: hummingbot/trading-management-bot:local
     restart: unless-stopped
     profiles:
       - telegram
     env_file:
       - .env.control
     environment:
-      CONDOR_API_HOST: hummingbot-api
-      CONDOR_API_PORT: 8000
+      TELEGRAM_MANAGEMENT_BOT_TOKEN_FILE: /run/secrets/telegram_management_bot_token
+      TRADING_MANAGEMENT_STATE_DIR: /state
+      TRADING_MANAGEMENT_MUTATIONS_ENABLED: "${TRADING_MANAGEMENT_MUTATIONS_ENABLED:-false}"
+      HUMMINGBOT_API_URL: http://hummingbot-api:8000
+      STOCKS_API_URL: http://binance-stocks-runtime:8000
+      GRID_GUARD_CONTRACT_PATH: /contracts/grid_guard_state.json
+      DCA_GUARD_CONTRACT_PATH: /contracts/dca_guard_state.json
+      INVENTORY_CONTRACT_PATH: /contracts/account_inventory_status.json
+      MODEL_APPROVAL_REQUEST_ROOT: /approvals/weekly
+      MODEL_APPROVAL_EVIDENCE_ROOT: /approvals/evidence
+      MODEL_APPROVAL_DECISION_ROOT: /approvals/decisions
     volumes:
-      - ./condor-files:/opt/condor/config
+      - ./telegram-management-data:/state
+      - ./grid-live-fdusd-data/guard_state.json:/contracts/grid_guard_state.json:ro
+      - ./dca-live-data/guard_state.json:/contracts/dca_guard_state.json:ro
+      - ./account-inventory-data/account_inventory_status.json:/contracts/account_inventory_status.json:ro
+      - ./results/ethbtc_forced_exit_weekly/approval_public:/approvals/weekly:ro
+      - ./dca-live-data/telegram:/approvals/evidence:ro
+      - ./results/ethbtc_forced_exit_weekly/decisions:/approvals/decisions
+    secrets:
+      - telegram_management_bot_token
     depends_on:
       - hummingbot-api
     networks:
@@ -463,9 +514,13 @@ networks:
     name: hummingbot-control
 
 secrets:
+  binance_stocks_credentials:
+    file: "${BINANCE_STOCKS_CREDENTIALS_PATH:-./config/binance_stocks_credentials.paper.json}"
   dca_binance_emergency_credentials:
     file: "${DCA_BINANCE_EMERGENCY_CREDENTIALS_PATH:-/home/ubuntu/secrets/dca_binance_emergency_credentials.json}"
   grid_binance_emergency_credentials:
     file: "${GRID_BINANCE_EMERGENCY_CREDENTIALS_PATH:-/home/ubuntu/secrets/grid_binance_emergency_credentials.json}"
   telegram_notify_bot_token:
     file: "${TELEGRAM_NOTIFY_BOT_TOKEN_PATH:-/home/ubuntu/secrets/telegram_notify_bot_token}"
+  telegram_management_bot_token:
+    file: "${TELEGRAM_MANAGEMENT_BOT_TOKEN_PATH:-/home/ubuntu/secrets/sunnypiggy_trade_bot_token}"

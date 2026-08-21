@@ -1,0 +1,187 @@
+{
+  "files": {
+    ".env.control.example": {
+      "bytes": 6054,
+      "sha256": "e3ffbe2fd0ffc0bb9143dd0109dea129d9d17400d5f3c87a4c0cffc8845fd3cc"
+    },
+    "Dockerfile.binance-stocks-runtime": {
+      "bytes": 1903,
+      "sha256": "4ecdf2f8e61fa165349cbc320d78907f6e001f15cf04d5ec799590d0d720d24c"
+    },
+    "config/binance_stocks_credentials.paper.json": {
+      "bytes": 3,
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    "deployment/binance-stocks-runtime.compose.yml": {
+      "bytes": 1017,
+      "sha256": "1977406cde8934eb33a32f7fd0906eff08067bbb082654e1bac04dff47d024e6"
+    },
+    "deployment/binance-stocks-runtime.secret.yml": {
+      "bytes": 134,
+      "sha256": "873efcf16cc115d4e8add7d253f13c520dbd4e07646fcdc29a1bf80768ef9184"
+    },
+    "docs/BINANCE_STOCKS_CONNECTOR.md": {
+      "bytes": 7271,
+      "sha256": "0d33019c791ef719233725990c3ae330c4ec11d89280a3beb95abc693705de02"
+    },
+    "docs/BINANCE_STOCKS_RUNTIME.md": {
+      "bytes": 7395,
+      "sha256": "9b049e13ee51d9836a092b3d6696f7b5a0b36e64117c7512f0712d8dd4110c28"
+    },
+    "hummingbot/connector/exchange/binance_stocks/__init__.py": {
+      "bytes": 191,
+      "sha256": "d53da6c42740806b73008e871f04a5a8452b79279221c11552cf15da078a414a"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_api_order_book_data_source.py": {
+      "bytes": 6499,
+      "sha256": "91f21c9f05945cad5c8e6464622aa2fea1c8e69c7a0ccb07523170e0bd4e6844"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_api_user_stream_data_source.py": {
+      "bytes": 5116,
+      "sha256": "684f8eff11dbe026278844dae691f35e413fdfbc13c7f2596b7b938fabf08700"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_auth.py": {
+      "bytes": 2096,
+      "sha256": "cf937d3b6e6191fa3579a4150ce6a3bbb455e92591408206919ad187cdc0bb08"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_constants.py": {
+      "bytes": 4029,
+      "sha256": "d26a68bfa16cbb7458f485f771fc9550a272d0a278d2ced17fd3d3f962aa6400"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_exchange.py": {
+      "bytes": 30267,
+      "sha256": "d6feb3cfafdeaa770d1ca642de7c7921fb76c9fc8499dd6d2125fc2f4eb35e3f"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_order_book.py": {
+      "bytes": 1313,
+      "sha256": "8f5586fa84de9ee9e213be1b590306406e4e517815d1c516082016210727dad7"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_position_provider.py": {
+      "bytes": 3455,
+      "sha256": "64f0f824997d59878d8e87688c5b2cb0460772158ae6318b99ad749e49722d93"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_utils.py": {
+      "bytes": 3453,
+      "sha256": "875fb495aacd78e766daf188daf795c890652587d2ed23284fffafc8204d54b4"
+    },
+    "hummingbot/connector/exchange/binance_stocks/binance_stocks_web_utils.py": {
+      "bytes": 2101,
+      "sha256": "62e6888d53207b2863fa7c9d357ba05e3f9a5b1763c8c39d0962bc19e4078285"
+    },
+    "hummingbot/strategy_v2/executors/binance_stocks_order_executor.py": {
+      "bytes": 1047,
+      "sha256": "8e6599d7d5a1eab7153218253b3bf8c4d56f86171b097fac07122b7fe9ae773c"
+    },
+    "hummingbot/strategy_v2/executors/binance_stocks_position_executor.py": {
+      "bytes": 11930,
+      "sha256": "ece535233f7e64127bf072242254bf507a081cf5ee598a3698b29f14aa617f19"
+    },
+    "scripts/archive_binance_stocks_runtime.py": {
+      "bytes": 6193,
+      "sha256": "ba9ef9664da4e72b9cdb6b9bed215ef929c8bcb309670346a39e4f991638d1de"
+    },
+    "scripts/audit_binance_stocks_runtime_deployment.py": {
+      "bytes": 4173,
+      "sha256": "24e52c1dc73d25da90c18da340765e0da44609227e43077c3e750bdb4085afb4"
+    },
+    "scripts/check_binance_stocks_runtime.py": {
+      "bytes": 2594,
+      "sha256": "30d74fabb187ab3f853af7685cfe35eb4c465840095e7819e89d51c0928f956a"
+    },
+    "scripts/install_binance_stocks_runtime.py": {
+      "bytes": 4246,
+      "sha256": "942d25229de13c23563eaced3809a4ee189978a3b1ea5f560623cf7c273005a8"
+    },
+    "scripts/verify_binance_stocks_runtime_package.py": {
+      "bytes": 2123,
+      "sha256": "288fbccdfa1f8e52cb40c113e7553ba5c6f9f5420ad97964a8a62df9c3141afd"
+    },
+    "stocks_runtime/__init__.py": {
+      "bytes": 61,
+      "sha256": "c2a9f3c00052278473c1d74f207c020528944860566080b1e3d9fddebe587a73"
+    },
+    "stocks_runtime/app.py": {
+      "bytes": 17592,
+      "sha256": "17b508cfcabe5ad613115fd317c1ec5b5f01a69fcf0f310f0e3926297fd2ba9a"
+    },
+    "stocks_runtime/auth.py": {
+      "bytes": 994,
+      "sha256": "86731b82ff1f4f7ef785b47120690ec8cde971e879c4a2ec4d8550576c81ee2b"
+    },
+    "stocks_runtime/binance_client.py": {
+      "bytes": 4926,
+      "sha256": "9619e1d4639f6c1e2329fe46ecc2a3b8840b42cb51c7d2726ee3312f3eaef3b3"
+    },
+    "stocks_runtime/ensure_database.py": {
+      "bytes": 1046,
+      "sha256": "3395734aa1661deeeb40f8819ab91bb335890be97722fb04dca68333ae6e9325"
+    },
+    "stocks_runtime/ledger.py": {
+      "bytes": 38315,
+      "sha256": "49b10f0ae000395202f59653bad9c4a90594b614c39b336cb3f7d0090733af38"
+    },
+    "stocks_runtime/policy.py": {
+      "bytes": 7911,
+      "sha256": "0731c44f9aa15ec7770e2a047d7933fb0fc230088043e1f4d2671e4c2ed18d83"
+    },
+    "stocks_runtime/router.py": {
+      "bytes": 12458,
+      "sha256": "861c3893ab65ab3d227221916ae5d929ff97ba5ea2c8ef2bf3755163159f9920"
+    },
+    "stocks_runtime/settings.py": {
+      "bytes": 3898,
+      "sha256": "8ce7ee03dec6c1f0e2c6b25e3db19e5caa9955cb200c73b9f0482fe3f1b5f520"
+    },
+    "test/hummingbot/connector/exchange/binance_stocks/__init__.py": {
+      "bytes": 46,
+      "sha256": "732584c506b4fddc557a2d1e0c71e4100f01febf8df7d2fd03a89f4b04ba38d9"
+    },
+    "test/hummingbot/connector/exchange/binance_stocks/binance_stocks_stateful_simulator.py": {
+      "bytes": 6186,
+      "sha256": "c030aeac20c9e00835d3109d1ab469e0ae0a6062ffdc51661b27d8445eb44c1d"
+    },
+    "test/hummingbot/connector/exchange/binance_stocks/test_binance_stocks_auth.py": {
+      "bytes": 1334,
+      "sha256": "7df07a74130a816f19b393d067841f4d7dd52bb35e3e98b61b0a7e2ff93f5d89"
+    },
+    "test/hummingbot/connector/exchange/binance_stocks/test_binance_stocks_exchange.py": {
+      "bytes": 14304,
+      "sha256": "c2d0dca740548524bead3d60aa86baeb03349e6427a109f5e29e469b791045ce"
+    },
+    "test/hummingbot/connector/exchange/binance_stocks/test_binance_stocks_order_book.py": {
+      "bytes": 1232,
+      "sha256": "44fed8beb20d0a74d60de7091e012a86fe7c83ecfbddc9de91daff0bb6203b82"
+    },
+    "test/hummingbot/connector/exchange/binance_stocks/test_binance_stocks_public_smoke.py": {
+      "bytes": 1199,
+      "sha256": "701f8c120264c572829428fb92441004ad95650091759c8554393a96ee404005"
+    },
+    "test/hummingbot/connector/exchange/binance_stocks/test_binance_stocks_stateful_integration.py": {
+      "bytes": 5370,
+      "sha256": "d4c9ce10f85d223bcceda023013cf8fa67ece5ae560df155cb0bc653f51c96e9"
+    },
+    "test/stocks_runtime/__init__.py": {
+      "bytes": 54,
+      "sha256": "4c3d57ea24838a2eb96464d16542c1626a10964065a78702ce81d4fdc15c9e2e"
+    },
+    "test/stocks_runtime/test_exit_policy.py": {
+      "bytes": 1045,
+      "sha256": "b686c83fe550200796010455e6121278d631b3ddb33fcbf622d392eee14f0f7e"
+    },
+    "test/stocks_runtime/test_installer.py": {
+      "bytes": 1435,
+      "sha256": "efdaf1a4987aa2f5f18ed189de77defbda08fd3fd1ca8a04426281a105f567ec"
+    },
+    "test/stocks_runtime/test_policy.py": {
+      "bytes": 5358,
+      "sha256": "f409c68f3dafab399282eb7a3d279d0361246288a9e77e429e053c1069bd0dcd"
+    },
+    "test/test_binance_stocks_runtime_deployment.py": {
+      "bytes": 1366,
+      "sha256": "0884b67a0b4a3f5882ab6e4463bba0df5d1ffd47561c0639559a94e94cdbdd01"
+    }
+  },
+  "package_id": "binance-stocks-runtime",
+  "release_sha256": "2293eaa769c621e131f9dd3ef24eaaafa21befd0b4ed77df510d8e1cf9eaf174",
+  "schema": "binance-stocks-runtime-package-v1"
+}

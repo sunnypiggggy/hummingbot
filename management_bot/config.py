@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_BOTS: dict[str, dict[str, str]] = {
+    "grid": {
+        "bot_name": "grid-live-fdusd-400",
+        "script": "walk_forward_portfolio_grid_live",
+        "conf": "walk_forward_portfolio_grid_live_fdusd_400",
+    },
+    "dca_btc": {
+        "bot_name": "dca-live-btcusdt-200",
+        "script": "v2_with_controllers",
+        "conf": "dca-live-btcusdt-200",
+    },
+    "dca_eth": {
+        "bot_name": "dca-live-ethusdt-200",
+        "script": "v2_with_controllers",
+        "conf": "dca-live-ethusdt-200",
+    },
+}
+
+
+def _required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ValueError(f"{name} is required")
+    return value
+
+
+@dataclass(frozen=True)
+class Settings:
+    token_file: Path
+    admin_user_id: int
+    state_dir: Path
+    health_path: Path
+    hummingbot_api_url: str
+    hummingbot_api_username: str
+    hummingbot_api_password: str
+    stocks_api_url: str
+    stocks_api_username: str
+    stocks_api_password: str
+    grid_guard_path: Path
+    dca_guard_path: Path
+    inventory_path: Path
+    approval_request_root: Path
+    approval_evidence_root: Path
+    approval_decision_root: Path
+    mutations_enabled: bool
+    bots: dict[str, dict[str, str]]
+    session_ttl_seconds: int = 900
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        raw_bots = os.getenv("TRADING_MANAGEMENT_BOTS_JSON", "").strip()
+        bots: dict[str, dict[str, str]] = DEFAULT_BOTS
+        if raw_bots:
+            parsed: Any = json.loads(raw_bots)
+            if not isinstance(parsed, dict):
+                raise ValueError("TRADING_MANAGEMENT_BOTS_JSON must be an object")
+            bots = {str(key): dict(value) for key, value in parsed.items() if isinstance(value, dict)}
+        state_dir = Path(os.getenv("TRADING_MANAGEMENT_STATE_DIR", "/state"))
+        return cls(
+            token_file=Path(os.getenv(
+                "TELEGRAM_MANAGEMENT_BOT_TOKEN_FILE",
+                "/run/secrets/telegram_management_bot_token",
+            )),
+            admin_user_id=int(_required("ADMIN_USER_ID")),
+            state_dir=state_dir,
+            health_path=Path(os.getenv("TRADING_MANAGEMENT_HEALTH_PATH", str(state_dir / "health.json"))),
+            hummingbot_api_url=os.getenv("HUMMINGBOT_API_URL", "http://hummingbot-api:8000").rstrip("/"),
+            hummingbot_api_username=os.getenv("USERNAME", os.getenv("HUMMINGBOT_API_USERNAME", "admin")),
+            hummingbot_api_password=_required("PASSWORD"),
+            stocks_api_url=os.getenv("STOCKS_API_URL", "http://binance-stocks-runtime:8000").rstrip("/"),
+            stocks_api_username=os.getenv("STOCKS_API_USERNAME", "stocks-admin"),
+            stocks_api_password=_required("STOCKS_API_PASSWORD"),
+            grid_guard_path=Path(os.getenv("GRID_GUARD_CONTRACT_PATH", "/contracts/grid_guard_state.json")),
+            dca_guard_path=Path(os.getenv("DCA_GUARD_CONTRACT_PATH", "/contracts/dca_guard_state.json")),
+            inventory_path=Path(os.getenv("INVENTORY_CONTRACT_PATH", "/contracts/account_inventory_status.json")),
+            approval_request_root=Path(os.getenv("MODEL_APPROVAL_REQUEST_ROOT", "/approvals/weekly")),
+            approval_evidence_root=Path(os.getenv("MODEL_APPROVAL_EVIDENCE_ROOT", "/approvals/evidence")),
+            approval_decision_root=Path(os.getenv("MODEL_APPROVAL_DECISION_ROOT", "/approvals/decisions")),
+            mutations_enabled=os.getenv("TRADING_MANAGEMENT_MUTATIONS_ENABLED", "false").lower() == "true",
+            bots=bots,
+            session_ttl_seconds=int(os.getenv("TRADING_MANAGEMENT_SESSION_TTL_SECONDS", "900")),
+        )
+
+    def read_token(self) -> str:
+        token = self.token_file.read_text(encoding="utf-8").strip()
+        if not token or ":" not in token:
+            raise ValueError("Telegram management Bot token secret is invalid")
+        return token
+

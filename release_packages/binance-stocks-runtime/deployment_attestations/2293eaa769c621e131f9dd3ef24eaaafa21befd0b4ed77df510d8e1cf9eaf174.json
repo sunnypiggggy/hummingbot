@@ -1,0 +1,25 @@
+{
+  "schema": "binance-stocks-runtime-deployment-attestation-v1",
+  "package_id": "binance-stocks-runtime",
+  "release_sha256": "2293eaa769c621e131f9dd3ef24eaaafa21befd0b4ed77df510d8e1cf9eaf174",
+  "transport_sha256": "b80493d6991d52e767a8644bcc239838bdac8c0dc4b3b6347ef891ffd11eb32c",
+  "container_image": "sha256:5e2b59b6135cdc268d21aee3910e1258be19e972245df453e2fe5e5a043b45a8",
+  "verified_at": "2026-08-21T15:24:40Z",
+  "target": "oci-ubuntu-152-69-205-54",
+  "host_files_checked": 43,
+  "image_files_checked": 21,
+  "mismatches": 0,
+  "container_status": "running/healthy",
+  "runtime_mode": "PAPER",
+  "live_authorized": false,
+  "economic_requests_enabled": false,
+  "managed_orders": 0,
+  "managed_positions": 0,
+  "raw_trading_endpoint_status": 403,
+  "tests": {
+    "passed": 70,
+    "skipped": 1,
+    "skip_reason": "optional official public read-only smoke test"
+  },
+  "secrets_included": false
+}

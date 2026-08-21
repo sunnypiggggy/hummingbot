@@ -121,6 +121,23 @@ class WeeklyReleaseManager:
 
     def _save(self, value: Mapping[str, Any]) -> None:
         atomic_json(self.state_path, dict(value))
+        approval_public = self.work_root / "approval_public"
+        approval_public.mkdir(parents=True, exist_ok=True)
+        approval_state = {
+            key: value.get(key) for key in (
+                "schema", "phase", "source_release_sha256", "source_effective_end",
+                "candidate_release_sha256", "review_started_at", "review_deadline",
+                "activation_boundary", "approved_at", "activate_at", "approval_mode",
+                "runtime_generation", "last_error",
+            )
+        }
+        atomic_json(approval_public / "automation_state.json", approval_state)
+        request_path = Path(str(value.get("request_path", "")))
+        release_sha = str(value.get("candidate_release_sha256", ""))
+        if release_sha and request_path.is_file():
+            request = load_json(request_path, {}) or {}
+            if request.get("release_sha256") == release_sha:
+                atomic_json(approval_public / f"approval-request-{release_sha}.json", request)
         public = {
             "schema": "ethbtc-forced-exit-cutover-status-v1",
             "updated_at": int(self.now()),
@@ -271,6 +288,9 @@ class WeeklyReleaseManager:
         }
         request_path = self.work_root / f"approval-request-{release_sha}.json"
         atomic_json(request_path, request)
+        approval_public = self.work_root / "approval_public"
+        approval_public.mkdir(parents=True, exist_ok=True)
+        atomic_json(approval_public / request_path.name, request)
         event = build_event(
             source="v22-weekly-release-manager", strategy="grid+dca",
             bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
@@ -309,7 +329,8 @@ class WeeklyReleaseManager:
         }
 
     def _decision(self, release_sha: str) -> dict[str, Any]:
-        value = load_json(self.work_root / "review_decision.json", {}) or {}
+        decision_root = Path(os.getenv("MODEL_APPROVAL_DECISION_ROOT", str(self.work_root)))
+        value = load_json(decision_root / "review_decision.json", {}) or {}
         if value.get("release_sha256") != release_sha:
             return {}
         if value.get("decision") not in {"approve", "reject"}:
@@ -810,7 +831,9 @@ def main() -> int:
             "operator": str(args.operator).strip(), "reason": str(args.reason).strip(),
             "decided_at": int(time.time()),
         }
-        atomic_json(args.work_root / "review_decision.json", decision)
+        decision_root = Path(os.getenv("MODEL_APPROVAL_DECISION_ROOT", str(args.work_root)))
+        decision_root.mkdir(parents=True, exist_ok=True)
+        atomic_json(decision_root / "review_decision.json", decision)
         print(json.dumps(decision, ensure_ascii=False, indent=2))
         return 0
     manager = WeeklyReleaseManager(

@@ -1,0 +1,147 @@
+from decimal import Decimal
+from unittest import IsolatedAsyncioTestCase
+
+from stocks_runtime.ledger import LedgerLimits
+from stocks_runtime.policy import StocksExecutorPolicy
+
+
+class FakeLedger:
+    limits = LedgerLimits()
+
+    def __init__(self):
+        self.reservations = []
+
+    async def managed_pnl(self, _):
+        return Decimal("0")
+
+    async def active_limits(self):
+        return self.limits
+
+    async def whitelist_entry(self, symbol):
+        if symbol == "AAPL":
+            return {
+                "symbol": symbol,
+                "enabled": True,
+                "max_position_notional": self.limits.max_symbol_exposure,
+            }
+        return None
+
+    async def set_trading_date(self, *_):
+        pass
+
+    async def daily_pnl(self, _):
+        return Decimal("0")
+
+    async def managed_exposure(self, _):
+        return Decimal("100")
+
+    async def managed_symbol_exposure(self, _symbol, _price):
+        return Decimal("0")
+
+    async def managed_available(self, owner, symbol):
+        return Decimal("10") if owner == "unassigned" and symbol == "AAPL" else Decimal("0")
+
+    async def reserve_intent(self, **kwargs):
+        self.reservations.append(kwargs)
+        return {"executor_id": kwargs["executor_id"], "status": "RESERVED"}
+
+
+class StocksExecutorPolicyTests(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.ledger = FakeLedger()
+        self.policy = StocksExecutorPolicy(self.ledger, "SHADOW", False)
+        self.policy.update_market({"AAPL"}, {"AAPL": Decimal("200")}, "2026-08-21")
+
+    async def test_valid_order_is_shadow_only_and_reserved_idempotently(self):
+        result = await self.policy.validate_and_reserve(
+            {
+                "id": "order-aapl-0001",
+                "type": "order_executor",
+                "connector_name": "binance_stocks",
+                "trading_pair": "AAPL-USDC",
+                "side": "BUY",
+                "amount": "0.5",
+                "price": "199",
+                "execution_strategy": "LIMIT",
+            },
+            "stocks_managed",
+            "stocks-runtime",
+        )
+        self.assertFalse(result["would_submit"])
+        self.assertEqual(Decimal("99.5"), self.ledger.reservations[0]["estimated_notional"])
+
+    async def test_preview_uses_same_checks_without_reserving(self):
+        result = await self.policy.preview(
+            {
+                "id": "order-aapl-preview",
+                "type": "order_executor",
+                "connector_name": "binance_stocks",
+                "trading_pair": "AAPL-USDC",
+                "side": "BUY",
+                "amount": "0.25",
+                "price": "200",
+                "execution_strategy": "LIMIT",
+            },
+            "stocks_managed",
+            "telegram-management-bot",
+        )
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["preflight_only"])
+        self.assertEqual([], self.ledger.reservations)
+
+    async def test_buy_requires_enabled_operator_whitelist(self):
+        self.policy.update_market({"AAPL", "TSLA"}, {"AAPL": Decimal("200"), "TSLA": Decimal("100")})
+        with self.assertRaisesRegex(Exception, "whitelist"):
+            await self.policy.preview(
+                {
+                    "id": "order-tsla-preview",
+                    "type": "order_executor",
+                    "connector_name": "binance_stocks",
+                    "trading_pair": "TSLA-USDC",
+                    "side": "BUY",
+                    "amount": "0.5",
+                    "price": "100",
+                    "execution_strategy": "LIMIT",
+                },
+                "stocks_managed",
+                None,
+            )
+
+    async def test_position_requires_stop_and_time_limit(self):
+        with self.assertRaisesRegex(ValueError, "stop_loss"):
+            await self.policy.validate_and_reserve(
+                {
+                    "id": "position-aapl-01",
+                    "type": "position_executor",
+                    "connector_name": "binance_stocks",
+                    "trading_pair": "AAPL-USDC",
+                    "side": "BUY",
+                    "amount": "0.5",
+                    "triple_barrier_config": {"time_limit": 3600},
+                },
+                "stocks_managed",
+                None,
+            )
+
+    async def test_rejects_short_bstocks_and_large_order(self):
+        base = {
+            "id": "position-aapl-02",
+            "type": "position_executor",
+            "connector_name": "binance_stocks",
+            "trading_pair": "AAPL-USDC",
+            "side": "SELL",
+            "amount": "0.5",
+            "triple_barrier_config": {"stop_loss": "0.05", "time_limit": 3600},
+        }
+        with self.assertRaisesRegex(ValueError, "long-only"):
+            await self.policy.validate_and_reserve(base, "stocks_managed", None)
+        base.update({
+            "id": "position-aaplb-03",
+            "side": "BUY",
+            "trading_pair": "AAPLB-USDC",
+        })
+        with self.assertRaisesRegex(ValueError, "exchangeInfo"):
+            await self.policy.validate_and_reserve(base, "stocks_managed", None)
+        base.update({"id": "position-aapl-04", "trading_pair": "AAPL-USDC", "amount": "2"})
+        with self.assertRaisesRegex(Exception, "200"):
+            await self.policy.validate_and_reserve(base, "stocks_managed", None)
