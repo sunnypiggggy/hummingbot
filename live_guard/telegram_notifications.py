@@ -209,9 +209,10 @@ class RuntimeErrorChannel:
         try:
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
-            self.state = {"schema": "runtime-error-channel-v1", "components": {}}
-        self.state.setdefault("schema", "runtime-error-channel-v1")
+            self.state = {"schema": "runtime-error-channel-v2", "components": {}}
+        self.state["schema"] = "runtime-error-channel-v2"
         self.state.setdefault("components", {})
+        self.state.setdefault("history", [])
 
     def _save(self) -> None:
         try:
@@ -234,12 +235,70 @@ class RuntimeErrorChannel:
             # unable to write its event file must still continue risk work.
             return False
 
+    def _failure_event(self, component: str, row: Mapping[str, Any]) -> dict[str, Any]:
+        return build_event(
+            source=self.source, strategy=self.strategy, bot=self.bot, pair=self.pair,
+            mechanism="runtime_error", transition="ERROR_OCCURRED",
+            reason=str(row.get("summary") or "unknown runtime error"),
+            severity=str(row.get("severity") or "warning"),
+            phase_to="ERROR_ACTIVE", action=str(row.get("action") or "automatic_retry"),
+            correlation_id=str(row["episode_id"]), details={
+                "component": component, "error_summary": row.get("summary", ""),
+                "first_seen_at": datetime.fromtimestamp(
+                    float(row.get("first_seen_at", time.time())), timezone.utc
+                ).isoformat(),
+                "occurrences": int(row.get("occurrences", 1)),
+                "trading_impact": row.get("trading_impact", ""),
+                "notification_delay_seconds": float(
+                    row.get("notification_delay_seconds", 0)
+                ),
+                **dict(row.get("details") or {}),
+            },
+        )
+
+    def _remember_recovery(self, component: str, row: Mapping[str, Any], now: float) -> None:
+        history = self.state.setdefault("history", [])
+        history.append({
+            "component": component,
+            "episode_id": row.get("episode_id"),
+            "summary": row.get("summary", ""),
+            "first_seen_at": float(row.get("first_seen_at", now)),
+            "recovered_at": now,
+            "duration_seconds": max(0, now - float(row.get("first_seen_at", now))),
+            "occurrences": int(row.get("occurrences", 1)),
+            "alert_sent": bool(row.get("notified")),
+            "suppressed_as_transient": not bool(row.get("notified")),
+        })
+        self.state["history"] = history[-1000:]
+
+    def record_transient_recovery(
+        self, component: str, error: BaseException | str, *, occurrences: int = 1,
+        duration_seconds: float = 0.0, now: float | None = None,
+    ) -> None:
+        """Persist an internally recovered transport retry without alerting."""
+        now = time.time() if now is None else float(now)
+        duration = max(0.0, float(duration_seconds))
+        row = {
+            "episode_id": canonical_sha256({
+                "source": self.source, "component": component,
+                "summary": sanitize_runtime_error(error), "recovered_at": now,
+            }),
+            "summary": sanitize_runtime_error(error),
+            "first_seen_at": now - duration,
+            "occurrences": max(1, int(occurrences)),
+            "notified": False,
+        }
+        self._remember_recovery(component, row, now)
+        self._save()
+
     def failure(
         self, component: str, error: BaseException | str, *,
         trading_impact: str, severity: str = "warning", action: str = "automatic_retry",
         details: Mapping[str, Any] | None = None, now: float | None = None,
+        notify_after_seconds: float = 0,
     ) -> bool:
         now = time.time() if now is None else float(now)
+        notify_after_seconds = max(0.0, float(notify_after_seconds))
         summary = sanitize_runtime_error(error)
         fingerprint = canonical_sha256({"component": component, "summary": summary})
         components = self.state["components"]
@@ -247,8 +306,18 @@ class RuntimeErrorChannel:
         if previous.get("active") and previous.get("fingerprint") == fingerprint:
             previous["occurrences"] = int(previous.get("occurrences", 1)) + 1
             previous["last_seen_at"] = now
+            previous["details"] = dict(details or previous.get("details") or {})
+            emitted = False
+            elapsed = now - float(previous.get("first_seen_at", now))
+            if not previous.get("notified") and elapsed >= float(
+                previous.get("notification_delay_seconds", notify_after_seconds)
+            ):
+                emitted = self._emit(self._failure_event(component, previous))
+                if emitted:
+                    previous["notified"] = True
+                    previous["notified_at"] = now
             self._save()
-            return False
+            return emitted
         episode_id = canonical_sha256({
             "source": self.source, "component": component,
             "fingerprint": fingerprint, "first_seen_at": now,
@@ -257,19 +326,16 @@ class RuntimeErrorChannel:
             "active": True, "episode_id": episode_id, "fingerprint": fingerprint,
             "summary": summary, "first_seen_at": now, "last_seen_at": now,
             "occurrences": 1, "trading_impact": trading_impact,
+            "severity": severity, "action": action, "details": dict(details or {}),
+            "notification_delay_seconds": notify_after_seconds, "notified": False,
         }
         components[component] = row
-        emitted = self._emit(build_event(
-            source=self.source, strategy=self.strategy, bot=self.bot, pair=self.pair,
-            mechanism="runtime_error", transition="ERROR_OCCURRED",
-            reason=summary, severity=severity, phase_to="ERROR_ACTIVE", action=action,
-            correlation_id=episode_id, details={
-                "component": component, "error_summary": summary,
-                "first_seen_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
-                "occurrences": 1, "trading_impact": trading_impact,
-                **dict(details or {}),
-            },
-        ))
+        emitted = False
+        if notify_after_seconds <= 0:
+            emitted = self._emit(self._failure_event(component, row))
+            if emitted:
+                row["notified"] = True
+                row["notified_at"] = now
         self._save()
         return emitted
 
@@ -283,22 +349,28 @@ class RuntimeErrorChannel:
             return False
         row["active"] = False
         row["recovered_at"] = now
-        emitted = self._emit(build_event(
-            source=self.source, strategy=self.strategy, bot=self.bot, pair=self.pair,
-            mechanism="runtime_error", transition="ERROR_RECOVERED",
-            reason=f"{component} recovered", severity="info",
-            phase_from="ERROR_ACTIVE", phase_to="HEALTHY", action="resume_normal_monitoring",
-            correlation_id=f"{row['episode_id']}:recovered", details={
-                "component": component, "error_summary": row.get("summary", ""),
-                "first_seen_at": datetime.fromtimestamp(
-                    float(row.get("first_seen_at", now)), timezone.utc
-                ).isoformat(),
-                "recovered_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
-                "duration_seconds": max(0, now - float(row.get("first_seen_at", now))),
-                "occurrences": int(row.get("occurrences", 1)),
-                "trading_status": trading_status, **dict(details or {}),
-            },
-        ))
+        self._remember_recovery(component, row, now)
+        emitted = False
+        if row.get("notified"):
+            emitted = self._emit(build_event(
+                source=self.source, strategy=self.strategy, bot=self.bot, pair=self.pair,
+                mechanism="runtime_error", transition="ERROR_RECOVERED",
+                reason=f"{component} recovered", severity="info",
+                phase_from="ERROR_ACTIVE", phase_to="HEALTHY",
+                action="resume_normal_monitoring",
+                correlation_id=f"{row['episode_id']}:recovered", details={
+                    "component": component, "error_summary": row.get("summary", ""),
+                    "first_seen_at": datetime.fromtimestamp(
+                        float(row.get("first_seen_at", now)), timezone.utc
+                    ).isoformat(),
+                    "recovered_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                    "duration_seconds": max(
+                        0, now - float(row.get("first_seen_at", now))
+                    ),
+                    "occurrences": int(row.get("occurrences", 1)),
+                    "trading_status": trading_status, **dict(details or {}),
+                },
+            ))
         self._save()
         return emitted
 
@@ -603,6 +675,15 @@ def format_event(event: Mapping[str, Any]) -> str:
                 f"- 7d：`{_number(profit.get('seven_day_mtm_quote'))}`",
                 f"- 累计：`{_number(profit.get('all_time_mtm_quote'))} {quote}`",
             ))
+            transport = item.get("runtime_transport", {})
+            if str(item.get("strategy", "")).lower() == "grid" and isinstance(
+                transport, Mapping
+            ):
+                lines.append(
+                    "- Guard连接瞬时恢复（4h）："
+                    f"`{int(transport.get('recovered_episodes', 0) or 0)} 次`"
+                    "，交易权限未受影响"
+                )
         lines.extend(("", "_不同报价币种不折算、不合并；详见四张单机器人 PNG。_"))
         return MARKDOWN_MESSAGE_PREFIX + "\n".join(lines)[:4096]
     if event.get("mechanism") == "parameter_update":

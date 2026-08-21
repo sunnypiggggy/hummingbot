@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from grid_live_common import PORTFOLIO_DRAWDOWN_LIMIT_PCT, PORTFOLIOS, budget_for_quote
 from grid_xgboost_risk_gate import MODEL_VERSION as XGBOOST_MODEL_VERSION
@@ -59,10 +61,12 @@ except ModuleNotFoundError:
 try:
     from telegram_notifications import (
         RuntimeErrorChannel, append_event, build_event, runtime_error_lines,
+        sanitize_runtime_error,
     )
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import (
         RuntimeErrorChannel, append_event, build_event, runtime_error_lines,
+        sanitize_runtime_error,
     )
 
 try:
@@ -72,6 +76,26 @@ except ImportError:  # Docker image layout
 
 
 LOG = logging.getLogger("grid-live-guard")
+
+
+def _read_retry_session(*, retry_total: int = 2) -> requests.Session:
+    """Retry only idempotent reads; trading writes must never be replayed."""
+    session = requests.Session()
+    retry = Retry(
+        total=retry_total,
+        connect=retry_total,
+        read=retry_total,
+        status=retry_total,
+        backoff_factor=0.1,
+        allowed_methods=frozenset({"GET"}),
+        status_forcelist=(429, 500, 502, 503, 504),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 BINANCE_API = OFFICIAL_BINANCE_API
 SCALE = Decimal("1000000")
 
@@ -101,11 +125,76 @@ def peak_drawdown(current_equity: Decimal, stored_peak: Decimal,
 class ApiClient:
     def __init__(self):
         self.base = os.getenv("HUMMINGBOT_API_URL", "http://hummingbot-api:8000").rstrip("/")
-        self.session = requests.Session()
-        self.session.auth = (os.environ["USERNAME"], os.environ["PASSWORD"])
+        self.auth = (os.environ["USERNAME"], os.environ["PASSWORD"])
+        self.session = self._new_session()
+        self._read_retry_events: list[dict[str, Any]] = []
+
+    def _new_session(self, *, retry_total: int = 2) -> requests.Session:
+        session = _read_retry_session(retry_total=retry_total)
+        session.auth = self.auth
+        return session
+
+    @staticmethod
+    def _retry_history(response: requests.Response) -> list[Any]:
+        retries = getattr(getattr(response, "raw", None), "retries", None)
+        return list(getattr(retries, "history", ()) or ())
+
+    @staticmethod
+    def _is_remote_disconnect(error: BaseException) -> bool:
+        current: BaseException | None = error
+        while current is not None:
+            if type(current).__name__ == "RemoteDisconnected":
+                return True
+            text = str(current).lower()
+            if "remote end closed connection" in text or "connection aborted" in text:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _replace_session(self) -> None:
+        previous = self.session
+        self.session = self._new_session()
+        previous.close()
+
+    def consume_read_retry_events(self) -> list[dict[str, Any]]:
+        events, self._read_retry_events = self._read_retry_events, []
+        return events
 
     def request(self, method: str, path: str, payload: Dict[str, Any] | None = None) -> Any:
-        response = self.session.request(method, f"{self.base}{path}", json=payload, timeout=30)
+        method = method.upper()
+        url = f"{self.base}{path}"
+        try:
+            response = self.session.request(method, url, json=payload, timeout=30)
+        except requests.exceptions.ConnectionError as exc:
+            if method != "GET" or not self._is_remote_disconnect(exc):
+                raise
+            # urllib3 has exhausted the normal read policy. Discard the entire
+            # stale pool and make exactly one final GET on a no-retry session.
+            self.session.close()
+            one_shot = self._new_session(retry_total=0)
+            started = time.monotonic()
+            try:
+                response = one_shot.request(method, url, json=payload, timeout=30)
+            finally:
+                one_shot.close()
+                self.session = self._new_session()
+            self._read_retry_events.append({
+                "path": path, "attempts": 1, "pool_replaced": True,
+                "duration_seconds": max(0.0, time.monotonic() - started),
+                "reason": sanitize_runtime_error(exc),
+            })
+        history = self._retry_history(response) if method == "GET" else []
+        if history:
+            reasons = [sanitize_runtime_error(item.error) for item in history if item.error]
+            self._read_retry_events.append({
+                "path": path, "attempts": len(history), "pool_replaced": True,
+                "duration_seconds": 0.0,
+                "reason": reasons[-1] if reasons else "transient GET retry",
+            })
+            # A successful retry proves that the old connection was unusable.
+            # Recreate the session so later cycles cannot reuse any sibling
+            # sockets from the same stale pool.
+            self._replace_session()
         response.raise_for_status()
         return response.json() if response.content else {}
 
@@ -154,6 +243,10 @@ class Guard:
             state_path=self.state_dir / "runtime_error_state.json",
             source="grid-live-guard", strategy="grid",
             bot="grid-live-fdusd-400", pair="BTC-FDUSD,ETH-FDUSD",
+        )
+        self.runtime_error_notify_after_seconds = min(
+            10.0,
+            max(5.0, float(os.getenv("GRID_RUNTIME_ERROR_NOTIFY_AFTER_SECONDS", "6"))),
         )
         self.runtime_log_cursor_path = self.state_dir / "runtime_log_cursor.json"
         try:
@@ -1254,6 +1347,13 @@ class Guard:
         if self.manifest_path.exists():
             self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         status = json.dumps(self.api.status(), ensure_ascii=True)
+        consume_retries = getattr(self.api, "consume_read_retry_events", lambda: [])
+        for retry in consume_retries():
+            self.runtime_errors.record_transient_recovery(
+                "guard_cycle", retry.get("reason", "transient GET retry"),
+                occurrences=int(retry.get("attempts", 1)),
+                duration_seconds=float(retry.get("duration_seconds", 0.0)),
+            )
         self.publish_technical_buy_gate()
         snapshots = {}
         for key in self.portfolio_keys:
@@ -1367,7 +1467,8 @@ class Guard:
                 )
             except Exception as exc:
                 LOG.exception("Grid guard cycle failed")
-                first = self.state.get("first_failure_at") or time.time()
+                now = time.time()
+                first = self.state.get("first_failure_at") or now
                 self.runtime_errors.failure(
                     "guard_cycle", exc,
                     trading_impact=(
@@ -1376,7 +1477,8 @@ class Guard:
                     ),
                     severity="warning", action="retry_then_fail_closed_on_threshold",
                     details={"fail_closed_after_seconds": self.fail_closed_seconds},
-                    now=first,
+                    now=now,
+                    notify_after_seconds=self.runtime_error_notify_after_seconds,
                 )
                 self.state["first_failure_at"] = self.state.get("first_failure_at") or time.time()
                 self.save()

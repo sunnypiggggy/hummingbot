@@ -244,6 +244,7 @@ services:
       GRID_DOCKER_SOCKET: /var/run/docker.sock
       GRID_XGBOOST_GATE_DISTRIBUTION_SECONDS: "30"
       GRID_LIVE_GUARD_INTERVAL: "${GRID_LIVE_GUARD_INTERVAL:-2}"
+      GRID_RUNTIME_ERROR_NOTIFY_AFTER_SECONDS: "${GRID_RUNTIME_ERROR_NOTIFY_AFTER_SECONDS:-6}"
       # v22 is the sole production producer.  Keep the retired v21 producer
       # explicitly disabled so a missing shell-level variable cannot revive it.
       GRID_V21_IN_GUARD_ENABLED: "false"

@@ -1226,6 +1226,24 @@ class UnifiedTelegramReporting:
         except Exception:
             return None, None, None
 
+    def _grid_transport_summary(self, now: datetime) -> dict[str, Any]:
+        state = self._load(self.grid_state / "runtime_error_state.json")
+        cutoff = now.timestamp() - 4 * 60 * 60
+        rows = [
+            row for row in state.get("history", [])
+            if isinstance(row, Mapping)
+            and row.get("component") == "guard_cycle"
+            and bool(row.get("suppressed_as_transient"))
+            and float(row.get("recovered_at", 0) or 0) >= cutoff
+        ]
+        return {
+            "window_hours": 4,
+            "recovered_episodes": len(rows),
+            "retry_attempts": sum(int(row.get("occurrences", 1) or 1) for row in rows),
+            "last_reason": str(rows[-1].get("summary") or "") if rows else None,
+            "trading_impact": "none",
+        }
+
     def _grid_cards(self, now: datetime) -> list[dict[str, Any]]:
         state = self._load(self.grid_state / "guard_state.json")
         macro = self._load(self.grid_state / "macro_gate.json")
@@ -1241,6 +1259,7 @@ class UnifiedTelegramReporting:
         )
         runtime = self._load(runtime_candidates[0]) if runtime_candidates else {}
         inventory_status = self._load(self.inventory_status_path)
+        transport_summary = self._grid_transport_summary(now)
         runtime_buy_ids = {str(value) for value in runtime.get("buy_order_ids", [])}
         runtime_sell_ids = {str(value) for value in runtime.get("sell_order_ids", [])}
         active_pair_parameters = runtime.get("active_pair_parameters", {})
@@ -1417,6 +1436,7 @@ class UnifiedTelegramReporting:
                 "fomc_gate": "暂停" if macro.get("pause_new_orders") else "放行",
                 "warnings": warnings,
                 "unattributed_dust": dust,
+                "runtime_transport": transport_summary,
                 "trading_status": trading_status,
             }
             output.append(item)

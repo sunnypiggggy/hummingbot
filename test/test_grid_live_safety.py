@@ -1,12 +1,16 @@
 import json
+import socket
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -55,7 +59,103 @@ from deploy_fdusd_live_grid import (  # noqa: E402
     load_bootstrap_receipt,
     validation_authorization,
 )
-from live_guard.grid_live_guard import Guard, fill_pnl, peak_drawdown  # noqa: E402
+from live_guard.grid_live_guard import (  # noqa: E402
+    ApiClient as GuardApiClient,
+    Guard,
+    _read_retry_session,
+    fill_pnl,
+    peak_drawdown,
+)
+
+
+class _DisconnectOnceHandler(BaseHTTPRequestHandler):
+    get_calls = 0
+    post_calls = 0
+    disconnect_gets = 1
+
+    def log_message(self, _format, *args):
+        return
+
+    def do_GET(self):
+        type(self).get_calls += 1
+        if type(self).get_calls <= type(self).disconnect_gets:
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+        payload = b'{"healthy":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        type(self).post_calls += 1
+        self.connection.shutdown(socket.SHUT_RDWR)
+        self.connection.close()
+
+
+class GridGuardHttpRetryTest(unittest.TestCase):
+    def setUp(self):
+        _DisconnectOnceHandler.get_calls = 0
+        _DisconnectOnceHandler.post_calls = 0
+        _DisconnectOnceHandler.disconnect_gets = 1
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _DisconnectOnceHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_read_retry_policy_matches_dca_and_never_replays_writes(self):
+        retry = _read_retry_session().get_adapter("http://").max_retries
+        self.assertEqual(2, retry.total)
+        self.assertEqual(frozenset({"GET"}), retry.allowed_methods)
+        self.assertNotIn("POST", retry.allowed_methods)
+        self.assertNotIn("DELETE", retry.allowed_methods)
+
+    def test_status_get_recovers_after_remote_disconnect(self):
+        with patch.dict("os.environ", {
+            "HUMMINGBOT_API_URL": self.base_url,
+            "USERNAME": "test-user",
+            "PASSWORD": "test-password",
+        }):
+            client = GuardApiClient()
+            original_session = client.session
+            self.assertEqual({"healthy": True}, client.status())
+            retries = client.consume_read_retry_events()
+        self.assertEqual(2, _DisconnectOnceHandler.get_calls)
+        self.assertIsNot(original_session, client.session)
+        self.assertEqual(1, len(retries))
+        self.assertTrue(retries[0]["pool_replaced"])
+
+    def test_exhausted_adapter_discards_pool_and_uses_one_final_get(self):
+        _DisconnectOnceHandler.disconnect_gets = 3
+        with patch.dict("os.environ", {
+            "HUMMINGBOT_API_URL": self.base_url,
+            "USERNAME": "test-user",
+            "PASSWORD": "test-password",
+        }):
+            client = GuardApiClient()
+            self.assertEqual({"healthy": True}, client.status())
+            retries = client.consume_read_retry_events()
+        self.assertEqual(4, _DisconnectOnceHandler.get_calls)
+        self.assertEqual(1, len(retries))
+        self.assertTrue(retries[0]["pool_replaced"])
+
+    def test_trading_post_is_not_retried_after_remote_disconnect(self):
+        with patch.dict("os.environ", {
+            "HUMMINGBOT_API_URL": self.base_url,
+            "USERNAME": "test-user",
+            "PASSWORD": "test-password",
+        }):
+            client = GuardApiClient()
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                client.stop("grid-live-fdusd-400")
+        self.assertEqual(1, _DisconnectOnceHandler.post_calls)
 
 
 class GridLiveSafetyTest(unittest.TestCase):

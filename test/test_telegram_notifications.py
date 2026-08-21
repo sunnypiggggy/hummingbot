@@ -35,7 +35,7 @@ from live_guard.telegram_parameter_report import (
 )
 from live_guard.dca_live_guard import Guard as DcaGuard
 from live_guard.grid_live_guard import Guard as GridGuard
-from live_guard.dca_live_report import ParameterReportWorker
+from live_guard.dca_live_report import ParameterReportWorker, UnifiedTelegramReporting
 
 
 def event(**overrides):
@@ -94,6 +94,91 @@ def test_runtime_error_channel_alerts_once_then_reports_recovery(tmp_path):
     assert rows[1]["details"]["duration_seconds"] == 10
     assert "运行错误告警" in format_event(rows[0])
     assert "运行错误已恢复" in format_event(rows[1])
+
+
+def test_short_runtime_error_is_suppressed_and_kept_for_four_hour_summary(tmp_path):
+    events = tmp_path / "events.jsonl"
+    state = tmp_path / "runtime-errors.json"
+    channel = RuntimeErrorChannel(
+        event_path=events, state_path=state, source="grid-live-guard",
+        strategy="grid", bot="grid-live-fdusd-400",
+        pair="BTC-FDUSD,ETH-FDUSD",
+    )
+    assert not channel.failure(
+        "guard_cycle", ConnectionError("remote end closed connection"),
+        trading_impact="automatic retry", now=100, notify_after_seconds=6,
+    )
+    assert not channel.failure(
+        "guard_cycle", ConnectionError("remote end closed connection"),
+        trading_impact="automatic retry", now=104, notify_after_seconds=6,
+    )
+    assert not channel.recovered("guard_cycle", now=105)
+    assert not events.exists()
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["history"][-1]["suppressed_as_transient"] is True
+    assert saved["history"][-1]["occurrences"] == 2
+    assert saved["history"][-1]["duration_seconds"] == 5
+
+
+def test_runtime_error_alerts_only_after_delay_then_reports_recovery(tmp_path):
+    events = tmp_path / "events.jsonl"
+    channel = RuntimeErrorChannel(
+        event_path=events, state_path=tmp_path / "state.json",
+        source="grid-live-guard", strategy="grid", bot="grid",
+        pair="BTC-FDUSD,ETH-FDUSD",
+    )
+    assert not channel.failure(
+        "guard_cycle", "api unavailable", trading_impact="retry",
+        now=200, notify_after_seconds=6,
+    )
+    assert channel.failure(
+        "guard_cycle", "api unavailable", trading_impact="retry",
+        now=206, notify_after_seconds=6,
+    )
+    assert channel.recovered("guard_cycle", now=208)
+    rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    assert [row["transition"] for row in rows] == ["ERROR_OCCURRED", "ERROR_RECOVERED"]
+    assert rows[0]["details"]["notification_delay_seconds"] == 6
+    assert rows[0]["details"]["occurrences"] == 2
+
+
+def test_internal_get_retry_is_recorded_without_telegram_event(tmp_path):
+    state = tmp_path / "state.json"
+    events = tmp_path / "events.jsonl"
+    channel = RuntimeErrorChannel(
+        event_path=events, state_path=state, source="grid-live-guard",
+        strategy="grid", bot="grid", pair="BTC-FDUSD,ETH-FDUSD",
+    )
+    channel.record_transient_recovery(
+        "guard_cycle", "RemoteDisconnected", occurrences=1,
+        duration_seconds=0.2, now=300,
+    )
+    assert not events.exists()
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["history"][-1]["alert_sent"] is False
+    assert saved["history"][-1]["suppressed_as_transient"] is True
+
+
+def test_four_hour_report_counts_only_recent_suppressed_grid_recoveries(tmp_path):
+    reporting = UnifiedTelegramReporting.__new__(UnifiedTelegramReporting)
+    reporting.grid_state = tmp_path
+    now = datetime.fromtimestamp(20_000, timezone.utc)
+    (tmp_path / "runtime_error_state.json").write_text(json.dumps({
+        "history": [
+            {"component": "guard_cycle", "recovered_at": 19_000,
+             "occurrences": 2, "summary": "recent", "suppressed_as_transient": True},
+            {"component": "guard_cycle", "recovered_at": 1_000,
+             "occurrences": 5, "summary": "old", "suppressed_as_transient": True},
+            {"component": "report_cycle", "recovered_at": 19_500,
+             "occurrences": 3, "summary": "other", "suppressed_as_transient": True},
+            {"component": "guard_cycle", "recovered_at": 19_800,
+             "occurrences": 1, "summary": "alerted", "suppressed_as_transient": False},
+        ]
+    }), encoding="utf-8")
+    summary = reporting._grid_transport_summary(now)
+    assert summary["recovered_episodes"] == 1
+    assert summary["retry_attempts"] == 2
+    assert summary["last_reason"] == "recent"
 
 
 def test_runtime_order_error_recovers_only_after_quiet_window(tmp_path):
@@ -312,6 +397,7 @@ def test_profit_report_is_sent_as_telegram_markdown():
                     "seven_day_mtm_quote": None,
                     "all_time_mtm_quote": 7.665,
                 },
+                "runtime_transport": {"recovered_episodes": 2},
             }],
         },
     )
@@ -319,6 +405,7 @@ def test_profit_report_is_sent_as_telegram_markdown():
     assert text.startswith(MARKDOWN_MESSAGE_PREFIX)
     assert "*GRID · BTC-FDUSD*" in text
     assert "- 累计：`+7.6650 FDUSD`" in text
+    assert "Guard连接瞬时恢复（4h）：`2 次`，交易权限未受影响" in text
     with tempfile.TemporaryDirectory() as directory:
         token = Path(directory) / "token"
         token.write_text("notify-token", encoding="utf-8")
