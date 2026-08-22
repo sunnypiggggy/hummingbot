@@ -1,0 +1,14 @@
+{
+  "base_image": "hummingbot-api-orchestration:local",
+  "economic_http_requests_enabled": false,
+  "external_positions_unknown": false,
+  "generated_at": "2026-08-22T06:00:47.746574+00:00",
+  "live_authorized": false,
+  "package_id": "binance-stocks-runtime",
+  "paper_initial_usdc": "2000",
+  "position_source": "paper_ledger",
+  "release_sha256": "c097c9404ea97b33b759516805590fde3b5765aadc9792e5bc4eaa8ca6327ea4",
+  "runtime_mode": "PAPER",
+  "schema": "binance-stocks-runtime-package-v2",
+  "secrets_included": false
+}
