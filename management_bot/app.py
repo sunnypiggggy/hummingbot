@@ -16,6 +16,7 @@ from management_bot.clients import (
 )
 from management_bot.config import Settings
 from management_bot.storage import BotStore
+from management_bot.system_metrics import HostSystemMetrics
 from management_bot.telegram_api import TelegramAPI, TelegramError
 
 
@@ -150,6 +151,14 @@ class TradingManagementBot:
             settings.approval_evidence_root,
             settings.approval_decision_root,
         )
+        self.system_metrics = HostSystemMetrics(
+            proc_stat=settings.host_proc_stat_path,
+            proc_meminfo=settings.host_proc_meminfo_path,
+            proc_loadavg=settings.host_proc_loadavg_path,
+            proc_uptime=settings.host_proc_uptime_path,
+            root_disk=settings.host_root_disk_path,
+            extra_disk=settings.host_extra_disk_path,
+        )
         self.running = True
 
     @property
@@ -201,23 +210,84 @@ class TradingManagementBot:
         return f"• {name}：{chinese}" + (f"，错误{count}条" if count else "")
 
     def _overview(self) -> str:
+        lines = ["📊 系统总览", f"模式：{self.mode_label}", ""]
         try:
             bots = self._api_bots()
-            lines = ["📊 系统总览", f"模式：{self.mode_label}", ""]
             wanted = {v["bot_name"] for v in self.settings.bots.values()}
             for name in sorted(wanted):
                 lines.append(self._bot_line(name, bots.get(name, {})))
-            try:
-                stock = self.stocks.health()
-                stock_ok = stock.get("status") == "healthy"
-                lines.append(f"• Stock Runtime：{'健康' if stock_ok else '降级'} / {stock.get('runtime_mode', '-')}")
-            except Exception as exc:
-                lines.append(f"• Stock Runtime：不可用（{type(exc).__name__}）")
+        except Exception as exc:
+            lines.append(f"• Grid/DCA运行状态：不可用（{type(exc).__name__}）")
+        try:
+            stock = self.stocks.health()
+            stock_ok = stock.get("status") == "healthy"
+            lines.append(f"• Stock Runtime：{'健康' if stock_ok else '降级'} / {stock.get('runtime_mode', '-')}")
+        except Exception as exc:
+            lines.append(f"• Stock Runtime：不可用（{type(exc).__name__}）")
+        try:
             contracts = self.contracts.snapshot()
             lines.append(f"• 风控合同：{'正常' if not contracts['errors'] else '存在缺失'}")
-            return "\n".join(lines)
         except Exception as exc:
-            return f"📊 系统总览\n\n数据不可用：{_safe_text(exc)}"
+            lines.append(f"• 风控合同：不可用（{type(exc).__name__}）")
+        lines.extend(("", "🖥 OCI宿主机资源"))
+        try:
+            metrics = self.system_metrics.snapshot()
+        except Exception as exc:
+            lines.append(f"⚪ 宿主机指标：不可用（{type(exc).__name__}）")
+            return "\n".join(lines)
+        cpu = metrics.get("cpu")
+        load = metrics.get("load")
+        if cpu:
+            load_text = (
+                f"｜Load {load['one']:.2f}/{load['five']:.2f}/{load['fifteen']:.2f}"
+                if load else ""
+            )
+            lines.append(
+                f"{self._resource_icon(cpu['used_pct'])} CPU：{cpu['used_pct']:.1f}% "
+                f"/ {cpu['cores']}核{load_text}"
+            )
+        else:
+            lines.append("⚪ CPU：数据不可用")
+        memory = metrics.get("memory")
+        if memory:
+            lines.append(
+                f"{self._resource_icon(memory['used_pct'])} 内存："
+                f"{self._gib(memory['used_bytes'])}/{self._gib(memory['total_bytes'])} GiB "
+                f"（{memory['used_pct']:.1f}%）｜可用 {self._gib(memory['available_bytes'])} GiB"
+            )
+        else:
+            lines.append("⚪ 内存：数据不可用")
+        disks = metrics.get("disks", {})
+        for key, label in (("root", "根盘 /"), ("extra", "数据盘 extra_drive")):
+            disk = disks.get(key)
+            if disk:
+                lines.append(
+                    f"{self._resource_icon(disk['used_pct'])} {label}："
+                    f"{self._gib(disk['used_bytes'])}/{self._gib(disk['total_bytes'])} GiB "
+                    f"（{disk['used_pct']:.1f}%）｜可用 {self._gib(disk['available_bytes'])} GiB"
+                )
+            else:
+                lines.append(f"⚪ {label}：数据不可用")
+        uptime = metrics.get("uptime_seconds")
+        if uptime is not None:
+            days, remainder = divmod(int(uptime), 86400)
+            hours = remainder // 3600
+            lines.append(f"• 宿主机运行：{days}天{hours}小时")
+        if metrics.get("errors"):
+            lines.append("• 指标降级：" + ", ".join(metrics["errors"]))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _resource_icon(percent: float) -> str:
+        if percent >= 85:
+            return "🔴"
+        if percent >= 70:
+            return "🟠"
+        return "🟢"
+
+    @staticmethod
+    def _gib(value: Any) -> str:
+        return f"{float(value) / (1024 ** 3):.1f}"
 
     def _profit(self) -> str:
         try:

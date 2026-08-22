@@ -58,6 +58,12 @@ class Settings:
     trading_status_path: Path = Path("/reports/trading_status.json")
     profit_snapshot_db_path: Path = Path("/reports/telegram_outbox.sqlite")
     operations_report_max_age_seconds: int = 300
+    host_proc_stat_path: Path = Path("/host-metrics/proc/stat")
+    host_proc_meminfo_path: Path = Path("/host-metrics/proc/meminfo")
+    host_proc_loadavg_path: Path = Path("/host-metrics/proc/loadavg")
+    host_proc_uptime_path: Path = Path("/host-metrics/proc/uptime")
+    host_root_disk_path: Path = Path("/host-metrics/root-disk")
+    host_extra_disk_path: Path = Path("/host-metrics/extra-disk")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -103,6 +109,24 @@ class Settings:
             )),
             operations_report_max_age_seconds=int(os.getenv(
                 "OPERATIONS_REPORT_MAX_AGE_SECONDS", "300"
+            )),
+            host_proc_stat_path=Path(os.getenv(
+                "HOST_PROC_STAT_PATH", "/host-metrics/proc/stat"
+            )),
+            host_proc_meminfo_path=Path(os.getenv(
+                "HOST_PROC_MEMINFO_PATH", "/host-metrics/proc/meminfo"
+            )),
+            host_proc_loadavg_path=Path(os.getenv(
+                "HOST_PROC_LOADAVG_PATH", "/host-metrics/proc/loadavg"
+            )),
+            host_proc_uptime_path=Path(os.getenv(
+                "HOST_PROC_UPTIME_PATH", "/host-metrics/proc/uptime"
+            )),
+            host_root_disk_path=Path(os.getenv(
+                "HOST_ROOT_DISK_PATH", "/host-metrics/root-disk"
+            )),
+            host_extra_disk_path=Path(os.getenv(
+                "HOST_EXTRA_DISK_PATH", "/host-metrics/extra-disk"
             )),
         )
 

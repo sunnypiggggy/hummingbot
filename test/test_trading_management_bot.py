@@ -274,6 +274,30 @@ class FakeHummingbot:
         }]}}}
 
 
+class FakeSystemMetrics:
+    def snapshot(self):
+        return {
+            "cpu": {"used_pct": 12.5, "cores": 4},
+            "load": {"one": 0.1, "five": 0.2, "fifteen": 0.3},
+            "memory": {
+                "used_bytes": 2 * 1024**3, "total_bytes": 8 * 1024**3,
+                "available_bytes": 6 * 1024**3, "used_pct": 25.0,
+            },
+            "disks": {
+                "root": {
+                    "used_bytes": 20 * 1024**3, "total_bytes": 100 * 1024**3,
+                    "available_bytes": 80 * 1024**3, "used_pct": 20.0,
+                },
+                "extra": {
+                    "used_bytes": 80 * 1024**3, "total_bytes": 100 * 1024**3,
+                    "available_bytes": 20 * 1024**3, "used_pct": 80.0,
+                },
+            },
+            "uptime_seconds": 90000,
+            "errors": [],
+        }
+
+
 class TelegramFlowTests(TestCase):
     def _bot(self, root: Path, *, paper_enabled: bool = False) -> TradingManagementBot:
         token = root / "token"
@@ -439,6 +463,20 @@ class TelegramFlowTests(TestCase):
             self.assertIn("Stock PAPER", text)
             self.assertIn("+0.9000 USDC", text)
             self.assertNotIn("无可信数据", text)
+            bot.store.close()
+
+    def test_overview_includes_host_cpu_memory_and_two_disks(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.hummingbot = FakeHummingbot()
+            bot.system_metrics = FakeSystemMetrics()
+            text = bot._overview()
+            self.assertIn("OCI宿主机资源", text)
+            self.assertIn("CPU：12.5% / 4核", text)
+            self.assertIn("内存：2.0/8.0 GiB （25.0%）", text)
+            self.assertIn("根盘 /：20.0/100.0 GiB （20.0%）", text)
+            self.assertIn("数据盘 extra_drive：80.0/100.0 GiB （80.0%）", text)
+            self.assertIn("宿主机运行：1天1小时", text)
             bot.store.close()
 
     def test_stock_paper_profit_positions_and_trades_are_clear(self):

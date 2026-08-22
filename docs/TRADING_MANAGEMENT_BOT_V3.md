@@ -47,6 +47,11 @@ SQLite同时保存 Telegram update offset、已处理update、经济动作幂等
 
 ## 盈亏与当前异常口径
 
+“系统总览”同时展示 OCI 宿主机 CPU、1/5/15分钟 Load、内存、根盘和
+`extra_drive` 数据盘占用。管理容器只读挂载 `/proc/stat`、`meminfo`、`loadavg`、
+`uptime` 四个指标文件，并通过两块磁盘上的空目录读取文件系统容量；不挂载宿主机
+根目录或 Docker socket。单项指标不可用时只对该行降级，不隐藏机器人与风控状态。
+
 管理Bot的盈亏页读取 `dca-live-report` 持久化的 `profit_snapshot`，统一展示
 Grid和DCA四个机器人的4小时、24小时、7天及上线以来策略归属MTM。该口径
 与四小时频道报告一致，不使用缺少Grid performance的Hummingbot Docker状态

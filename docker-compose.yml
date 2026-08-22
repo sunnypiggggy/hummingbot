@@ -497,6 +497,12 @@ services:
       TRADING_STATUS_PATH: /reports/trading_status.json
       PROFIT_SNAPSHOT_DB_PATH: /reports/telegram_outbox.sqlite
       OPERATIONS_REPORT_MAX_AGE_SECONDS: "300"
+      HOST_PROC_STAT_PATH: /host-metrics/proc/stat
+      HOST_PROC_MEMINFO_PATH: /host-metrics/proc/meminfo
+      HOST_PROC_LOADAVG_PATH: /host-metrics/proc/loadavg
+      HOST_PROC_UPTIME_PATH: /host-metrics/proc/uptime
+      HOST_ROOT_DISK_PATH: /host-metrics/root-disk
+      HOST_EXTRA_DISK_PATH: /host-metrics/extra-disk
       MODEL_APPROVAL_REQUEST_ROOT: /approvals/weekly
       MODEL_APPROVAL_EVIDENCE_ROOT: /approvals/evidence
       MODEL_APPROVAL_DECISION_ROOT: /approvals/decisions
@@ -509,6 +515,12 @@ services:
       - ./dca-live-data/telegram:/approvals/evidence:ro
       - ./dca-live-data/telegram:/reports:ro
       - ./results/ethbtc_forced_exit_weekly/decisions:/approvals/decisions
+      - ${HOST_PROC_STAT_SOURCE:-/proc/stat}:/host-metrics/proc/stat:ro
+      - ${HOST_PROC_MEMINFO_SOURCE:-/proc/meminfo}:/host-metrics/proc/meminfo:ro
+      - ${HOST_PROC_LOADAVG_SOURCE:-/proc/loadavg}:/host-metrics/proc/loadavg:ro
+      - ${HOST_PROC_UPTIME_SOURCE:-/proc/uptime}:/host-metrics/proc/uptime:ro
+      - ${HOST_ROOT_DISK_ANCHOR:-./host-metrics/root-disk}:/host-metrics/root-disk:ro
+      - ${HOST_EXTRA_DISK_ANCHOR:-./host-metrics/extra-disk}:/host-metrics/extra-disk:ro
     secrets:
       - telegram_management_bot_token
     depends_on:
