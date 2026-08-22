@@ -54,6 +54,9 @@ class Settings:
     mutations_enabled: bool
     bots: dict[str, dict[str, str]]
     session_ttl_seconds: int = 900
+    trading_status_path: Path = Path("/reports/trading_status.json")
+    profit_snapshot_db_path: Path = Path("/reports/telegram_outbox.sqlite")
+    operations_report_max_age_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,6 +91,15 @@ class Settings:
             mutations_enabled=os.getenv("TRADING_MANAGEMENT_MUTATIONS_ENABLED", "false").lower() == "true",
             bots=bots,
             session_ttl_seconds=int(os.getenv("TRADING_MANAGEMENT_SESSION_TTL_SECONDS", "900")),
+            trading_status_path=Path(os.getenv(
+                "TRADING_STATUS_PATH", "/reports/trading_status.json"
+            )),
+            profit_snapshot_db_path=Path(os.getenv(
+                "PROFIT_SNAPSHOT_DB_PATH", "/reports/telegram_outbox.sqlite"
+            )),
+            operations_report_max_age_seconds=int(os.getenv(
+                "OPERATIONS_REPORT_MAX_AGE_SECONDS", "300"
+            )),
         )
 
     def read_token(self) -> str:
@@ -95,4 +107,3 @@ class Settings:
         if not token or ":" not in token:
             raise ValueError("Telegram management Bot token secret is invalid")
         return token
-

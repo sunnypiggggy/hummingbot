@@ -1,13 +1,15 @@
 import json
+import sqlite3
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase
 
 import yaml
 
 from management_bot.approvals import ApprovalStore
-from management_bot.clients import ContractReader
+from management_bot.clients import ContractReader, OperationsReportReader
 from management_bot.config import Settings
 from management_bot.app import TradingManagementBot
 from management_bot.storage import BotStore
@@ -111,6 +113,33 @@ class ContractReaderTests(TestCase):
         self.assertIn("锁存", reason)
 
 
+class OperationsReportReaderTests(TestCase):
+    def test_reads_fresh_owned_mtm_snapshot_and_status(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            status = root / "trading_status.json"
+            status.write_text(json.dumps({
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "robots": [{"strategy": "grid", "pair": "BTC-FDUSD", "trading_normal": True}],
+            }), encoding="utf-8")
+            database = root / "outbox.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE profit_snapshot(strategy TEXT,pair TEXT,observed_at REAL,"
+                "mtm_quote REAL,equity REAL,drawdown_pct REAL,payload_json TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO profit_snapshot VALUES (?,?,?,?,?,?,?)",
+                ("grid", "BTC-FDUSD", time.time(), 1.25, 201.25, 0.4,
+                 json.dumps({"profit": {"all_time_mtm_quote": 1.25}})),
+            )
+            connection.commit()
+            connection.close()
+            reader = OperationsReportReader(status, database, 300)
+            self.assertTrue(reader.status()["robots"][0]["trading_normal"])
+            self.assertEqual(1.25, reader.profits()["robots"][0]["profit"]["all_time_mtm_quote"])
+
+
 class FakeTelegram:
     def __init__(self):
         self.sent = []
@@ -138,6 +167,52 @@ class FakeStocks:
 
     def preview(self, config):
         return {"allowed": True, "fee_reserve": "0.35", "executor_id": config["id"]}
+
+
+class FakeReports:
+    def profits(self):
+        rows = []
+        for strategy, pair, value in (
+            ("grid", "BTC-FDUSD", "1.2345"), ("grid", "ETH-FDUSD", "2.3456"),
+            ("dca", "BTC-USDT", "0.4567"), ("dca", "ETH-USDT", "-0.1234"),
+        ):
+            rows.append({
+                "strategy": strategy, "pair": pair,
+                "profit": {
+                    "four_hour_mtm_quote": value, "twenty_four_hour_mtm_quote": value,
+                    "seven_day_mtm_quote": value, "all_time_mtm_quote": value,
+                },
+            })
+        return {"age_seconds": 8, "robots": rows}
+
+    def status(self):
+        rows = []
+        for strategy, pair in (
+            ("grid", "BTC-FDUSD"), ("grid", "ETH-FDUSD"),
+            ("dca", "BTC-USDT"), ("dca", "ETH-USDT"),
+        ):
+            gates = []
+            if strategy == "dca":
+                gates.append({
+                    "mechanism": "capital_budget_gate", "label": "资金预算告警",
+                    "applicable": True, "health": "HEALTHY", "state": "ALERT_ONLY",
+                    "buy_enabled": True, "sell_enabled": True,
+                    "reason": "insufficient_quote_budget",
+                })
+            rows.append({
+                "strategy": strategy, "pair": pair, "bot": f"{strategy}-{pair}",
+                "trading_normal": True, "phase": "ACTIVE",
+                "final_permissions": {"buy_enabled": True, "sell_enabled": True},
+                "blockers": [], "gate_statuses": gates,
+            })
+        return {"age_seconds": 8, "robots": rows}
+
+
+class FakeHummingbot:
+    def status(self):
+        return {"data": {"dca-BTC-USDT": {"error_logs": [{
+            "timestamp": time.time() - 3600, "msg": "Not enough budget to create DCA."
+        }]}}}
 
 
 class TelegramFlowTests(TestCase):
@@ -217,6 +292,48 @@ class TelegramFlowTests(TestCase):
             bot = self._bot(Path(raw))
             _, rows = bot._new_stock_session("stock_order", 7, 7, 11)
             for row in rows:
+                for _, callback in row:
+                    self.assertLessEqual(len(callback.encode()), 64)
+            bot.store.close()
+
+    def test_profit_uses_owned_mtm_snapshots_for_grid_and_dca(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.reports = FakeReports()
+            text = bot._profit()
+            self.assertIn("BTC-FDUSD", text)
+            self.assertIn("+1.2345 FDUSD", text)
+            self.assertIn("ETH-USDT", text)
+            self.assertNotIn("无可信数据", text)
+            bot.store.close()
+
+    def test_current_errors_are_grouped_by_effect_and_ignore_old_logs(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.reports = FakeReports()
+            bot.hummingbot = FakeHummingbot()
+            text = bot._errors()
+            self.assertIn("4/4 正常交易", text)
+            self.assertIn("仅告警，BUY/SELL仍放行", text)
+            self.assertNotIn("Not enough budget", text)
+            self.assertNotIn("交易阻塞：", text)
+            bot.store.close()
+
+    def test_risk_status_uses_final_per_robot_permissions(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.reports = FakeReports()
+            overview = bot._risk()
+            self.assertIn("4/4 正常交易", overview)
+            self.assertIn("GRID BTC-FDUSD", overview)
+            self.assertIn("BUY 放行｜SELL 放行", overview)
+            self.assertNotIn("合同已过期", overview)
+            detail = bot._risk_detail("dca", "BTC-USDT")
+            self.assertIn("✅ 正常交易", detail)
+            self.assertIn("资金预算告警：提醒（不阻塞）", detail)
+            self.assertIn("报价币预算不足，仅告警", detail)
+            self.assertIn("当前没有阻塞交易的风控门", detail)
+            for row in bot._risk_rows():
                 for _, callback in row:
                     self.assertLessEqual(len(callback.encode()), 64)
             bot.store.close()

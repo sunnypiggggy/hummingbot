@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -179,3 +181,74 @@ class ContractReader:
             if token in text:
                 return False, reason
         return True, "当前合同未发现恢复阻塞"
+
+
+class OperationsReportReader:
+    """Read the report service's canonical trading status and owned-MTM snapshots."""
+
+    def __init__(self, status_path: Path, profit_db_path: Path, max_age_seconds: int = 300):
+        self.status_path = status_path
+        self.profit_db_path = profit_db_path
+        self.max_age_seconds = max_age_seconds
+
+    @staticmethod
+    def _iso_timestamp(value: Any) -> float:
+        text = str(value or "").strip()
+        if not text:
+            return 0.0
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+    def status(self) -> dict:
+        try:
+            payload = json.loads(self.status_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ServiceError(f"运行状态快照不可用：{type(exc).__name__}") from exc
+        robots = payload.get("robots", []) if isinstance(payload, dict) else []
+        if not isinstance(robots, list) or not robots:
+            raise ServiceError("运行状态快照没有机器人数据")
+        generated_at = self._iso_timestamp(payload.get("generated_at"))
+        age = time.time() - generated_at if generated_at else float("inf")
+        if age > self.max_age_seconds:
+            raise ServiceError(f"运行状态快照已过期（{int(age)}秒）")
+        return {"generated_at": generated_at, "age_seconds": max(0.0, age), "robots": robots}
+
+    def profits(self) -> dict:
+        try:
+            uri = self.profit_db_path.resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=3)
+            try:
+                rows = connection.execute(
+                    "SELECT p.strategy,p.pair,p.observed_at,p.mtm_quote,p.equity,"
+                    "p.drawdown_pct,p.payload_json FROM profit_snapshot p "
+                    "JOIN (SELECT strategy,pair,MAX(observed_at) AS latest "
+                    "FROM profit_snapshot GROUP BY strategy,pair) x "
+                    "ON p.strategy=x.strategy AND p.pair=x.pair AND p.observed_at=x.latest "
+                    "ORDER BY p.strategy,p.pair"
+                ).fetchall()
+            finally:
+                connection.close()
+        except Exception as exc:
+            raise ServiceError(f"收益快照不可用：{type(exc).__name__}") from exc
+        if not rows:
+            raise ServiceError("收益快照没有机器人数据")
+        result = []
+        newest = 0.0
+        for strategy, pair, observed_at, mtm, equity, drawdown, payload_json in rows:
+            try:
+                payload = json.loads(payload_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            observed = float(observed_at or 0)
+            newest = max(newest, observed)
+            result.append({
+                "strategy": str(strategy), "pair": str(pair), "observed_at": observed,
+                "mtm_quote": mtm, "equity": equity, "drawdown_pct": drawdown,
+                "profit": payload.get("profit", {}) if isinstance(payload, dict) else {},
+            })
+        age = time.time() - newest if newest else float("inf")
+        if age > self.max_age_seconds:
+            raise ServiceError(f"收益快照已过期（{int(age)}秒）")
+        return {"observed_at": newest, "age_seconds": max(0.0, age), "robots": result}

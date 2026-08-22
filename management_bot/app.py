@@ -10,7 +10,9 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Optional
 
 from management_bot.approvals import ApprovalStore
-from management_bot.clients import ContractReader, HummingbotClient, StocksClient
+from management_bot.clients import (
+    ContractReader, HummingbotClient, OperationsReportReader, StocksClient,
+)
 from management_bot.config import Settings
 from management_bot.storage import BotStore
 from management_bot.telegram_api import TelegramAPI, TelegramError
@@ -54,6 +56,47 @@ def _safe_text(value: Any, limit: int = 500) -> str:
     return str(value).replace("`", "'")[:limit]
 
 
+def _permission_cn(value: Any) -> str:
+    if value is True:
+        return "放行"
+    if value is False:
+        return "阻止"
+    return "不适用"
+
+
+def _state_cn(value: Any) -> str:
+    raw = str(value or "未知").upper()
+    return {
+        "RISK_ON": "正常（Risk-On）", "RISK_OFF": "风险关闭（Risk-Off）",
+        "ALLOW": "放行", "BLOCK": "阻止", "BLOCKED": "阻止",
+        "HEALTHY": "健康", "FAILED": "故障", "UNAVAILABLE": "不可用",
+        "ACTIVE": "正常", "EXITING": "清仓中", "COOLDOWN": "冷却中",
+        "REENTRY": "等待重入", "LATCHED": "锁存", "APPLIED": "已落地",
+        "ALERT_ONLY": "提醒（不阻塞）", "LONG_ONLY": "只做多模式",
+        "N/A": "不适用",
+    }.get(raw, str(value or "未知"))
+
+
+def _reason_cn(value: Any) -> str:
+    raw = str(value or "").strip()
+    return {
+        "long_risk_gate_clear": "模型允许新增BUY",
+        "no_active_fomc_window": "当前无FOMC限制窗口",
+        "macro_state_healthy": "宏观状态正常",
+        "not_triggered": "未触发",
+        "all_sources_fresh": "全部数据源新鲜",
+        "already_classified_dust": "仅有已归类Dust，不影响交易",
+        "orders_submitted": "挂单已正常提交",
+        "ACTIVE": "处于正常交易阶段",
+        "runtime_consumed_current_gates": "运行时已应用当前门控",
+        "unchanged": "控制器已同步",
+        "insufficient_quote_budget": "报价币预算不足，仅告警",
+        "ordinary_sell_creation_disabled_protective_exits_allowed": (
+            "普通SELL建仓关闭，保护性退出仍允许"
+        ),
+    }.get(raw, _safe_text(raw or "无附加原因", 140))
+
+
 class TradingManagementBot:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -73,6 +116,11 @@ class TradingManagementBot:
         )
         self.contracts = ContractReader(
             settings.grid_guard_path, settings.dca_guard_path, settings.inventory_path
+        )
+        self.reports = OperationsReportReader(
+            settings.trading_status_path,
+            settings.profit_snapshot_db_path,
+            settings.operations_report_max_age_seconds,
         )
         self.approvals = ApprovalStore(
             settings.approval_request_root,
@@ -150,66 +198,195 @@ class TradingManagementBot:
 
     def _profit(self) -> str:
         try:
-            bots = self._api_bots()
+            snapshot = self.reports.profits()
         except Exception as exc:
-            return f"💰 盈亏报告\n\n无可信数据：{_safe_text(exc)}"
-        lines = ["💰 当前策略收益摘要", ""]
-        for definition in self.settings.bots.values():
-            name = definition["bot_name"]
-            raw = bots.get(name, {})
-            performance = raw.get("performance", {}) if isinstance(raw, dict) else {}
-            pnl: Any = None
-            if isinstance(performance, dict):
-                for report in performance.values():
-                    if isinstance(report, dict):
-                        metrics = report.get("performance", report)
-                        if isinstance(metrics, dict) and metrics.get("global_pnl_quote") is not None:
-                            pnl = metrics.get("global_pnl_quote")
-                            break
-            lines.append(f"• {name}：{pnl if pnl is not None else '无可信数据'}")
-        lines.append("\n详细4小时策略归属MTM仍由通知频道发送。")
+            return f"💰 策略归属 MTM\n\n数据不可用：{_safe_text(exc)}"
+
+        def amount(value: Any, quote: str) -> str:
+            try:
+                return f"{Decimal(str(value)):+.4f} {quote}"
+            except (InvalidOperation, TypeError, ValueError):
+                return "无可信数据"
+
+        age = int(snapshot["age_seconds"])
+        lines = ["💰 Grid / DCA 策略归属 MTM", f"数据年龄：{age}秒"]
+        for strategy, title in (("grid", "🟦 Grid"), ("dca", "🟩 DCA")):
+            lines.extend(("", title))
+            rows = [row for row in snapshot["robots"] if row["strategy"] == strategy]
+            for row in rows:
+                quote = row["pair"].split("-")[-1]
+                profit = row.get("profit", {})
+                lines.append(
+                    f"• {row['pair']}\n"
+                    f"  4h {amount(profit.get('four_hour_mtm_quote'), quote)}｜"
+                    f"24h {amount(profit.get('twenty_four_hour_mtm_quote'), quote)}\n"
+                    f"  7d {amount(profit.get('seven_day_mtm_quote'), quote)}｜"
+                    f"累计 {amount(profit.get('all_time_mtm_quote'), quote)}"
+                )
+        lines.append("\n口径：机器人归属资金的连续 MTM，不是交易所账户总收益。")
         return "\n".join(lines)
 
     def _risk(self) -> str:
-        snapshot = self.contracts.snapshot()
-        lines = ["🛡 风控状态", ""]
-        if snapshot["errors"]:
-            lines.append("合同读取异常：" + "；".join(snapshot["errors"]))
-        for strategy in ("grid", "dca"):
-            value = snapshot["sources"].get(strategy, {})
-            allowed, reason = ContractReader.resume_allowed(strategy, snapshot)
-            phase = value.get("phase", value.get("recovery_phase", "-")) if isinstance(value, dict) else "-"
-            lines.append(f"• {strategy.upper()}：{'未发现完整性阻塞' if allowed else '受限'}；阶段={phase}；{reason}")
-        inventory = snapshot["sources"].get("inventory", {})
-        if inventory:
-            lines.append(f"• 库存归属：{'健康' if inventory.get('healthy') else '需检查'}")
+        try:
+            snapshot = self.reports.status()
+        except Exception as exc:
+            return f"🛡 风控状态\n\n数据不可用：{_safe_text(exc)}"
+        robots = snapshot["robots"]
+        normal = sum(1 for item in robots if item.get("trading_normal"))
+        lines = [
+            "🛡 Grid / DCA 风控状态",
+            f"数据年龄：{int(snapshot['age_seconds'])}秒",
+            f"结论：{'✅' if normal == len(robots) else '🔴'} {normal}/{len(robots)} 正常交易",
+            "",
+        ]
+        for robot in robots:
+            strategy = str(robot.get("strategy", "")).upper()
+            pair = str(robot.get("pair", "未知交易对"))
+            permissions = robot.get("final_permissions", {})
+            buy = "放行" if permissions.get("buy_enabled") else "阻止"
+            sell = "放行" if permissions.get("sell_enabled") else "阻止"
+            alerts = sum(
+                1 for gate in robot.get("gate_statuses", [])
+                if isinstance(gate, dict) and gate.get("applicable", True)
+                and gate.get("state") == "ALERT_ONLY"
+            )
+            state = "正常交易" if robot.get("trading_normal") else "交易受限"
+            suffix = f"｜{alerts}项提醒" if alerts else ""
+            lines.append(
+                f"{'✅' if robot.get('trading_normal') else '🔴'} {strategy} {pair}\n"
+                f"  {state}｜BUY {buy}｜SELL {sell}｜阶段 {_state_cn(robot.get('phase'))}{suffix}"
+            )
+        lines.append("\n点击下方交易对查看全部生效门控。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _risk_rows() -> list[list[tuple[str, str]]]:
+        return [
+            [("Grid BTC", "r:grid:BTC-FDUSD"), ("Grid ETH", "r:grid:ETH-FDUSD")],
+            [("DCA BTC", "r:dca:BTC-USDT"), ("DCA ETH", "r:dca:ETH-USDT")],
+            [("🏠 主菜单", "m:home")],
+        ]
+
+    def _risk_detail(self, strategy: str, pair: str) -> str:
+        try:
+            snapshot = self.reports.status()
+        except Exception as exc:
+            return f"🛡 风控详情\n\n数据不可用：{_safe_text(exc)}"
+        robot = next((
+            item for item in snapshot["robots"]
+            if str(item.get("strategy")) == strategy and str(item.get("pair")) == pair
+        ), None)
+        if not robot:
+            return f"🛡 风控详情\n\n没有找到 {strategy.upper()} {pair} 的状态。"
+        permissions = robot.get("final_permissions", {})
+        buy = "放行" if permissions.get("buy_enabled") else "阻止"
+        sell = "放行" if permissions.get("sell_enabled") else "阻止"
+        lines = [
+            f"🛡 {strategy.upper()} {pair} 风控详情",
+            f"交易状态：{'✅ 正常交易' if robot.get('trading_normal') else '🔴 交易受限'}",
+            f"最终权限：BUY {buy}｜SELL {sell}",
+            f"恢复阶段：{_state_cn(robot.get('phase'))}",
+            "",
+            "全部生效门控：",
+        ]
+        for gate in robot.get("gate_statuses", []):
+            if not isinstance(gate, dict) or not gate.get("applicable", True):
+                continue
+            gate_buy = _permission_cn(gate.get("buy_enabled"))
+            gate_sell = _permission_cn(gate.get("sell_enabled"))
+            lines.append(
+                f"• {gate.get('label', gate.get('mechanism', '未知门控'))}："
+                f"{_state_cn(gate.get('state'))}\n"
+                f"  BUY {gate_buy}｜SELL {gate_sell}｜{_reason_cn(gate.get('reason'))}"
+            )
+        blockers = robot.get("blockers", [])
+        if blockers:
+            lines.extend(("", "当前阻塞原因："))
+            lines.extend(f"• {_safe_text(item, 160)}" for item in blockers)
+        else:
+            lines.append("\n当前没有阻塞交易的风控门。")
         return "\n".join(lines)
 
     def _errors(self) -> str:
-        lines = ["⚠️ 当前异常", ""]
-        found = 0
+        blockers: list[str] = []
+        warnings: list[str] = []
+        normal = 0
+        total = 0
+        budget_warning_bots: set[str] = set()
+        try:
+            status = self.reports.status()
+            for robot in status["robots"]:
+                total += 1
+                pair = str(robot.get("pair", "未知交易对"))
+                strategy = str(robot.get("strategy", "")).upper()
+                bot_name = str(robot.get("bot", pair))
+                permissions = robot.get("final_permissions", {})
+                buy = "放行" if permissions.get("buy_enabled") else "阻止"
+                sell = "放行" if permissions.get("sell_enabled") else "阻止"
+                if robot.get("trading_normal"):
+                    normal += 1
+                else:
+                    reasons = robot.get("blockers", [])
+                    reason = "；".join(_safe_text(item, 100) for item in reasons) or "存在生效中的风控门"
+                    blockers.append(
+                        f"{strategy} {pair}：交易受限，BUY={buy}、SELL={sell}；{reason}"
+                    )
+                for gate in robot.get("gate_statuses", []):
+                    if not isinstance(gate, dict) or not gate.get("applicable", True):
+                        continue
+                    if gate.get("state") == "ALERT_ONLY":
+                        budget_warning_bots.add(bot_name)
+                        quote = pair.split("-")[-1]
+                        warnings.append(
+                            f"{strategy} {pair}：可用 {quote} 低于预算提醒值；"
+                            "仅告警，BUY/SELL仍放行。"
+                        )
+                    elif str(gate.get("health", "HEALTHY")).upper() != "HEALTHY" and robot.get("trading_normal"):
+                        warnings.append(
+                            f"{strategy} {pair}：{gate.get('label', '风控数据')}状态异常，"
+                            "当前尚未阻塞交易。"
+                        )
+        except Exception as exc:
+            blockers.append(_safe_text(exc))
+
+        # Hummingbot's error_logs is a rolling history, not a current alarm list.
+        # Only recent unique errors are shown and repeated per-second messages are collapsed.
+        cutoff = time.time() - 900
+        recent: dict[tuple[str, str], int] = {}
         try:
             for name, raw in self._api_bots().items():
                 values = raw.get("error_logs", []) if isinstance(raw, dict) else []
                 if isinstance(values, list):
-                    for value in values[-3:]:
-                        found += 1
-                        lines.append(f"• {name}：{_safe_text(value, 260)}")
+                    for value in values:
+                        if not isinstance(value, dict) or float(value.get("timestamp", 0) or 0) < cutoff:
+                            continue
+                        msg = str(value.get("msg", "未知运行错误"))
+                        if name in budget_warning_bots and "Not enough budget" in msg:
+                            continue
+                        key = (name, msg)
+                        recent[key] = recent.get(key, 0) + 1
         except Exception as exc:
-            lines.append(f"• Hummingbot API：{_safe_text(exc)}")
-            found += 1
+            blockers.append(f"Hummingbot API不可用：{_safe_text(exc)}")
+        for (name, message), count in recent.items():
+            suffix = f"（近15分钟重复{count}次）" if count > 1 else ""
+            warnings.append(f"{name}：{_safe_text(message, 140)}{suffix}；请关注，当前权限以风控状态为准。")
+
         snapshot = self.contracts.snapshot()
         for error in snapshot["errors"]:
-            lines.append(f"• 合同：{error}")
-            found += 1
-        for strategy in ("grid", "dca"):
-            source = snapshot["sources"].get(strategy, {})
-            error = source.get("last_error") if isinstance(source, dict) else None
-            if error:
-                lines.append(f"• {strategy.upper()} Guard：{_safe_text(error)}")
-                found += 1
-        if not found:
-            lines.append("当前未发现已上报错误。")
+            blockers.append(f"风控合同不可用：{error}")
+
+        lines = ["⚠️ 当前异常"]
+        if blockers:
+            lines.append(f"结论：🔴 {len(blockers)}项正在影响或可能影响交易；正常交易 {normal}/{total}。")
+            lines.extend(("", "交易阻塞："))
+            lines.extend(f"• {item}" for item in blockers)
+        else:
+            lines.append(f"结论：✅ {normal}/{total} 正常交易；没有生效中的交易阻塞。")
+        if warnings:
+            lines.extend(("", "提醒（不阻塞交易）："))
+            lines.extend(f"• {item}" for item in warnings)
+        elif not blockers:
+            lines.append("当前也没有需要处理的运行提醒。")
         return "\n".join(lines)
 
     def _models(self) -> str:
@@ -848,7 +1025,12 @@ class TradingManagementBot:
             elif data == "m:profit":
                 text, rows = self._profit(), self._back()
             elif data == "m:risk":
-                text, rows = self._risk(), self._back()
+                text, rows = self._risk(), self._risk_rows()
+            elif data.startswith("r:"):
+                _, strategy, pair = data.split(":", 2)
+                text, rows = self._risk_detail(strategy, pair), [
+                    [("⬅️ 风控总览", "m:risk"), ("🏠 主菜单", "m:home")]
+                ]
             elif data == "m:errors":
                 text, rows = self._errors(), self._back()
             elif data == "m:models":
