@@ -31,13 +31,18 @@ producer 加载模型、行情和连续状态，发布有执行权的合同；Gr
 
 ## 周模型审批
 
-默认每周在旧周边界前13小时生成候选，随后进入12小时复核窗口。频道通知包含报告、截止时间和 Hermes 提示词；明确拒绝会终止候选，明确批准可提前完成审批，无操作时仅在所有硬门槛持续通过后默认批准。审批等待不修改当前 release 或 controller，不撤单、不成交，也不暂停当前模型交易。
+默认每周在旧周边界前16小时生成候选，随后进入12小时复核窗口。频道通知包含报告、截止时间和 Hermes 提示词；明确拒绝会终止候选，明确批准可提前完成审批，无操作时仅在所有硬门槛持续通过后默认批准。审批等待不修改当前 release 或 controller，不撤单、不成交，也不暂停当前模型交易。
 
-关键配置为 `V22_WEEKLY_AUTO_UPDATE_ENABLED=true`、`V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS=43200`、`V22_WEEKLY_GENERATION_LEAD_SECONDS=57600`、`V22_WEEKLY_MINIMUM_RUNWAY_SECONDS=86400` 和 `V22_RUNTIME_ROOT=/workspace/state/v22-runtime`。候选在 `T-16h` 生成，保留 12 小时无人拒绝自动批准语义；随后在周边界前 35 分钟隔离预热、前 30 分钟原子提交 runtime generation，周边界不再切换实时文件。授权绑定 release、模型哈希、复核请求、账户预检、审批方式和未来周边界；完整性、连续性、资金归属、紧急通道或过滤器任一失败时拒绝默认通过。
+关键配置为 `V22_WEEKLY_AUTO_UPDATE_ENABLED=true`、`V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS=43200`、`V22_WEEKLY_GENERATION_LEAD_SECONDS=57600`、`V22_WEEKLY_MINIMUM_RUNWAY_SECONDS=86400`、`V22_WEEKLY_RETAIN_OLD_RELEASES=3` 和 `V22_RUNTIME_ROOT=/workspace/state/v22-runtime`。候选在 `T-16h` 生成，保留 12 小时无人拒绝自动批准语义；随后在周边界前 35 分钟隔离预热、前 30 分钟原子提交 runtime generation，周边界不再切换实时文件。授权绑定 release、模型哈希、复核请求、账户预检、审批方式和未来周边界；完整性、连续性、资金归属、紧急通道或过滤器任一失败时拒绝默认通过。
 
 ## 原子切换
 
 日常周切换不重启交易容器。候选批准后继续使用旧 release；到 `activate_at` 时，调度器原子替换发布族根目录的 `active_deployment.json`，该文件同时内嵌哈希绑定授权并引用不可变 release。Grid producer 每轮读取该单一指针，DCA 消费 Grid 发布的同一合同，因此不会先切模型后切授权，也不会因审批等待关闭当前交易。
+
+健康周边界激活完成后才执行 release 保留：当前 release 不计入旧模型数量，另保留最近
+3 个旧 release。被清理 release 对应的非活动 runtime generation 同步删除；当前和前一代
+安全指针受保护。模型目录清理不删除 Telegram 证据 PNG、交付回执、审批记录或审计事件。
+清理失败只产生告警并等待下次健康更新重试，不改变已激活模型和交易权限。
 
 ## 激活后检查
 

@@ -11,10 +11,12 @@ from scripts.ethbtc_forced_exit_contract import atomic_json
 from scripts.v22_weekly_release_manager import (
     DEFAULT_DELAY_SECONDS,
     DEFAULT_GENERATION_LEAD_SECONDS,
+    DEFAULT_RETAIN_OLD_RELEASES,
     Policy,
     V22LiveGateProducer,
     WeeklyReleaseManager,
     approval_prompt,
+    policy_from_environment,
 )
 
 
@@ -308,3 +310,148 @@ def test_candidate_notification_contains_default_pass_prompt():
     assert "默认行为" in text
     assert "审批等待不影响当前模型交易" in text
     assert "Hermes" in text and HASH in text
+
+
+def _write_release(value: WeeklyReleaseManager, release_sha: str, effective_end: int) -> Path:
+    path = value.release_root / "releases" / release_sha
+    path.mkdir(parents=True)
+    atomic_json(path / "production_lock.json", {
+        "package_id": "ethbtc-forced-exit",
+        "release_sha256": release_sha,
+        "effective_start": 1_000,
+        "effective_end": effective_end,
+    })
+    (path / "model.bin").write_bytes(release_sha.encode())
+    return path
+
+
+def _write_generation(value: WeeklyReleaseManager, generation: str, *, release: str,
+                      predecessor: str | None = None) -> Path:
+    path = value.runtime_root / "generations" / generation
+    path.mkdir(parents=True)
+    atomic_json(path / "manifest.json", {
+        "release_sha256": release,
+        "predecessor_release_sha256": predecessor,
+    })
+    return path
+
+
+def test_release_retention_keeps_current_plus_three_old_and_preserves_png_evidence(tmp_path: Path):
+    value = manager(tmp_path, 2_000_000_000, 2_000_000_000)
+    old = [str(number) * 64 for number in range(1, 6)]
+    _write_release(value, HASH, 700)
+    for number, release_sha in enumerate(old, 1):
+        _write_release(value, release_sha, number * 100)
+    atomic_json(value.release_root / "active_deployment.json", {"release_sha256": HASH})
+
+    current_generation = "d" * 64
+    stale_generation = "e" * 64
+    _write_generation(value, current_generation, release=HASH, predecessor=old[-1])
+    stale_path = _write_generation(value, stale_generation, release=old[0])
+    atomic_json(value.runtime_root / "current.json", {
+        "runtime_generation": current_generation, "release_sha256": HASH,
+    })
+
+    receipt = value.evidence_receipt_root / f"{old[0]}.json"
+    atomic_json(receipt, {"release_sha256": old[0], "photo_sha256": ["f" * 64]})
+    png = value.evidence_receipt_root.parent / "parameters" / "old-event" / "btc-360d.png"
+    png.parent.mkdir(parents=True)
+    png.write_bytes(b"png-evidence")
+
+    report = value._prune_release_history({"candidate_release_sha256": HASH}, 1234)
+
+    remaining = {path.name for path in (value.release_root / "releases").iterdir() if path.is_dir()}
+    assert remaining == {HASH, old[2], old[3], old[4]}
+    assert report["retain_old_releases"] == DEFAULT_RETAIN_OLD_RELEASES == 3
+    assert report["removed_release_sha256"] == [old[0], old[1]]
+    assert stale_generation in report["removed_runtime_generation"]
+    assert not stale_path.exists()
+    assert (value.runtime_root / "generations" / current_generation).is_dir()
+    assert receipt.is_file() and png.read_bytes() == b"png-evidence"
+    assert report["evidence_png_and_receipts_preserved"] is True
+
+
+def test_release_retention_never_breaks_the_current_runtime_generation(tmp_path: Path):
+    value = manager(tmp_path, 2_000_000_000, 2_000_000_000)
+    value.policy = Policy(retain_old_releases=0)
+    predecessor = "1" * 64
+    _write_release(value, HASH, 200)
+    _write_release(value, predecessor, 100)
+    atomic_json(value.release_root / "active_deployment.json", {"release_sha256": HASH})
+    generation = "d" * 64
+    _write_generation(value, generation, release=HASH, predecessor=predecessor)
+    atomic_json(value.runtime_root / "current.json", {
+        "runtime_generation": generation, "release_sha256": HASH,
+    })
+
+    report = value._prune_release_history({"candidate_release_sha256": HASH}, 1234)
+
+    assert (value.release_root / "releases" / predecessor).is_dir()
+    assert (value.runtime_root / "generations" / generation).is_dir()
+    assert report["removed_release_sha256"] == []
+
+
+def test_release_retention_ignores_unverified_directories(tmp_path: Path):
+    value = manager(tmp_path, 2_000_000_000, 2_000_000_000)
+    _write_release(value, HASH, 200)
+    atomic_json(value.release_root / "active_deployment.json", {"release_sha256": HASH})
+    invalid = value.release_root / "releases" / ("f" * 64)
+    invalid.mkdir(parents=True)
+    atomic_json(invalid / "production_lock.json", {
+        "package_id": "wrong-package", "release_sha256": invalid.name,
+    })
+
+    value._prune_release_history({"candidate_release_sha256": HASH}, 1234)
+
+    assert invalid.is_dir()
+
+
+def test_release_retention_failure_is_nonfatal_and_audited(tmp_path: Path):
+    value = manager(tmp_path, 2_000_000_000, 2_000_000_000)
+    with patch.object(value, "_prune_release_history", side_effect=OSError("disk busy")):
+        report = value._apply_release_retention({"candidate_release_sha256": HASH}, 1234)
+
+    assert report["status"] == "FAILED"
+    assert "disk busy" in report["error"]
+    persisted = json.loads(
+        (value.work_root / "release_retention.json").read_text(encoding="utf-8")
+    )
+    assert persisted == report
+    assert "MODEL_RETENTION_FAILED" in value.notification_path.read_text(encoding="utf-8")
+
+
+def test_release_retention_policy_defaults_to_three(monkeypatch):
+    monkeypatch.delenv("V22_WEEKLY_RETAIN_OLD_RELEASES", raising=False)
+    assert policy_from_environment().retain_old_releases == 3
+    monkeypatch.setenv("V22_WEEKLY_RETAIN_OLD_RELEASES", "5")
+    assert policy_from_environment().retain_old_releases == 5
+
+
+def test_release_retention_runs_only_after_a_healthy_fold_activation(tmp_path: Path):
+    boundary = 2_000_000_000
+    value = manager(tmp_path, boundary, boundary)
+    pending = value.work_root / "pending.json"
+    atomic_json(pending, {"model_sha256": MODEL})
+    base_state = {
+        "candidate_release_sha256": "c" * 64,
+        "pending_authorization_path": str(pending),
+        "activation_boundary": boundary,
+        "approval_mode": "automatic_default_after_12h",
+    }
+
+    with patch.object(value, "_switch_current"), \
+            patch.object(value, "_apply_release_retention") as retention:
+        unavailable = value._finalize_fold(dict(base_state), boundary, generation_healthy=False)
+    assert unavailable["phase"] == "ACTIVE_UNAVAILABLE"
+    retention.assert_not_called()
+
+    retention_report = {
+        "schema": "ethbtc-forced-exit-release-retention-v1",
+        "removed_release_sha256": [],
+    }
+    with patch.object(value, "_switch_current"), \
+            patch.object(value, "_apply_release_retention", return_value=retention_report) as retention:
+        active = value._finalize_fold(dict(base_state), boundary, generation_healthy=True)
+    assert active["phase"] == "ACTIVE"
+    assert active["release_retention"] == retention_report
+    retention.assert_called_once()

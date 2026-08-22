@@ -37,6 +37,7 @@ DEFAULT_MINIMUM_RUNWAY_SECONDS = 24 * 60 * 60
 DEFAULT_GENERATION_LEAD_SECONDS = 16 * 60 * 60
 DEFAULT_PREWARM_LEAD_SECONDS = 35 * 60
 DEFAULT_ACTIVATION_LEAD_SECONDS = 30 * 60
+DEFAULT_RETAIN_OLD_RELEASES = 3
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
 
@@ -70,6 +71,7 @@ class Policy:
     minimum_runway_seconds: int = DEFAULT_MINIMUM_RUNWAY_SECONDS
     generation_lead_seconds: int = DEFAULT_GENERATION_LEAD_SECONDS
     xgb_threads: int = 2
+    retain_old_releases: int = DEFAULT_RETAIN_OLD_RELEASES
 
     def __post_init__(self) -> None:
         if self.approval_delay_seconds < 60:
@@ -82,6 +84,8 @@ class Policy:
             raise ValueError("generation lead must leave 30m after the review window")
         if self.generation_lead_seconds > 48 * 3600:
             raise ValueError("generation lead cannot exceed 48h")
+        if not 0 <= self.retain_old_releases <= 52:
+            raise ValueError("old release retention must be between 0 and 52")
 
 
 class WeeklyReleaseManager:
@@ -370,6 +374,203 @@ class WeeklyReleaseManager:
         temporary.symlink_to(Path("releases") / release_sha, target_is_directory=True)
         os.replace(temporary, self.current)
 
+    @staticmethod
+    def _is_release_sha(value: object) -> bool:
+        text = str(value or "")
+        return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+    @staticmethod
+    def _remove_directory_atomically(path: Path) -> None:
+        """Remove one verified child directory without exposing a half-deleted release."""
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(f"retention target is not a real directory: {path}")
+        parent = path.parent.resolve()
+        resolved = path.resolve()
+        if resolved.parent != parent or resolved.name != path.name:
+            raise ValueError(f"retention target escaped its parent: {path}")
+        tombstone = path.parent / f".pruning-{path.name}"
+        if tombstone.exists():
+            raise FileExistsError(f"retention tombstone already exists: {tombstone}")
+        os.replace(path, tombstone)
+        try:
+            shutil.rmtree(tombstone)
+        except BaseException:
+            if tombstone.exists() and not path.exists():
+                os.replace(tombstone, path)
+            raise
+
+    def _release_records(self) -> list[dict[str, Any]]:
+        releases = self.release_root / "releases"
+        if not releases.is_dir():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in releases.iterdir():
+            if not path.is_dir() or path.is_symlink() or not self._is_release_sha(path.name):
+                continue
+            production = load_json(path / "production_lock.json", {}) or {}
+            if (
+                production.get("package_id") != PACKAGE_ID
+                or production.get("release_sha256") != path.name
+            ):
+                continue
+            records.append({
+                "release_sha256": path.name,
+                "path": path,
+                "effective_start": int(production.get("effective_start", 0) or 0),
+                "effective_end": int(production.get("effective_end", 0) or 0),
+                "mtime_ns": path.stat().st_mtime_ns,
+            })
+        return records
+
+    @staticmethod
+    def _generation_release_refs(manifest: Mapping[str, Any]) -> set[str]:
+        return {
+            str(value) for value in (
+                manifest.get("release_sha256"),
+                manifest.get("predecessor_release_sha256"),
+            )
+            if WeeklyReleaseManager._is_release_sha(value)
+        }
+
+    def _prune_release_history(
+        self, state: Mapping[str, Any], observed: int,
+    ) -> dict[str, Any]:
+        """Keep the active release plus N previous releases and their usable generations.
+
+        Telegram PNGs, delivery receipts, approval records, and notification events live
+        outside ``releases/`` and are deliberately not touched by this retention task.
+        """
+        records = self._release_records()
+        active_sha = str(state.get("candidate_release_sha256") or "")
+        active = load_json(self.release_root / "active_deployment.json", {}) or {}
+        if self._is_release_sha(active.get("release_sha256")):
+            active_sha = str(active["release_sha256"])
+        if not self._is_release_sha(active_sha):
+            raise RuntimeError("cannot prune releases without a valid active release hash")
+
+        ordered_old = sorted(
+            (record for record in records if record["release_sha256"] != active_sha),
+            key=lambda record: (
+                record["effective_end"], record["effective_start"],
+                record["mtime_ns"], record["release_sha256"],
+            ),
+            reverse=True,
+        )
+        retained_old = ordered_old[:self.policy.retain_old_releases]
+        retained = {active_sha, *(record["release_sha256"] for record in retained_old)}
+
+        protected_generations: set[str] = set()
+        current_pointer = load_json(self.runtime_root / "current.json", {}) or {}
+        current_generation = str(current_pointer.get("runtime_generation") or "")
+        if self._is_release_sha(current_pointer.get("release_sha256")):
+            retained.add(str(current_pointer["release_sha256"]))
+        if self._is_release_sha(current_generation):
+            protected_generations.add(current_generation)
+        previous_pointer = state.get("previous_runtime_pointer")
+        if isinstance(previous_pointer, Mapping):
+            previous_generation = str(previous_pointer.get("runtime_generation") or "")
+            if self._is_release_sha(previous_generation):
+                protected_generations.add(previous_generation)
+            if self._is_release_sha(previous_pointer.get("release_sha256")):
+                retained.add(str(previous_pointer["release_sha256"]))
+
+        generations_root = self.runtime_root / "generations"
+        generation_records: list[tuple[Path, set[str]]] = []
+        if generations_root.is_dir():
+            for path in generations_root.iterdir():
+                if not path.is_dir() or path.is_symlink() or not self._is_release_sha(path.name):
+                    continue
+                manifest = load_json(path / "manifest.json", {}) or {}
+                refs = self._generation_release_refs(manifest)
+                generation_records.append((path, refs))
+                if path.name in protected_generations:
+                    retained.update(refs)
+
+        known_releases = {record["release_sha256"] for record in records}
+        candidates_for_removal = known_releases - retained
+        removed_generations: list[str] = []
+        generation_errors: list[str] = []
+        for path, refs in generation_records:
+            if path.name in protected_generations or not (refs & candidates_for_removal):
+                continue
+            try:
+                self._remove_directory_atomically(path)
+                removed_generations.append(path.name)
+            except Exception as exc:
+                # Never leave a surviving generation pointing at a deleted release.
+                retained.update(refs)
+                candidates_for_removal -= refs
+                generation_errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+
+        removed_releases: list[str] = []
+        release_errors: list[str] = []
+        by_sha = {record["release_sha256"]: record for record in records}
+        for release_sha in sorted(
+            candidates_for_removal,
+            key=lambda sha: (
+                by_sha[sha]["effective_end"], by_sha[sha]["effective_start"], sha,
+            ),
+        ):
+            try:
+                self._remove_directory_atomically(by_sha[release_sha]["path"])
+                removed_releases.append(release_sha)
+            except Exception as exc:
+                release_errors.append(f"{release_sha}: {type(exc).__name__}: {exc}")
+
+        report = {
+            "schema": "ethbtc-forced-exit-release-retention-v1",
+            "generated_at": int(observed),
+            "active_release_sha256": active_sha,
+            "retain_old_releases": self.policy.retain_old_releases,
+            "retained_release_sha256": sorted(known_releases - set(removed_releases)),
+            "removed_release_sha256": removed_releases,
+            "removed_runtime_generation": removed_generations,
+            "generation_errors": generation_errors,
+            "release_errors": release_errors,
+            "evidence_png_and_receipts_preserved": True,
+        }
+        atomic_json(self.work_root / "release_retention.json", report)
+        return report
+
+    def _apply_release_retention(
+        self, state: Mapping[str, Any], observed: int,
+    ) -> dict[str, Any]:
+        try:
+            report = self._prune_release_history(state, observed)
+            if report["removed_release_sha256"] or report["removed_runtime_generation"]:
+                append_event(self.notification_path, build_event(
+                    source="v22-weekly-release-manager", strategy="grid+dca",
+                    bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
+                    pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT",
+                    mechanism="parameter_update", transition="MODEL_RETENTION_PRUNED",
+                    reason=("新模型健康激活后仅保留当前模型和最近"
+                            f"{self.policy.retain_old_releases}个旧模型"),
+                    severity="info", action="prune_unreferenced_old_releases",
+                    release_sha256=str(report["active_release_sha256"]),
+                    correlation_id=f"retention:{report['active_release_sha256']}:{observed}",
+                    details=report,
+                ))
+            return report
+        except Exception as exc:
+            report = {
+                "schema": "ethbtc-forced-exit-release-retention-v1",
+                "generated_at": int(observed), "status": "FAILED",
+                "error": f"{type(exc).__name__}: {exc}",
+                "evidence_png_and_receipts_preserved": True,
+            }
+            atomic_json(self.work_root / "release_retention.json", report)
+            append_event(self.notification_path, build_event(
+                source="v22-weekly-release-manager", strategy="grid+dca",
+                bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
+                pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT",
+                mechanism="parameter_update", transition="MODEL_RETENTION_FAILED",
+                reason="旧模型保留清理失败；当前已激活模型和交易不回滚",
+                severity="warning", action="keep_active_release_and_retry_next_update",
+                release_sha256=str(state.get("candidate_release_sha256") or ""),
+                correlation_id=f"retention-failed:{observed}", details=report,
+            ))
+            return report
+
     def _activate(self, state: dict[str, Any], observed: int) -> dict[str, Any]:
         release_sha = str(state["candidate_release_sha256"])
         prepared_pointer = load_json(Path(state["prepared_pointer_path"]), {}) or {}
@@ -421,7 +622,11 @@ class WeeklyReleaseManager:
         self._switch_current(release_sha)
         atomic_json(self.authorization_path, receipt)
         runtime_pointer = load_json(self.runtime_root / "current.json", {}) or {}
-        if runtime_pointer.get("runtime_generation") == state.get("runtime_generation"):
+        expected_generation = str(state.get("runtime_generation") or "")
+        if (
+            self._is_release_sha(expected_generation)
+            and runtime_pointer.get("runtime_generation") == expected_generation
+        ):
             runtime_pointer["cutover_phase"] = (
                 "ACTIVE" if generation_healthy else "ACTIVE_UNAVAILABLE"
             )
@@ -438,6 +643,8 @@ class WeeklyReleaseManager:
             "active_deployment_sha256": sha256_file(target),
             "last_error": None if generation_healthy else "signed_week_unavailable",
         })
+        if generation_healthy:
+            state["release_retention"] = self._apply_release_retention(state, observed)
         self._save(state)
         append_event(self.notification_path, build_event(
             source="v22-weekly-release-manager", strategy="grid+dca",
@@ -801,6 +1008,9 @@ def policy_from_environment() -> Policy:
         minimum_runway_seconds=int(os.getenv("V22_WEEKLY_MINIMUM_RUNWAY_SECONDS", str(DEFAULT_MINIMUM_RUNWAY_SECONDS))),
         generation_lead_seconds=int(os.getenv("V22_WEEKLY_GENERATION_LEAD_SECONDS", str(DEFAULT_GENERATION_LEAD_SECONDS))),
         xgb_threads=int(os.getenv("V22_WEEKLY_XGB_THREADS", "2")),
+        retain_old_releases=int(os.getenv(
+            "V22_WEEKLY_RETAIN_OLD_RELEASES", str(DEFAULT_RETAIN_OLD_RELEASES),
+        )),
     )
 
 

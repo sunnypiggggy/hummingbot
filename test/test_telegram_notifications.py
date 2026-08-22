@@ -53,6 +53,7 @@ def test_model_cutover_lifecycle_events_are_channel_safe():
     for transition in (
         "MODEL_CUTOVER_PREWARMED", "MODEL_CUTOVER_STABLE",
         "MODEL_CUTOVER_PRECHECK_FAILED", "MODEL_FOLD_ACTIVATED",
+        "MODEL_RETENTION_PRUNED", "MODEL_RETENTION_FAILED",
     ):
         value = event(
             mechanism="parameter_update", transition=transition,

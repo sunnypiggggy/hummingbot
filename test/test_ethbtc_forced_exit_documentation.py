@@ -26,7 +26,12 @@ def test_release_family_contains_complete_utf8_mechanism_documentation() -> None
         "CONTRACTS_AND_RUNTIME_FLOW.md",
         "TELEGRAM_NOTIFICATIONS.md",
         "ACCOUNT_INVENTORY.md",
+        "GRID_PAIR_PARAMETER_CUTOVER.md",
+        "NO_BNB_FEE_POLICY.md",
         "REAL_SCENARIO_TESTING.md",
+        "RESILIENCE_POLICY.md",
+        "V22_ZERO_DOWNTIME_CUTOVER.md",
+        "WEEKLY_APPROVAL_NOTIFICATIONS.md",
         "train_xgboost_codex_historty.md",
     }
     assert {path.name for path in DOCUMENTATION.glob("*.md")} == expected
@@ -71,9 +76,9 @@ def test_container_flow_document_describes_current_live_execution() -> None:
         "dca-live-report",
     ):
         assert container in content
-    assert "OCI 已切换到 v22 live" in content
+    assert "OCI 现网容器、功能依赖与信号链路" in content
     assert "唯一 v22 producer" in content
-    assert "execution_authorized=false" in content
+    assert "当前实际运行容器" in content
     assert "Fail-Closed" in content
 
 
@@ -115,5 +120,20 @@ def test_telegram_document_covers_runtime_error_lifecycle_and_safety() -> None:
         "[REDACTED]",
         "日志采集失败只降低日志可见性",
         "dca-live-report` 仍是唯一发送器",
+    ):
+        assert value in content
+
+
+def test_weekly_release_retention_keeps_three_old_models_and_all_png_evidence() -> None:
+    content = (DOCUMENTATION / "WEEKLY_APPROVAL_NOTIFICATIONS.md").read_text(
+        encoding="utf-8"
+    )
+    for value in (
+        "当前 release",
+        "最近 3 个旧 release",
+        "V22_WEEKLY_RETAIN_OLD_RELEASES=3",
+        "12 张证据 PNG",
+        "MODEL_RETENTION_PRUNED",
+        "MODEL_RETENTION_FAILED",
     ):
         assert value in content
