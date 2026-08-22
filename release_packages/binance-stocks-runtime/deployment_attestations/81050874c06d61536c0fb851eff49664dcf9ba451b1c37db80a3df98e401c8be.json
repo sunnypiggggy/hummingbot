@@ -1,0 +1,33 @@
+{
+  "schema": "binance-stocks-runtime-deployment-attestation-v2",
+  "package_id": "binance-stocks-runtime",
+  "release_sha256": "81050874c06d61536c0fb851eff49664dcf9ba451b1c37db80a3df98e401c8be",
+  "transport_sha256": "a08540832564dcf9907205856354efb04796a170f8d3d098ee40dd8c2270f987",
+  "container_image": "sha256:87c20c696046902ee7c18b6026da70525ba879485ce0eddb695dd1704890c98c",
+  "verified_at": "2026-08-22T02:09:23Z",
+  "target": "oci-ubuntu-152-69-205-54",
+  "host_files_checked": 48,
+  "image_files_checked": 23,
+  "mismatches": 0,
+  "container_status": "running/healthy",
+  "runtime_mode": "PAPER",
+  "live_authorized": false,
+  "economic_requests_enabled": false,
+  "economic_http_request_count": 0,
+  "paper_initial_usdc": "2000",
+  "paper_equity": "2000",
+  "paper_orders": 0,
+  "paper_positions": 0,
+  "market_data_credentials_ready": false,
+  "paper_trading_status": "awaiting_read_only_market_data_credentials",
+  "tests": {
+    "pytest_passed": 35,
+    "pytest_skipped": 1,
+    "postgres_scenario": "restart_fifo_timeout",
+    "postgres_scenario_fills": 3,
+    "postgres_scenario_net_pnl": "-1.50",
+    "postgres_scenario_run_id_stable": true,
+    "postgres_scenario_timeout_status": "CANCELED"
+  },
+  "secrets_included": false
+}

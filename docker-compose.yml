@@ -82,6 +82,11 @@ services:
       BINANCE_STOCKS_MAX_SYMBOL_USDC: "200"
       BINANCE_STOCKS_MAX_EXPOSURE_USDC: "2000"
       BINANCE_STOCKS_DAILY_LOSS_USDC: "200"
+      BINANCE_STOCKS_PAPER_INITIAL_USDC: "2000"
+      BINANCE_STOCKS_PAPER_FILL_LATENCY_MS: "1000"
+      BINANCE_STOCKS_PAPER_MARKET_TIMEOUT_SECONDS: "5"
+      BINANCE_STOCKS_PAPER_QUOTE_MAX_AGE_SECONDS: "10"
+      BINANCE_STOCKS_PAPER_EQUITY_SNAPSHOT_SECONDS: "60"
     ports:
       - "127.0.0.1:8001:8000"
     volumes:
@@ -487,6 +492,9 @@ services:
       GRID_GUARD_CONTRACT_PATH: /contracts/grid_guard_state.json
       DCA_GUARD_CONTRACT_PATH: /contracts/dca_guard_state.json
       INVENTORY_CONTRACT_PATH: /contracts/account_inventory_status.json
+      TRADING_STATUS_PATH: /reports/trading_status.json
+      PROFIT_SNAPSHOT_DB_PATH: /reports/telegram_outbox.sqlite
+      OPERATIONS_REPORT_MAX_AGE_SECONDS: "300"
       MODEL_APPROVAL_REQUEST_ROOT: /approvals/weekly
       MODEL_APPROVAL_EVIDENCE_ROOT: /approvals/evidence
       MODEL_APPROVAL_DECISION_ROOT: /approvals/decisions
@@ -497,6 +505,7 @@ services:
       - ./account-inventory-data/account_inventory_status.json:/contracts/account_inventory_status.json:ro
       - ./results/ethbtc_forced_exit_weekly/approval_public:/approvals/weekly:ro
       - ./dca-live-data/telegram:/approvals/evidence:ro
+      - ./dca-live-data/telegram:/reports:ro
       - ./results/ethbtc_forced_exit_weekly/decisions:/approvals/decisions
     secrets:
       - telegram_management_bot_token
