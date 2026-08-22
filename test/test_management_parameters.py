@@ -88,6 +88,28 @@ connector_secret: must-not-leak
         attachment = reader.attachment(evidence["sets"][0]["evidence_set_id"], "grid", "BTC", "360d")
         assert Path(attachment["path"]).read_bytes() == image
 
+        first_sha = result["catalog_sha256"]
+        write(grid / "xgboost_risk_gate.json", {
+            "release_sha256": "r" * 64, "model_sha256": "m" * 64,
+            "generated_at": "2026-08-22T00:01:00Z", "valid_until": "2026-08-22T00:03:30Z",
+            "pairs": {"BTC-FDUSD": {"probability": .8, "entry_threshold": .5,
+                       "model_signal": "RISK_OFF"}},
+        })
+        dynamic_robot = {**robot, "trading_normal": False,
+                         "final_permissions": {"buy_enabled": False, "sell_enabled": True}}
+        dynamic = publisher.publish([dynamic_robot], now=datetime.now(timezone.utc))
+        assert dynamic["catalog_sha256"] == first_sha
+        assert len(dynamic["history"]) == 1
+
+        runtime_path = bots / "instances/grid-live-fdusd-400/data/live_grid_runtime_state.json"
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        runtime["active_parameter_sha256"] = "b" * 64
+        runtime["active_pair_parameters"]["BTC-FDUSD"]["grid_range"] = .08
+        write(runtime_path, runtime)
+        changed = publisher.publish([dynamic_robot], now=datetime.now(timezone.utc))
+        assert changed["catalog_sha256"] != first_sha
+        assert len(changed["history"]) == 2
+
 
 def test_evidence_reader_rejects_path_escape_and_hash_mismatch():
     with tempfile.TemporaryDirectory() as raw:

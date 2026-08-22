@@ -13,6 +13,7 @@ import yaml
 
 SCHEMA = "management-parameter-catalog-v1"
 EVIDENCE_SCHEMA = "management-model-evidence-catalog-v1"
+HISTORY_SCHEMA = "management-parameter-history-v2"
 HISTORY_LIMIT = 3
 
 GRID_FIELDS = (
@@ -309,21 +310,59 @@ class ManagementParameterPublisher:
         _atomic_json(self.output.parent / "model_evidence_catalog.json", catalog)
         return catalog
 
+    @staticmethod
+    def _version_snapshot(catalog: Mapping[str, Any]) -> dict[str, Any]:
+        """Return only fields whose change creates a parameter/model version."""
+        risks = catalog.get("risks", {})
+        models = catalog.get("models", {})
+        active = models.get("active", {})
+        stable_active = {
+            key: active.get(key) for key in (
+                "package_id", "model_version", "runtime_generation", "release_sha256",
+                "predecessor_release_sha256", "model_sha256", "feature_schema_sha256",
+                "strategy_sha256", "data_sha256",
+            ) if key in active
+        }
+        stable_pairs = {}
+        for pair, value in active.get("pairs", {}).items():
+            if not isinstance(value, Mapping):
+                continue
+            stable_pairs[pair] = {
+                key: value.get(key) for key in (
+                    "pair", "source_pair", "model_week", "week_start", "week_end",
+                    "week_model_sha256", "entry_threshold",
+                ) if key in value
+            }
+        stable_active["pairs"] = stable_pairs
+        return {
+            "grid": catalog.get("grid", {}),
+            "dca": catalog.get("dca", {}),
+            "risks": {
+                strategy: risks.get(strategy, {}) for strategy in ("grid", "dca")
+            },
+            "models": {"active": stable_active},
+        }
+
     def _record_history(self, catalog: Mapping[str, Any]) -> list[dict[str, Any]]:
-        snapshot = {key: catalog[key] for key in ("grid", "dca", "risks", "models")}
+        snapshot = self._version_snapshot(catalog)
         digest = _canonical_sha(snapshot)
         path = self.history_root / f"{digest}.json"
         if not path.is_file():
             _atomic_json(path, {
-                "schema": "management-parameter-history-v1",
+                "schema": HISTORY_SCHEMA,
                 "recorded_at": catalog["generated_at"],
                 "catalog_sha256": digest,
                 **snapshot,
             })
         else:
             os.utime(path, None)
-        paths = sorted(self.history_root.glob("*.json"), key=lambda item: item.stat().st_mtime,
-                       reverse=True)
+        paths = []
+        for candidate in self.history_root.glob("*.json"):
+            if _json(candidate).get("schema") != HISTORY_SCHEMA:
+                candidate.unlink(missing_ok=True)
+                continue
+            paths.append(candidate)
+        paths.sort(key=lambda item: item.stat().st_mtime, reverse=True)
         for stale in paths[HISTORY_LIMIT:]:
             stale.unlink(missing_ok=True)
         return [{
@@ -342,9 +381,7 @@ class ManagementParameterPublisher:
             "risks": self._risks(robots),
             "models": self._models(),
         }
-        catalog["catalog_sha256"] = _canonical_sha({
-            key: catalog[key] for key in ("grid", "dca", "risks", "models")
-        })
+        catalog["catalog_sha256"] = _canonical_sha(self._version_snapshot(catalog))
         evidence = self._publish_evidence(catalog["models"])
         catalog["evidence"] = [{
             "evidence_set_id": item["evidence_set_id"],
