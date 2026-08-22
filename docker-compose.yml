@@ -487,6 +487,7 @@ services:
       TELEGRAM_MANAGEMENT_BOT_TOKEN_FILE: /run/secrets/telegram_management_bot_token
       TRADING_MANAGEMENT_STATE_DIR: /state
       TRADING_MANAGEMENT_MUTATIONS_ENABLED: "${TRADING_MANAGEMENT_MUTATIONS_ENABLED:-false}"
+      STOCKS_PAPER_TELEGRAM_TRADING_ENABLED: "${STOCKS_PAPER_TELEGRAM_TRADING_ENABLED:-true}"
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
       STOCKS_API_URL: http://binance-stocks-runtime:8000
       GRID_GUARD_CONTRACT_PATH: /contracts/grid_guard_state.json

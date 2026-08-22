@@ -53,6 +53,7 @@ class Settings:
     approval_decision_root: Path
     mutations_enabled: bool
     bots: dict[str, dict[str, str]]
+    stocks_paper_trading_enabled: bool = False
     session_ttl_seconds: int = 900
     trading_status_path: Path = Path("/reports/trading_status.json")
     profit_snapshot_db_path: Path = Path("/reports/telegram_outbox.sqlite")
@@ -90,6 +91,9 @@ class Settings:
             approval_decision_root=Path(os.getenv("MODEL_APPROVAL_DECISION_ROOT", "/approvals/decisions")),
             mutations_enabled=os.getenv("TRADING_MANAGEMENT_MUTATIONS_ENABLED", "false").lower() == "true",
             bots=bots,
+            stocks_paper_trading_enabled=os.getenv(
+                "STOCKS_PAPER_TELEGRAM_TRADING_ENABLED", "false"
+            ).lower() == "true",
             session_ttl_seconds=int(os.getenv("TRADING_MANAGEMENT_SESSION_TTL_SECONDS", "900")),
             trading_status_path=Path(os.getenv(
                 "TRADING_STATUS_PATH", "/reports/trading_status.json"

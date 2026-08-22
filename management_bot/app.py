@@ -200,7 +200,10 @@ class TradingManagementBot:
         try:
             snapshot = self.reports.profits()
         except Exception as exc:
-            return f"💰 策略归属 MTM\n\n数据不可用：{_safe_text(exc)}"
+            snapshot = None
+            reports_error = _safe_text(exc, 160)
+        else:
+            reports_error = None
 
         def amount(value: Any, quote: str) -> str:
             try:
@@ -208,22 +211,48 @@ class TradingManagementBot:
             except (InvalidOperation, TypeError, ValueError):
                 return "无可信数据"
 
-        age = int(snapshot["age_seconds"])
-        lines = ["💰 Grid / DCA 策略归属 MTM", f"数据年龄：{age}秒"]
-        for strategy, title in (("grid", "🟦 Grid"), ("dca", "🟩 DCA")):
-            lines.extend(("", title))
-            rows = [row for row in snapshot["robots"] if row["strategy"] == strategy]
-            for row in rows:
-                quote = row["pair"].split("-")[-1]
-                profit = row.get("profit", {})
+        lines = ["💰 Grid / DCA / Stock 收益"]
+        if snapshot is None:
+            lines.append(f"\n🟦 Grid / 🟩 DCA\n• 数据不可用：{reports_error}")
+        else:
+            lines.append(f"Grid/DCA数据年龄：{int(snapshot['age_seconds'])}秒")
+            for strategy, title in (("grid", "🟦 Grid"), ("dca", "🟩 DCA")):
+                lines.extend(("", title))
+                rows = [row for row in snapshot["robots"] if row["strategy"] == strategy]
+                for row in rows:
+                    quote = row["pair"].split("-")[-1]
+                    profit = row.get("profit", {})
+                    lines.append(
+                        f"• {row['pair']}\n"
+                        f"  4h {amount(profit.get('four_hour_mtm_quote'), quote)}｜"
+                        f"24h {amount(profit.get('twenty_four_hour_mtm_quote'), quote)}\n"
+                        f"  7d {amount(profit.get('seven_day_mtm_quote'), quote)}｜"
+                        f"累计 {amount(profit.get('all_time_mtm_quote'), quote)}"
+                    )
+        lines.extend(("", "🧪 Stock PAPER"))
+        try:
+            paper = self.stocks.paper_summary()
+            if not paper.get("valuation_complete") or not paper.get("reconciliation", {}).get("ok"):
+                lines.append("• 收益数据无法对账，暂不展示收益数值。")
+            else:
+                windows = paper.get("windows", {})
+                def paper_window(name: str) -> str:
+                    window = windows.get(name, {})
+                    suffix = "" if window.get("window_complete") else "（运行期不足）"
+                    return f"{amount(window.get('pnl'), 'USDC')}{suffix}"
+                account = paper.get("account", {})
                 lines.append(
-                    f"• {row['pair']}\n"
-                    f"  4h {amount(profit.get('four_hour_mtm_quote'), quote)}｜"
-                    f"24h {amount(profit.get('twenty_four_hour_mtm_quote'), quote)}\n"
-                    f"  7d {amount(profit.get('seven_day_mtm_quote'), quote)}｜"
-                    f"累计 {amount(profit.get('all_time_mtm_quote'), quote)}"
+                    f"• 4h {paper_window('4h')}｜24h {paper_window('24h')}\n"
+                    f"  7d {paper_window('7d')}｜累计 {paper_window('all')}\n"
+                    f"  权益 {amount(account.get('equity'), 'USDC').lstrip('+')}｜"
+                    f"峰值 {amount(account.get('peak_equity'), 'USDC').lstrip('+')}｜"
+                    f"回撤 {Decimal(str(account.get('drawdown_pct', 0))):.4f}%"
                 )
-        lines.append("\n口径：机器人归属资金的连续 MTM，不是交易所账户总收益。")
+        except Exception as exc:
+            lines.append(f"• 数据不可用：{_safe_text(exc, 160)}")
+        lines.append(
+            "\n口径：Grid/DCA为机器人归属MTM；Stock为独立2000 USDC Paper账户，币种不合并。"
+        )
         return "\n".join(lines)
 
     def _risk(self) -> str:
@@ -430,16 +459,116 @@ class TradingManagementBot:
     def _stock_menu(self) -> tuple[str, list[list[tuple[str, str]]]]:
         try:
             health = self.stocks.health()
-            status = f"{health.get('status', 'unknown')} / {health.get('runtime_mode', '-')}"
+            mode = str(health.get("runtime_mode", "-")).upper()
+            if mode == "PAPER":
+                status = self._paper_status(self.stocks.paper_summary()).lstrip("✅🔴🟦🟠 ")
+            else:
+                status = f"Runtime {health.get('status', 'unknown')} / {mode}"
         except Exception as exc:
             status = f"不可用（{type(exc).__name__}）"
         rows = [
             [("🧾 单笔订单", "s:new:order"), ("📈 仓位交易", "s:new:position")],
+            [("💰 Paper 收益", "s:paper_profit"), ("📊 Paper 持仓", "s:paper_positions")],
+            [("🧾 Paper 成交", "s:paper_trades"), ("🔄 刷新", "m:stock")],
             [("📋 白名单", "s:whitelist"), ("📏 交易限制", "s:limits")],
-            [("持仓", "s:positions"), ("刷新", "m:stock")],
+            [("Executor管理", "s:positions")],
             [("🏠 主菜单", "m:home")],
         ]
-        return f"📈 Stock 管理\n\nRuntime：{status}\n交易时段：盘前 + 正常时段 + 盘后（EXTENDED）", rows
+        paper_switch = "已开启" if self.settings.stocks_paper_trading_enabled else "已关闭"
+        return (
+            f"📈 Stock 管理\n\n状态：{status}\n"
+            f"Telegram Paper下单：{paper_switch}\n"
+            "交易时段：盘前 + 正常时段 + 盘后（EXTENDED）",
+            rows,
+        )
+
+    @staticmethod
+    def _paper_status(summary: dict) -> str:
+        if summary.get("account", {}).get("recovery_required"):
+            return "🔴 恢复校验失败，禁止新增Paper仓位"
+        if not summary.get("valuation_complete") or not summary.get("reconciliation", {}).get("ok"):
+            return "🔴 收益数据无法对账"
+        health = str(summary.get("quote_health", "UNKNOWN")).upper()
+        if health == "FRESH":
+            return "✅ 模拟交易正常"
+        if health == "MARKET_CLOSED_LAST_TRUSTED":
+            return "🟦 市场休市，使用最后可信行情估值"
+        if health == "MARKET_STATE_UNAVAILABLE":
+            return "🟠 行情已接入，等待交易时段状态"
+        if health in {"MARKET_DATA_UNAVAILABLE", "AWAITING_FIRST_QUOTE"}:
+            return "🟠 行情尚未接入，Paper未运行"
+        return f"🟠 Paper状态：{health}"
+
+    @staticmethod
+    def _paper_money(value: Any, *, signed: bool = True) -> str:
+        try:
+            number = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return "无可信数据"
+        return f"{number:+.4f} USDC" if signed else f"{number:.4f} USDC"
+
+    def _stock_paper_profit(self) -> str:
+        summary = self.stocks.paper_summary()
+        lines = ["💰 Stock PAPER 收益", self._paper_status(summary), ""]
+        if not summary.get("valuation_complete") or not summary.get("reconciliation", {}).get("ok"):
+            error = summary.get("reconciliation", {}).get("error", "unknown")
+            lines.append(f"原因：{_safe_text(error, 180)}\n收益数值已隐藏，避免展示错误估值。")
+            return "\n".join(lines)
+        windows = summary.get("windows", {})
+        for key, label in (("4h", "最近4小时"), ("24h", "最近24小时"), ("7d", "最近7天"), ("all", "上线以来")):
+            window = windows.get(key, {})
+            incomplete = "（运行期不足，按本次Paper run）" if not window.get("window_complete") else ""
+            lines.append(f"• {label}：{self._paper_money(window.get('pnl'))}{incomplete}")
+        account = summary.get("account", {})
+        totals = summary.get("totals", {})
+        lines.extend((
+            "",
+            f"当前权益：{self._paper_money(account.get('equity'), signed=False)}",
+            f"峰值权益：{self._paper_money(account.get('peak_equity'), signed=False)}",
+            f"当前回撤：{Decimal(str(account.get('drawdown_pct', 0))):.4f}%",
+            f"可用现金：{self._paper_money(account.get('available_cash'), signed=False)}",
+            f"持仓市值：{self._paper_money(account.get('positions_value'), signed=False)}",
+            f"累计费用：{self._paper_money(totals.get('fees'), signed=False)}",
+            f"成交：{totals.get('fill_count', 0)}笔｜活动订单：{totals.get('open_order_count', 0)}｜"
+            f"活动Executor：{totals.get('active_executor_count', 0)}",
+            f"Paper run：{str(summary.get('paper_run_id', '-'))[:16]}",
+        ))
+        return "\n".join(lines)
+
+    def _stock_paper_positions(self) -> str:
+        summary = self.stocks.paper_summary()
+        lines = ["📊 Stock PAPER 持仓", self._paper_status(summary), ""]
+        positions = [row for row in summary.get("positions", []) if Decimal(str(row.get("total", 0))) > 0]
+        if not positions:
+            lines.append("当前没有Paper持仓。")
+            return "\n".join(lines)
+        for row in positions:
+            lines.append(
+                f"• {row.get('symbol', '-')}：{row.get('total', '0')}股\n"
+                f"  成本 {self._paper_money(row.get('cost_quote'), signed=False)}｜"
+                f"均价 {self._paper_money(row.get('average_cost'), signed=False)}\n"
+                f"  市值 {self._paper_money(row.get('market_value'), signed=False)}｜"
+                f"最新Bid {row.get('mark_bid') or '无可信数据'}\n"
+                f"  已实现 {self._paper_money(row.get('realized_pnl'))}｜"
+                f"未实现 {self._paper_money(row.get('unrealized_pnl'))}\n"
+                f"  费用 {self._paper_money(row.get('fees'), signed=False)}｜"
+                f"净收益 {self._paper_money(row.get('net_pnl'))}"
+            )
+        return "\n".join(lines)
+
+    def _stock_paper_trades(self) -> str:
+        trades = self.stocks.paper_trades(limit=12)
+        lines = ["🧾 Stock PAPER 最近成交", ""]
+        if not trades:
+            lines.append("当前没有Paper成交。")
+            return "\n".join(lines)
+        for row in trades:
+            lines.append(
+                f"• {row.get('symbol', '-')} {row.get('side', '-')} {row.get('quantity', '0')}股 "
+                f"@ {row.get('price', '-')}｜费用 {row.get('fee_delta', '0')} USDC\n"
+                f"  {str(row.get('created_at', '-'))[:19]}"
+            )
+        return "\n".join(lines)
 
     def _enabled_symbols(self) -> list[str]:
         return [str(row["symbol"]) for row in self.stocks.whitelist() if row.get("enabled")]
@@ -518,7 +647,7 @@ class TradingManagementBot:
         self.store.update_session(sid, step="price")
         return "限价设置：", [[("使用最新报价", f"w:{sid}:price_latest:-"), ("自定义价格", f"w:{sid}:input:price")], [("取消", f"w:{sid}:cancel:-")]]
 
-    def _build_stock_config(self, session: dict) -> tuple[dict, Decimal]:
+    def _build_stock_request(self, session: dict) -> tuple[dict, Decimal]:
         data = session["payload"]
         symbol = data["symbol"]
         side = data.get("side", "BUY")
@@ -536,49 +665,51 @@ class TradingManagementBot:
         order_type = data.get("order_type", "LIMIT")
         common = {
             "id": executor_id,
-            "timestamp": time.time(),
-            "connector_name": "binance_stocks",
-            "trading_pair": f"{symbol}-USDC",
-            "side": side,
+            "symbol": symbol,
             "amount": str(shares),
             "controller_id": "telegram-management-bot",
         }
         if session["flow"] == "stock_order":
-            config = {**common, "type": "order_executor", "position_action": "OPEN", "execution_strategy": order_type}
+            request = {**common, "side": side, "order_type": order_type}
             if order_type == "LIMIT":
-                config["price"] = str(price)
+                request["price"] = str(price)
         else:
-            config = {
+            request = {
                 **common,
-                "type": "position_executor",
-                "entry_price": str(price) if order_type == "LIMIT" else None,
-                "triple_barrier_config": {
-                    "take_profit": data.get("take_profit", "0.03"),
-                    "stop_loss": data.get("stop_loss", "0.02"),
-                    "time_limit": int(Decimal(data.get("days", "7")) * 86400),
-                    "open_order_type": order_type,
-                    "take_profit_order_type": "LIMIT",
-                    "stop_loss_order_type": "MARKET",
-                    "time_limit_order_type": "MARKET",
-                },
+                "entry_order_type": order_type,
+                "stop_loss": data.get("stop_loss", "0.02"),
+                "take_profit": data.get("take_profit", "0.03"),
+                "time_limit": int(Decimal(data.get("days", "7")) * 86400),
             }
-        return config, price
+            if order_type == "LIMIT":
+                request["entry_price"] = str(price)
+        return request, price
 
     def _stock_preview(self, session: dict) -> tuple[str, list]:
-        config, price = self._build_stock_config(session)
-        preview = self.stocks.preview(config)
-        session = self.store.update_session(session["session_id"], step="confirm", payload={"config": config})
-        notional = Decimal(config["amount"]) * price
-        barriers = config.get("triple_barrier_config", {})
-        loss = notional * Decimal(str(barriers.get("stop_loss", "0")))
+        request, price = self._build_stock_request(session)
+        if session["flow"] == "stock_order":
+            preview = self.stocks.preview_order(request)
+            request_type = "order"
+        else:
+            preview = self.stocks.preview_position(request)
+            request_type = "position"
+        session = self.store.update_session(
+            session["session_id"], step="confirm",
+            payload={"request": request, "request_type": request_type},
+        )
+        notional = Decimal(request["amount"]) * price
+        loss = notional * Decimal(str(request.get("stop_loss", "0")))
         lines = [
             "✅ Stock 权威预检通过",
-            f"股票：{session['payload']['symbol']} / {config['side']}",
-            f"类型：{config['type']} / {session['payload'].get('order_type', 'LIMIT')}",
-            f"数量：{config['amount']} 股",
+            f"股票：{session['payload']['symbol']} / {request.get('side', 'BUY')}",
+            f"类型：{'OrderExecutor' if request_type == 'order' else 'PositionExecutor'} / "
+            f"{session['payload'].get('order_type', 'LIMIT')}",
+            f"数量：{request['amount']} 股",
             f"参考价格：{price} USDC",
             f"预计金额：{notional.quantize(Decimal('0.01'))} USDC",
             f"预计费用预留：{preview.get('fee_reserve', '-')} USDC",
+            "执行范围：PAPER（本地持久化撮合）",
+            "不会发送Binance真实下单或撤单请求。",
         ]
         if loss > 0:
             lines.append(f"止损最大估算：{loss.quantize(Decimal('0.01'))} USDC（不含跳空滑点）")
@@ -586,16 +717,25 @@ class TradingManagementBot:
         return "\n".join(lines), [[("✅ 确认创建", f"w:{session['session_id']}:confirm:-"), ("取消", f"w:{session['session_id']}:cancel:-")]]
 
     def _execute_stock(self, session: dict) -> tuple[str, list]:
-        config = dict(session["payload"].get("config", {}))
-        if not config:
+        request = dict(session["payload"].get("request", {}))
+        request_type = str(session["payload"].get("request_type", ""))
+        if not request or request_type not in {"order", "position"}:
             raise ValueError("订单预览已失效，请重新创建")
-        if not self.settings.mutations_enabled:
-            return "🔒 当前为只读观察模式，预检已通过但未创建任何订单。", self._back("m:stock")
-        key = f"stock:{config['id']}"
+        if not self.settings.stocks_paper_trading_enabled:
+            return "🔒 Telegram Paper下单开关已关闭，未创建任何订单。", self._back("m:stock")
+        health = self.stocks.health()
+        if str(health.get("runtime_mode", "")).upper() != "PAPER":
+            return "⛔ Stock Runtime并非PAPER模式，管理Bot拒绝提交。", self._back("m:stock")
+        if health.get("economic_requests_enabled") or health.get("live_authorized"):
+            return "⛔ 检测到实盘经济请求权限，管理Bot拒绝Paper提交。", self._back("m:stock")
+        key = f"stock-paper:{request['id']}"
         claimed, existing = self.store.claim_action(key)
         if claimed:
             try:
-                result = self.stocks.create(config)
+                result = (
+                    self.stocks.create_order(request)
+                    if request_type == "order" else self.stocks.create_position(request)
+                )
                 self.store.finish_action(key, "SUBMITTED", result)
             except Exception as exc:
                 result = {"error": _safe_text(exc)}
@@ -603,9 +743,11 @@ class TradingManagementBot:
                 raise
         else:
             result = existing or {}
-        self.store.update_session(session["session_id"], step="result", payload={"executor_id": config["id"]})
+        self.store.update_session(session["session_id"], step="result", payload={"executor_id": request["id"]})
         return (
-            f"📨 创建请求已处理\nExecutor：{config['id']}\n状态：{_safe_text(result.get('status', result))}",
+            f"📨 PAPER创建请求已处理\nExecutor：{request['id']}\n"
+            f"范围：PAPER / Binance真实经济请求=False\n"
+            f"状态：{_safe_text(result.get('status', result))}",
             [[("刷新执行结果", f"w:{session['session_id']}:refresh:-"), ("Stock菜单", "m:stock")]],
         )
 
@@ -933,8 +1075,11 @@ class TradingManagementBot:
                 [[("确认执行", f"x:{sid}:{action}2"), ("取消", f"x:{sid}:exec_view")]],
             )
         if action in {"exec_pause2", "exec_close2"}:
-            if not self.settings.mutations_enabled:
-                return "🔒 只读观察模式，未执行Executor变更。", self._back("s:positions")
+            if not self.settings.stocks_paper_trading_enabled:
+                return "🔒 Telegram Paper下单开关已关闭，未执行Executor变更。", self._back("s:positions")
+            health = self.stocks.health()
+            if str(health.get("runtime_mode", "")).upper() != "PAPER":
+                return "⛔ Stock Runtime并非PAPER模式，拒绝Executor变更。", self._back("s:positions")
             executor_id = session["payload"]["executor_id"]
             key = f"executor:{executor_id}:{action}"
             claimed, existing = self.store.claim_action(key)
@@ -948,8 +1093,11 @@ class TradingManagementBot:
             self.store.update_session(sid, step="input_reduce")
             return "请输入需要减仓的股数：", [[("取消", f"x:{sid}:exec_view")]]
         if action == "exec_reduce_confirm":
-            if not self.settings.mutations_enabled:
-                return "🔒 只读观察模式，未执行减仓。", self._back("s:positions")
+            if not self.settings.stocks_paper_trading_enabled:
+                return "🔒 Telegram Paper下单开关已关闭，未执行减仓。", self._back("s:positions")
+            health = self.stocks.health()
+            if str(health.get("runtime_mode", "")).upper() != "PAPER":
+                return "⛔ Stock Runtime并非PAPER模式，拒绝减仓。", self._back("s:positions")
             executor_id = session["payload"]["executor_id"]
             amount = session["payload"]["reduce_amount"]
             request_id = hashlib.sha256(f"{sid}|{executor_id}|{amount}".encode()).hexdigest()[:24]
@@ -1016,7 +1164,10 @@ class TradingManagementBot:
             self.telegram.answer_callback(callback_id, "无权访问", True)
             return
         try:
-            if data.startswith("m:") or data in {"s:whitelist", "s:limits", "s:positions"}:
+            if data.startswith("m:") or data in {
+                "s:whitelist", "s:limits", "s:positions", "s:paper_profit",
+                "s:paper_positions", "s:paper_trades",
+            }:
                 self.store.clear_sessions(user_id, chat_id)
             if data == "m:home":
                 text, rows = self._home()
@@ -1061,6 +1212,18 @@ class TradingManagementBot:
                 text, rows = self._stock_limits(), [[("修改", "s:limits_input"), ("⬅️ 返回", "m:stock")]]
             elif data == "s:positions":
                 text, rows = self._stock_executors_menu(user_id, chat_id, message_id)
+            elif data == "s:paper_profit":
+                text, rows = self._stock_paper_profit(), [[
+                    ("🔄 刷新", "s:paper_profit"), ("⬅️ Stock菜单", "m:stock")
+                ]]
+            elif data == "s:paper_positions":
+                text, rows = self._stock_paper_positions(), [[
+                    ("🔄 刷新", "s:paper_positions"), ("⬅️ Stock菜单", "m:stock")
+                ]]
+            elif data == "s:paper_trades":
+                text, rows = self._stock_paper_trades(), [[
+                    ("🔄 刷新", "s:paper_trades"), ("⬅️ Stock菜单", "m:stock")
+                ]]
             elif data == "s:wl_input":
                 session = self.store.create_session(user_id, chat_id, "whitelist_input", message_id)
                 self.store.update_session(session["session_id"], step="input")

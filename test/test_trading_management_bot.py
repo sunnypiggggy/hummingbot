@@ -159,6 +159,16 @@ class FakeTelegram:
 
 
 class FakeStocks:
+    def __init__(self):
+        self.created = []
+
+    def health(self):
+        return {
+            "status": "healthy", "runtime_mode": "PAPER", "connector_ready": True,
+            "paper_recovery_required": False, "economic_requests_enabled": False,
+            "live_authorized": False,
+        }
+
     def whitelist(self):
         return [{"symbol": "AAPL", "enabled": True, "max_position_notional": "200"}]
 
@@ -167,6 +177,49 @@ class FakeStocks:
 
     def preview(self, config):
         return {"allowed": True, "fee_reserve": "0.35", "executor_id": config["id"]}
+
+    def preview_order(self, payload):
+        return {"allowed": True, "fee_reserve": "0.35", "executor_id": payload["id"],
+                "execution_scope": "paper", "binance_economic_request": False}
+
+    def preview_position(self, payload):
+        return self.preview_order(payload)
+
+    def create_order(self, payload):
+        self.created.append(("order", payload))
+        return {"executor": {"status": "RUNNING"}, "execution_scope": "paper"}
+
+    def create_position(self, payload):
+        self.created.append(("position", payload))
+        return {"executor": {"status": "RUNNING"}, "execution_scope": "paper"}
+
+    def paper_summary(self):
+        return {
+            "paper_run_id": "paper-run-1", "quote_health": "FRESH", "valuation_complete": True,
+            "account": {
+                "equity": "2000.90", "peak_equity": "2002", "drawdown_pct": "0.0549",
+                "available_cash": "1900", "positions_value": "101.25", "recovery_required": False,
+            },
+            "windows": {
+                "4h": {"pnl": "0.25", "window_complete": False},
+                "24h": {"pnl": "0.90", "window_complete": True},
+                "7d": {"pnl": "0.90", "window_complete": True},
+                "all": {"pnl": "0.90", "window_complete": True},
+            },
+            "totals": {"fees": "0.35", "fill_count": 1, "open_order_count": 0,
+                       "active_executor_count": 1},
+            "positions": [{
+                "symbol": "AAPL", "total": "0.5", "available": "0.5", "cost_quote": "100",
+                "average_cost": "200", "mark_bid": "202.5", "market_value": "101.25",
+                "realized_pnl": "0", "unrealized_pnl": "1.25", "fees": "0.35",
+                "net_pnl": "0.90",
+            }],
+            "reconciliation": {"ok": True, "error": None},
+        }
+
+    def paper_trades(self, limit=20):
+        return [{"symbol": "AAPL", "side": "BUY", "quantity": "0.5", "price": "200",
+                 "fee_delta": "0.35", "created_at": "2026-08-22T01:02:03+00:00"}]
 
 
 class FakeReports:
@@ -216,7 +269,7 @@ class FakeHummingbot:
 
 
 class TelegramFlowTests(TestCase):
-    def _bot(self, root: Path) -> TradingManagementBot:
+    def _bot(self, root: Path, *, paper_enabled: bool = False) -> TradingManagementBot:
         token = root / "token"
         token.write_text("123456:test-token", encoding="utf-8")
         guard = root / "guard.json"
@@ -242,6 +295,7 @@ class TelegramFlowTests(TestCase):
             approval_decision_root=root / "decisions",
             mutations_enabled=False,
             bots={"grid": {"bot_name": "grid", "script": "grid", "conf": "grid"}},
+            stocks_paper_trading_enabled=paper_enabled,
         )
         bot = TradingManagementBot(settings)
         bot.telegram = FakeTelegram()
@@ -284,7 +338,24 @@ class TelegramFlowTests(TestCase):
             self.assertIn("权威预检通过", preview)
             session = bot.store.get_session(sid)
             result, _ = bot._stock_order_step(session, "confirm", "-")
-            self.assertIn("只读观察模式", result)
+            self.assertIn("Paper下单开关已关闭", result)
+            bot.store.close()
+
+    def test_stock_paper_trading_is_independent_from_global_mutation_switch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True)
+            _, rows = bot._new_stock_session("stock_order", 7, 7, 11)
+            sid = rows[0][0][1].split(":")[1]
+            bot._stock_order_step(bot.store.get_session(sid), "symbol", "AAPL")
+            bot._stock_order_step(bot.store.get_session(sid), "side", "BUY")
+            bot._stock_order_step(bot.store.get_session(sid), "otype", "MARKET")
+            preview, _ = bot._stock_order_step(bot.store.get_session(sid), "amount", "100")
+            self.assertIn("执行范围：PAPER", preview)
+            self.assertIn("不会发送Binance真实", preview)
+            result, _ = bot._stock_order_step(bot.store.get_session(sid), "confirm", "-")
+            self.assertIn("PAPER创建请求已处理", result)
+            self.assertEqual("order", bot.stocks.created[0][0])
+            self.assertNotIn("connector_name", bot.stocks.created[0][1])
             bot.store.close()
 
     def test_callback_data_stays_below_telegram_limit(self):
@@ -304,7 +375,37 @@ class TelegramFlowTests(TestCase):
             self.assertIn("BTC-FDUSD", text)
             self.assertIn("+1.2345 FDUSD", text)
             self.assertIn("ETH-USDT", text)
+            self.assertIn("Stock PAPER", text)
+            self.assertIn("+0.9000 USDC", text)
             self.assertNotIn("无可信数据", text)
+            bot.store.close()
+
+    def test_stock_paper_profit_positions_and_trades_are_clear(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            profit = bot._stock_paper_profit()
+            positions = bot._stock_paper_positions()
+            trades = bot._stock_paper_trades()
+            self.assertIn("模拟交易正常", profit)
+            self.assertIn("运行期不足", profit)
+            self.assertIn("AAPL", positions)
+            self.assertIn("净收益 +0.9000 USDC", positions)
+            self.assertIn("AAPL BUY", trades)
+            bot.store.close()
+
+    def test_stock_paper_reconciliation_failure_hides_profit_values(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.reports = FakeReports()
+            broken = bot.stocks.paper_summary()
+            broken["valuation_complete"] = False
+            broken["reconciliation"] = {"ok": False, "error": "missing_position_mark:AAPL"}
+            bot.stocks.paper_summary = lambda: broken
+            detail = bot._stock_paper_profit()
+            combined = bot._profit()
+            self.assertIn("收益数值已隐藏", detail)
+            self.assertIn("暂不展示收益数值", combined)
+            self.assertNotIn("+0.9000 USDC", combined)
             bot.store.close()
 
     def test_current_errors_are_grouped_by_effect_and_ignore_old_logs(self):

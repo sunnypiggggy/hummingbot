@@ -46,6 +46,16 @@ Grid和DCA四个机器人的4小时、24小时、7天及上线以来策略归属
 与四小时频道报告一致，不使用缺少Grid performance的Hummingbot Docker状态
 响应，也不等同于交易所账户总收益。快照超过5分钟即显示数据不可用。
 
+Stock PAPER收益独立读取 Stock Runtime 的 `GET /stocks/paper/summary`：
+
+- 总盈亏页增加4h、24h、7d和本次Paper run累计收益，但不与FDUSD/USDT相加。
+- Stock菜单提供账户收益、逐股票持仓收益和最近成交三个页面。
+- 窗口不足时标明“运行期不足”；逐股票与账户收益无法对账时隐藏收益数值。
+- 休市使用最后可信行情并明确标注；无行情时不把持仓按0估值。
+- 行情新鲜但市场阶段暂不可判定时显示“行情已接入，等待交易时段状态”，不误报为连接故障。
+- `STOCKS_PAPER_TELEGRAM_TRADING_ENABLED`只授权本地Paper Executor，和全局维护
+  `TRADING_MANAGEMENT_MUTATIONS_ENABLED`相互独立。
+
 “当前异常”以 `trading_status.json` 的最终交易权限为权威来源，按“交易阻塞”
 和“不阻塞提醒”分组。Hummingbot `error_logs` 是滚动历史缓存，只有最近15分钟
 的错误才会进入页面；相同错误会聚合，旧错误不会继续冒充当前故障。
@@ -62,6 +72,11 @@ Stock Runtime提供以下受控接口：
 - `GET/PUT /stocks/limits`
 - `POST /stocks/executors/preview`
 - `GET/POST /stocks/executors`
+- `POST /stocks/order-executors/preview`
+- `POST /stocks/order-executors`
+- `POST /stocks/position-executors/preview`
+- `POST /stocks/position-executors`
+- `GET /stocks/paper/summary`
 - `GET /stocks/executors/{executor_id}`
 - `POST /stocks/executors/{executor_id}/cancel`
 - `POST /stocks/executors/{executor_id}/reduce`

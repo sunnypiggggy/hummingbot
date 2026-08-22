@@ -81,6 +81,14 @@ class StocksClient(JsonClient):
     def account(self) -> dict:
         return self.request("GET", "/stocks/account-summary")
 
+    def paper_summary(self) -> dict:
+        value = self.request("GET", "/stocks/paper/summary")
+        return value if isinstance(value, dict) else {}
+
+    def paper_trades(self, limit: int = 20) -> list[dict]:
+        value = self.request("GET", f"/stocks/paper/trades?limit={max(1, min(limit, 100))}")
+        return list(value.get("items", [])) if isinstance(value, dict) else []
+
     def positions(self) -> dict:
         return self.request("GET", "/stocks/managed-positions")
 
@@ -118,11 +126,23 @@ class StocksClient(JsonClient):
             "controller_id": "telegram-management-bot",
         })
 
+    def preview_order(self, payload: dict) -> dict:
+        return self.request("POST", "/stocks/order-executors/preview", payload)
+
+    def preview_position(self, payload: dict) -> dict:
+        return self.request("POST", "/stocks/position-executors/preview", payload)
+
     def create(self, config: dict) -> dict:
         return self.request("POST", "/stocks/executors", {
             "executor_config": config,
             "controller_id": "telegram-management-bot",
         })
+
+    def create_order(self, payload: dict) -> dict:
+        return self.request("POST", "/stocks/order-executors", payload)
+
+    def create_position(self, payload: dict) -> dict:
+        return self.request("POST", "/stocks/position-executors", payload)
 
     def executor(self, executor_id: str) -> dict:
         return self.request("GET", f"/stocks/executors/{executor_id}")

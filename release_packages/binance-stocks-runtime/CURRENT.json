@@ -1,6 +1,6 @@
 {
   "package_id": "binance-stocks-runtime",
-  "path": "releases/2a577999da510781cc4a9010190023aeef04cc13f3316639b3b001f5335b174f",
-  "release_sha256": "2a577999da510781cc4a9010190023aeef04cc13f3316639b3b001f5335b174f",
+  "path": "releases/2642ecec98c447281b6acdfaf3836c3e7a8b3d58c7a959ff7e1a352dcf5474eb",
+  "release_sha256": "2642ecec98c447281b6acdfaf3836c3e7a8b3d58c7a959ff7e1a352dcf5474eb",
   "schema": "binance-stocks-runtime-package-v2"
 }
