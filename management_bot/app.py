@@ -652,11 +652,13 @@ class TradingManagementBot:
         configured = risks.get(strategy, {})
         current = risks.get("current", {}).get(f"{strategy}:{pair}", {})
         parameter_map = configured.get("parameters", {})
+        permissions = current.get("final_permissions", {})
+        final_buy = permissions.get("buy_enabled", permissions.get("buy"))
+        final_sell = permissions.get("sell_enabled", permissions.get("sell"))
         lines = [
             f"🛡 {strategy.upper()} {pair} 风控门参数",
             f"交易结论：{'正常交易' if current.get('trading_normal') else '交易受限'}",
-            f"最终权限：BUY={_permission_cn(current.get('final_permissions', {}).get('buy'))} / "
-            f"SELL={_permission_cn(current.get('final_permissions', {}).get('sell'))}",
+            f"最终权限：BUY={_permission_cn(final_buy)} / SELL={_permission_cn(final_sell)}",
             "",
         ]
         for gate in current.get("gates", []):

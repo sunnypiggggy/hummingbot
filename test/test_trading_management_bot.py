@@ -194,7 +194,7 @@ class FakeParameters:
                 "loss_limit_quote": "6", "cooldown_seconds": 21600,
             }}}, "dca": {"parameters": {}}, "current": {
                 "grid:BTC-FDUSD": {"trading_normal": True,
-                    "final_permissions": {"buy": True, "sell": True},
+                    "final_permissions": {"buy_enabled": True, "sell_enabled": True},
                     "gates": [{"mechanism": "strategy_loss_breaker",
                                "label": "策略亏损熔断", "enabled": True,
                                "state": "ALLOW", "buy_enabled": True, "sell_enabled": True}]},
@@ -615,6 +615,7 @@ class TelegramFlowTests(TestCase):
             self.assertIn("止损：5.0000%", dca)
             risk, _ = bot._risk_parameters("grid", "BTC")
             self.assertIn("交易结论：正常交易", risk)
+            self.assertIn("最终权限：BUY=放行 / SELL=放行", risk)
             self.assertIn("亏损阈值=6", risk)
             model, _ = bot._v22_model()
             self.assertIn("概率/阈值：0.2 / 0.5", model)
