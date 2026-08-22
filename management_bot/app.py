@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Optional
 
@@ -20,6 +21,7 @@ from management_bot.telegram_api import TelegramAPI, TelegramError
 
 logger = logging.getLogger("trading-management-bot")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 
 HOME_ROWS = [
@@ -52,6 +54,24 @@ def _quote_price(payload: dict, side: str) -> Decimal:
     return price
 
 
+def _quote_timestamp(payload: dict) -> Optional[float]:
+    for key in ("T", "E", "eventTime", "quoteTime", "updateTime", "timestamp", "time"):
+        value = payload.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+        if result > 10**12:
+            result /= 1000
+        return result
+    return None
+
+
 def _safe_text(value: Any, limit: int = 500) -> str:
     return str(value).replace("`", "'")[:limit]
 
@@ -73,6 +93,9 @@ def _state_cn(value: Any) -> str:
         "ACTIVE": "正常", "EXITING": "清仓中", "COOLDOWN": "冷却中",
         "REENTRY": "等待重入", "LATCHED": "锁存", "APPLIED": "已落地",
         "ALERT_ONLY": "提醒（不阻塞）", "LONG_ONLY": "只做多模式",
+        "MARKET_OPEN": "正常交易时段", "PRE_MARKET": "盘前",
+        "AFTER_HOURS": "盘后", "OVERNIGHT": "夜盘", "MARKET_CLOSED": "休市",
+        "TRADING": "可交易", "UNKNOWN": "未知",
         "N/A": "不适用",
     }.get(raw, str(value or "未知"))
 
@@ -601,8 +624,10 @@ class TradingManagementBot:
                 return self._limit_price_step(session)
             return self._stock_preview(session)
         if action == "price_latest":
-            self.store.update_session(sid, payload={"use_latest_price": True})
-            return self._stock_preview(self.store.get_session(sid) or session)
+            session = self._capture_latest_limit_price(session)
+            return self._stock_preview(session)
+        if action == "price_refresh":
+            return self._limit_price_step(session)
         if action == "confirm":
             return self._execute_stock(session)
         if action == "refresh":
@@ -624,18 +649,16 @@ class TradingManagementBot:
             session = self.store.update_session(sid, step="barriers", payload={
                 "order_type": value, "take_profit": "0.03", "stop_loss": "0.02", "days": "7",
             })
-            return (
-                "默认仓位参数：止盈3% / 止损2% / 最长7天",
-                [[("使用推荐值", f"w:{sid}:barriers:default"), ("自定义", f"w:{sid}:input:barriers")], [("取消", f"w:{sid}:cancel:-")]],
-            )
-        if action == "barriers":
-            session = self.store.get_session(sid) or session
-            if session["payload"]["order_type"] == "LIMIT":
+            if value == "LIMIT":
                 return self._limit_price_step(session)
-            return self._stock_preview(session)
-        if action == "price_latest":
-            self.store.update_session(sid, payload={"use_latest_price": True})
+            return self._position_barriers_step(session)
+        if action == "barriers":
             return self._stock_preview(self.store.get_session(sid) or session)
+        if action == "price_latest":
+            session = self._capture_latest_limit_price(session)
+            return self._position_barriers_step(session)
+        if action == "price_refresh":
+            return self._limit_price_step(session)
         if action == "confirm":
             return self._execute_stock(session)
         if action == "refresh":
@@ -645,7 +668,101 @@ class TradingManagementBot:
     def _limit_price_step(self, session: dict) -> tuple[str, list]:
         sid = session["session_id"]
         self.store.update_session(sid, step="price")
-        return "限价设置：", [[("使用最新报价", f"w:{sid}:price_latest:-"), ("自定义价格", f"w:{sid}:input:price")], [("取消", f"w:{sid}:cancel:-")]]
+        side = str(session["payload"].get("side", "BUY"))
+        context, quote = self._stock_quote_context(session["payload"]["symbol"], side)
+        reference = Decimal(str(quote["reference"]))
+        reference_label = "卖一" if side.upper() == "BUY" else "买一"
+        return (
+            f"限价设置\n\n{context}\n\n"
+            f"建议：{side.upper()} LIMIT 可从最新{reference_label}价开始判断；偏离盘口会影响成交速度。",
+            [[(f"按最新{reference_label} {reference}", f"w:{sid}:price_latest:-"),
+              ("自定义限价", f"w:{sid}:input:price")],
+             [("刷新行情", f"w:{sid}:price_refresh:-"), ("取消", f"w:{sid}:cancel:-")]],
+        )
+
+    def _stock_quote_context(self, symbol: str, side: str) -> tuple[str, dict]:
+        raw = self.stocks.quote(symbol)
+        bid = Decimal(str(raw.get("bidPrice", raw.get("bid", "0")) or "0"))
+        ask = Decimal(str(raw.get("askPrice", raw.get("ask", "0")) or "0"))
+        if bid <= 0 or ask <= 0 or ask < bid:
+            raise ValueError("最新Bid/Ask无效，暂时不能辅助定价")
+        mid = (bid + ask) / 2
+        spread = ask - bid
+        spread_pct = spread / mid * 100 if mid > 0 else Decimal("0")
+        quote_ts = _quote_timestamp(raw)
+        if quote_ts is None:
+            quote_time = datetime.now(BEIJING_TZ).strftime("查询于 %Y-%m-%d %H:%M:%S %z")
+            age_text = "交易所未提供事件时间，无法计算"
+        else:
+            quote_time = datetime.fromtimestamp(quote_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime(
+                "%Y-%m-%d %H:%M:%S %z"
+            )
+            age_text = f"{max(0, time.time() - quote_ts):.1f}秒"
+        try:
+            market = self.stocks.market_status(symbol)
+        except Exception:
+            market = {}
+        phase = _state_cn(market.get("market_phase", "未知"))
+        trading = _state_cn(market.get("trading_status", "未知"))
+        reference = ask if side.upper() == "BUY" else bid
+        text = (
+            f"📍 {symbol} 最新行情\n"
+            f"买一 Bid：{bid} USDC｜卖一 Ask：{ask} USDC\n"
+            f"中间价：{mid.quantize(Decimal('0.0001'))} USDC｜"
+            f"价差：{spread} USDC（{spread_pct.quantize(Decimal('0.0001'))}%）\n"
+            f"{side.upper()}参考价：{reference} USDC\n"
+            f"行情时间：{quote_time}｜数据年龄：{age_text}\n"
+            f"市场阶段：{phase}｜标的状态：{trading}"
+        )
+        return text, {
+            "bid": str(bid), "ask": str(ask), "mid": str(mid),
+            "reference": str(reference), "quote_ts": quote_ts,
+        }
+
+    def _capture_latest_limit_price(self, session: dict) -> dict:
+        side = str(session["payload"].get("side", "BUY"))
+        _, quote = self._stock_quote_context(session["payload"]["symbol"], side)
+        return self.store.update_session(session["session_id"], payload={
+            "price": quote["reference"],
+            "price_source": "latest_ask" if side.upper() == "BUY" else "latest_bid",
+            "quote_bid": quote["bid"], "quote_ask": quote["ask"],
+            "quote_ts": quote["quote_ts"],
+        })
+
+    def _position_barriers_step(self, session: dict) -> tuple[str, list]:
+        sid = session["session_id"]
+        session = self.store.update_session(sid, step="barriers")
+        data = session["payload"]
+        context, quote = self._stock_quote_context(data["symbol"], "BUY")
+        entry = Decimal(str(data.get("price", quote["ask"])))
+        amount = Decimal(str(data.get("amount_usdc", "100")))
+        tp = Decimal(str(data.get("take_profit", "0.03")))
+        sl = Decimal(str(data.get("stop_loss", "0.02")))
+        days = Decimal(str(data.get("days", "7")))
+        tp_price = entry * (1 + tp)
+        sl_price = entry * (1 - sl)
+        reward = amount * tp
+        risk = amount * sl
+        ratio = reward / risk if risk > 0 else Decimal("0")
+        entry_note = (
+            "LIMIT入场价" if data.get("order_type") == "LIMIT"
+            else "MARKET估算入场价（最终成交可能滑移）"
+        )
+        text = (
+            f"仓位退出参数\n\n{context}\n\n"
+            f"{entry_note}：{entry} USDC\n"
+            f"止盈3% → 约 {tp_price.quantize(Decimal('0.0001'))} USDC，"
+            f"预计 +{reward.quantize(Decimal('0.01'))} USDC\n"
+            f"止损2% → 约 {sl_price.quantize(Decimal('0.0001'))} USDC，"
+            f"预计 -{risk.quantize(Decimal('0.01'))} USDC\n"
+            f"预期盈亏比：{ratio.quantize(Decimal('0.01'))}:1｜最长持仓：{days}天\n\n"
+            "以上为价格辅助，不含跳空、滑点和费用；最终参数由Stock Runtime再次校验。"
+        )
+        return text, [
+            [("采用以上 3% / 2% / 7天", f"w:{sid}:barriers:default"),
+             ("自定义参数", f"w:{sid}:input:barriers")],
+            [("取消", f"w:{sid}:cancel:-")],
+        ]
 
     def _build_stock_request(self, session: dict) -> tuple[dict, Decimal]:
         data = session["payload"]
@@ -699,11 +816,14 @@ class TradingManagementBot:
         )
         notional = Decimal(request["amount"]) * price
         loss = notional * Decimal(str(request.get("stop_loss", "0")))
+        side = str(session["payload"].get("side", "BUY"))
+        quote_context, latest_quote = self._stock_quote_context(session["payload"]["symbol"], side)
         lines = [
             "✅ Stock 权威预检通过",
             f"股票：{session['payload']['symbol']} / {request.get('side', 'BUY')}",
             f"类型：{'OrderExecutor' if request_type == 'order' else 'PositionExecutor'} / "
             f"{session['payload'].get('order_type', 'LIMIT')}",
+            quote_context,
             f"数量：{request['amount']} 股",
             f"参考价格：{price} USDC",
             f"预计金额：{notional.quantize(Decimal('0.01'))} USDC",
@@ -711,8 +831,25 @@ class TradingManagementBot:
             "执行范围：PAPER（本地持久化撮合）",
             "不会发送Binance真实下单或撤单请求。",
         ]
+        if session["payload"].get("order_type") == "LIMIT":
+            latest_reference = Decimal(str(latest_quote["reference"]))
+            deviation = (price / latest_reference - 1) * 100 if latest_reference > 0 else Decimal("0")
+            lines.append(
+                f"限价相对最新{'卖一' if side.upper() == 'BUY' else '买一'}："
+                f"{deviation.quantize(Decimal('0.0001'))}%"
+            )
         if loss > 0:
             lines.append(f"止损最大估算：{loss.quantize(Decimal('0.01'))} USDC（不含跳空滑点）")
+        if request_type == "position":
+            take_profit = Decimal(str(request.get("take_profit", "0")))
+            stop_loss = Decimal(str(request.get("stop_loss", "0")))
+            lines.extend([
+                f"止盈触发参考：{(price * (1 + take_profit)).quantize(Decimal('0.0001'))} USDC "
+                f"（+{take_profit * 100}%）",
+                f"止损触发参考：{(price * (1 - stop_loss)).quantize(Decimal('0.0001'))} USDC "
+                f"（-{stop_loss * 100}%）",
+                f"最长持仓：{Decimal(request['time_limit']) / Decimal(86400)}天",
+            ])
         lines.append("确认后由 Stock Runtime 再次执行同一套校验。")
         return "\n".join(lines), [[("✅ 确认创建", f"w:{session['session_id']}:confirm:-"), ("取消", f"w:{session['session_id']}:cancel:-")]]
 
@@ -968,6 +1105,8 @@ class TradingManagementBot:
             if step == "input_price":
                 _d(text)
                 session = self.store.update_session(sid, payload={"price": text})
+                if flow == "stock_position":
+                    return self._position_barriers_step(session)
                 return self._stock_preview(session)
             if step == "input_barriers":
                 parts = [part.strip() for part in text.replace("，", ",").split(",")]
@@ -979,8 +1118,6 @@ class TradingManagementBot:
                 session = self.store.update_session(sid, payload={
                     "take_profit": str(tp / 100), "stop_loss": str(sl / 100), "days": str(days),
                 })
-                if session["payload"].get("order_type") == "LIMIT":
-                    return self._limit_price_step(session)
                 return self._stock_preview(session)
         if flow == "whitelist_input":
             parts = text.upper().split()
@@ -1274,7 +1411,20 @@ class TradingManagementBot:
                         "amount": "请输入USDC金额：", "shares": "请输入股数：", "price": "请输入限价：",
                         "barriers": "请输入：止盈%,止损%,持仓天数，例如 3,2,7",
                     }
-                    text, rows = prompts[value], [[("取消", f"w:{sid}:cancel:-")]]
+                    if value == "price":
+                        side = str(session["payload"].get("side", "BUY"))
+                        context, _ = self._stock_quote_context(session["payload"]["symbol"], side)
+                        text = f"{context}\n\n请输入自定义LIMIT入场价（USDC）："
+                    elif value == "barriers" and session["flow"] == "stock_position":
+                        context, quote = self._stock_quote_context(session["payload"]["symbol"], "BUY")
+                        entry = session["payload"].get("price", quote["ask"])
+                        text = (
+                            f"{context}\n\n当前入场参考：{entry} USDC\n"
+                            "请输入：止盈%,止损%,持仓天数，例如 3,2,7"
+                        )
+                    else:
+                        text = prompts[value]
+                    rows = [[("取消", f"w:{sid}:cancel:-")]]
                 elif session["flow"] == "stock_order":
                     text, rows = self._stock_order_step(session, action, value)
                 else:

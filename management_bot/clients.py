@@ -120,6 +120,10 @@ class StocksClient(JsonClient):
         value = self.request("GET", f"/stocks/quotes/{symbol}")
         return value if isinstance(value, dict) else {}
 
+    def market_status(self, symbol: str) -> dict:
+        value = self.request("GET", f"/stocks/market-status/{symbol}")
+        return value if isinstance(value, dict) else {}
+
     def preview(self, config: dict) -> dict:
         return self.request("POST", "/stocks/executors/preview", {
             "executor_config": config,

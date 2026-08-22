@@ -173,7 +173,13 @@ class FakeStocks:
         return [{"symbol": "AAPL", "enabled": True, "max_position_notional": "200"}]
 
     def quote(self, _symbol):
-        return {"bidPrice": "199", "askPrice": "200"}
+        return {"bidPrice": "199", "askPrice": "200", "eventTime": int(time.time() * 1000)}
+
+    def market_status(self, _symbol):
+        return {
+            "market_phase": "MARKET_OPEN", "trading_status": "TRADING",
+            "tradability": "BUY_SELL", "quote_fresh": True,
+        }
 
     def preview(self, config):
         return {"allowed": True, "fee_reserve": "0.35", "executor_id": config["id"]}
@@ -356,6 +362,61 @@ class TelegramFlowTests(TestCase):
             self.assertIn("PAPER创建请求已处理", result)
             self.assertEqual("order", bot.stocks.created[0][0])
             self.assertNotIn("connector_name", bot.stocks.created[0][1])
+            bot.store.close()
+
+    def test_position_limit_wizard_uses_live_quote_and_price_based_risk_preview(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True)
+            _, rows = bot._new_stock_session("stock_position", 7, 7, 11)
+            sid = rows[0][0][1].split(":")[1]
+            bot._stock_position_step(bot.store.get_session(sid), "symbol", "AAPL")
+            bot._stock_position_step(bot.store.get_session(sid), "amount", "100")
+            price_step, price_rows = bot._stock_position_step(
+                bot.store.get_session(sid), "entry", "LIMIT"
+            )
+            self.assertIn("AAPL 最新行情", price_step)
+            self.assertIn("买一 Bid：199", price_step)
+            self.assertIn("卖一 Ask：200", price_step)
+            self.assertIn("行情时间：", price_step)
+            self.assertIn("按最新卖一 200", price_rows[0][0][0])
+
+            barrier_step, _ = bot._stock_position_step(
+                bot.store.get_session(sid), "price_latest", "-"
+            )
+            self.assertIn("LIMIT入场价：200", barrier_step)
+            self.assertIn("止盈3% → 约 206.0000", barrier_step)
+            self.assertIn("止损2% → 约 196.0000", barrier_step)
+            self.assertIn("预期盈亏比：1.50:1", barrier_step)
+
+            preview, _ = bot._stock_position_step(
+                bot.store.get_session(sid), "barriers", "default"
+            )
+            self.assertIn("止盈触发参考：206.0000", preview)
+            self.assertIn("止损触发参考：196.0000", preview)
+            self.assertIn("限价相对最新卖一：0.0000%", preview)
+            session = bot.store.get_session(sid)
+            self.assertEqual("200", session["payload"]["request"]["entry_price"])
+            result, _ = bot._stock_position_step(session, "confirm", "-")
+            self.assertIn("PAPER创建请求已处理", result)
+            self.assertEqual("position", bot.stocks.created[0][0])
+            bot.store.close()
+
+    def test_custom_limit_input_prompt_contains_current_market_reference(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            _, rows = bot._new_stock_session("stock_position", 7, 7, 11)
+            sid = rows[0][0][1].split(":")[1]
+            bot._stock_position_step(bot.store.get_session(sid), "symbol", "AAPL")
+            bot._stock_position_step(bot.store.get_session(sid), "amount", "100")
+            bot._stock_position_step(bot.store.get_session(sid), "entry", "LIMIT")
+            session = bot.store.get_session(sid)
+            bot.store.update_session(sid, step="input_price")
+            context, _ = bot._stock_quote_context(session["payload"]["symbol"], "BUY")
+            prompt = f"{context}\n\n请输入自定义LIMIT入场价（USDC）："
+            self.assertIn("买一 Bid：199", prompt)
+            self.assertIn("卖一 Ask：200", prompt)
+            self.assertIn("价差：1", prompt)
+            self.assertIn("数据年龄：", prompt)
             bot.store.close()
 
     def test_callback_data_stays_below_telegram_limit(self):
