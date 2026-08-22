@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -276,3 +277,86 @@ class OperationsReportReader:
         if age > self.max_age_seconds:
             raise ServiceError(f"收益快照已过期（{int(age)}秒）")
         return {"observed_at": newest, "age_seconds": max(0.0, age), "robots": result}
+
+
+class ParameterCatalogReader:
+    """Read the report service's sanitized parameter and evidence contracts."""
+
+    def __init__(self, catalog_path: Path, evidence_catalog_path: Path,
+                 report_root: Path, max_age_seconds: int = 300):
+        self.catalog_path = catalog_path
+        self.evidence_catalog_path = evidence_catalog_path
+        self.report_root = report_root.resolve()
+        self.max_age_seconds = max_age_seconds
+
+    @staticmethod
+    def _load(path: Path) -> dict:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ServiceError(f"参数合同不可用：{type(exc).__name__}") from exc
+        if not isinstance(value, dict):
+            raise ServiceError("参数合同格式无效")
+        return value
+
+    @staticmethod
+    def _iso_timestamp(value: Any) -> float:
+        text = str(value or "").strip()
+        if not text:
+            return 0.0
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+    def catalog(self) -> dict:
+        value = self._load(self.catalog_path)
+        generated = self._iso_timestamp(value.get("generated_at"))
+        age = time.time() - generated if generated else float("inf")
+        if age > self.max_age_seconds:
+            raise ServiceError(f"参数合同已过期（{int(age)}秒）")
+        value["age_seconds"] = max(0.0, age)
+        return value
+
+    def evidence(self) -> dict:
+        return self._load(self.evidence_catalog_path)
+
+    def evidence_set(self, set_id: str) -> Optional[dict]:
+        return next((item for item in self.evidence().get("sets", [])
+                     if item.get("evidence_set_id") == set_id), None)
+
+    def attachment(self, set_id: str, strategy: str, asset: str, window: str) -> dict:
+        evidence = self.evidence_set(set_id)
+        if not evidence:
+            raise ServiceError("证据集不存在")
+        item = next((row for row in evidence.get("attachments", [])
+                     if row.get("strategy") == strategy
+                     and str(row.get("pair", "")).split("-", 1)[0] == asset
+                     and row.get("window") == window), None)
+        if not item:
+            raise ServiceError("所选证据图片不存在")
+        path = (self.report_root / str(item.get("relative_path", ""))).resolve()
+        try:
+            path.relative_to(self.report_root)
+        except ValueError as exc:
+            raise ServiceError("证据路径越界") from exc
+        if not path.is_file():
+            raise ServiceError("证据文件缺失")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != item.get("sha256"):
+            raise ServiceError("证据文件哈希不匹配")
+        return {**item, "path": str(path), "notice": evidence.get("notice")}
+
+    def history(self, digest_prefix: str) -> dict:
+        catalog = self.catalog()
+        match = next((item for item in catalog.get("history", [])
+                      if str(item.get("catalog_sha256", "")).startswith(digest_prefix)), None)
+        if not match:
+            raise ServiceError("历史参数版本不存在")
+        digest = str(match["catalog_sha256"])
+        path = (self.report_root / "management" / "history" / f"{digest}.json").resolve()
+        try:
+            path.relative_to(self.report_root)
+        except ValueError as exc:
+            raise ServiceError("历史参数路径越界") from exc
+        return self._load(path)

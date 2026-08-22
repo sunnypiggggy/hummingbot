@@ -20,6 +20,7 @@ COPY live_guard/dca_live_report.py /app/dca_live_report.py
 COPY live_guard/telegram_notifications.py /app/telegram_notifications.py
 COPY live_guard/telegram_parameter_report.py /app/telegram_parameter_report.py
 COPY live_guard/trading_status.py /app/trading_status.py
+COPY live_guard/management_parameters.py /app/management_parameters.py
 COPY scripts/render_v22_backtest_png_windows.py /app/render_v22_backtest_png_windows.py
 
 CMD ["python", "/app/dca_live_guard.py"]

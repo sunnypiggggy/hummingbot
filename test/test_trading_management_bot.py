@@ -157,6 +157,68 @@ class FakeTelegram:
     def answer_callback(self, callback_id, text="", alert=False):
         self.answers.append((callback_id, text, alert))
 
+    def send_file(self, chat_id, path, caption=""):
+        self.sent.append((chat_id, caption, path))
+        return {"message_id": 2}
+
+
+class FakeParameters:
+    def catalog(self):
+        return {
+            "age_seconds": 2,
+            "catalog_sha256": "f" * 64,
+            "grid": {
+                "application_state": "APPLIED", "configured_sha256": "1" * 64,
+                "runtime_sha256": "2" * 64,
+                "configured": {"pair_budget_quote": 200, "side_budget_quote": 100,
+                               "grid_range": .06, "grid_levels": 10, "take_profit": .006,
+                               "move_threshold": .015, "min_grid_move_seconds": 1800,
+                               "order_refresh_time": 7200, "min_order_quote": 5.25,
+                               "fee_rate": 0},
+                "runtime": {"active_parameter_version": "fixed-v1"},
+                "pairs": {"BTC-FDUSD": {"effective": {}}, "ETH-FDUSD": {"effective": {}}},
+            },
+            "dca": {
+                "BTC-USDT": {"application_state": "APPLIED", "parameter_sha256": "3" * 64,
+                             "effective": {"total_amount_quote": 190,
+                                           "dca_spreads": [.01, .02, .04, .08],
+                                           "dca_amounts": [.1, .2, .3, .4],
+                                           "take_profit": .02, "stop_loss": .05,
+                                           "executor_refresh_time": 18000,
+                                           "time_limit": 18000, "cooldown_time": 15,
+                                           "long_only_enabled": True}},
+                "ETH-USDT": {"application_state": "APPLIED", "parameter_sha256": "4" * 64,
+                             "effective": {}},
+            },
+            "risks": {"grid": {"parameters": {"strategy_loss_breaker": {
+                "loss_limit_quote": "6", "cooldown_seconds": 21600,
+            }}}, "dca": {"parameters": {}}, "current": {
+                "grid:BTC-FDUSD": {"trading_normal": True,
+                    "final_permissions": {"buy": True, "sell": True},
+                    "gates": [{"mechanism": "strategy_loss_breaker",
+                               "label": "策略亏损熔断", "enabled": True,
+                               "state": "ALLOW", "buy_enabled": True, "sell_enabled": True}]},
+            }},
+            "models": {"active": {"release_sha256": "a" * 64,
+                "runtime_generation": "b" * 64, "model_sha256": "c" * 64,
+                "feature_schema_sha256": "d" * 64, "valid_until": "2026-08-23T00:00:00Z",
+                "cutover_phase": "ACTIVE", "pairs": {"BTC-FDUSD": {
+                    "model_signal": "RISK_ON", "probability": .2,
+                    "entry_threshold": .5, "model_week": 39}}},
+                "candidate": [{"release_sha256": "e" * 64, "status": "PENDING"}],
+                "history": [{"release_sha256": "9" * 64, "effective_end": 1}]},
+            "history": [{"catalog_sha256": "8" * 64,
+                         "recorded_at": "2026-08-22T00:00:00Z"}],
+        }
+
+    def evidence(self):
+        return {"sets": []}
+
+    def history(self, _digest):
+        value = self.catalog()
+        return {"recorded_at": "2026-08-22T00:00:00Z", "catalog_sha256": "8" * 64,
+                "grid": value["grid"], "dca": value["dca"], "models": value["models"]}
+
 
 class FakeStocks:
     def __init__(self):
@@ -536,6 +598,30 @@ class TelegramFlowTests(TestCase):
             for row in bot._risk_rows():
                 for _, callback in row:
                     self.assertLessEqual(len(callback.encode()), 64)
+            bot.store.close()
+
+    def test_models_and_parameters_are_read_only_inline_pages(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.parameters = FakeParameters()
+            menu, rows = bot._models()
+            self.assertIn("模型与参数（只读）", menu)
+            self.assertIn("最近历史版本：1", menu)
+            self.assertTrue(any(callback == "p:grid" for row in rows for _, callback in row))
+            grid, _ = bot._grid_parameters("BTC")
+            self.assertIn("Grid总范围：6.0000%", grid)
+            self.assertIn("Maker费用：0.0000%", grid)
+            dca, _ = bot._dca_parameters("BTC")
+            self.assertIn("止损：5.0000%", dca)
+            risk, _ = bot._risk_parameters("grid", "BTC")
+            self.assertIn("交易结论：正常交易", risk)
+            self.assertIn("亏损阈值=6", risk)
+            model, _ = bot._v22_model()
+            self.assertIn("概率/阈值：0.2 / 0.5", model)
+            history, _ = bot._parameter_versions()
+            self.assertIn("最近3个版本", history)
+            for _, callback in [button for row in rows for button in row]:
+                self.assertLessEqual(len(callback.encode()), 64)
             bot.store.close()
 
 

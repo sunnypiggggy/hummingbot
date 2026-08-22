@@ -64,6 +64,9 @@ class Settings:
     host_proc_uptime_path: Path = Path("/host-metrics/proc/uptime")
     host_root_disk_path: Path = Path("/host-metrics/root-disk")
     host_extra_disk_path: Path = Path("/host-metrics/extra-disk")
+    parameter_catalog_path: Path = Path("/reports/management_parameter_catalog.json")
+    model_evidence_catalog_path: Path = Path("/reports/model_evidence_catalog.json")
+    reports_root: Path = Path("/reports")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -128,6 +131,13 @@ class Settings:
             host_extra_disk_path=Path(os.getenv(
                 "HOST_EXTRA_DISK_PATH", "/host-metrics/extra-disk"
             )),
+            parameter_catalog_path=Path(os.getenv(
+                "MANAGEMENT_PARAMETER_CATALOG_PATH", "/reports/management_parameter_catalog.json"
+            )),
+            model_evidence_catalog_path=Path(os.getenv(
+                "MODEL_EVIDENCE_CATALOG_PATH", "/reports/model_evidence_catalog.json"
+            )),
+            reports_root=Path(os.getenv("MANAGEMENT_REPORTS_ROOT", "/reports")),
         )
 
     def read_token(self) -> str:

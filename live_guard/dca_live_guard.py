@@ -64,6 +64,8 @@ except ModuleNotFoundError:
 from risk_recovery import (
     ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
     EMERGENCY_ESCALATION_SECONDS, EXIT_CRITICAL_SECONDS,
+    POSITION_COOLDOWN_SECONDS, PORTFOLIO_COOLDOWN_SECONDS,
+    REQUIRED_HEALTHY_CYCLES, STRATEGY_COOLDOWN_SECONDS,
     advance_integrity_failure, advance_recovery, active_state,
     mark_exit_complete, mark_reentry_complete, normalize_state, trigger_state,
 )
@@ -643,6 +645,44 @@ class Guard:
             }
         state["version"] = 2
         state["mechanisms"] = dict(self.mechanisms)
+        state["mechanism_parameters"] = {
+            "v22_weekly_buy_gate": {
+                "update_cycle": "weekly", "contract_max_age_seconds": self.v21_max_age_seconds,
+                "scope": "ordinary_buy_only", "threshold_source": "fold_local_signed_model",
+            },
+            "fomc_gate": {
+                "contract_max_age_seconds": self.macro_max_age_seconds,
+                "scope": "configured_direction",
+            },
+            "strategy_loss_breaker": {
+                "loss_limit_quote": str(SINGLE_BOT_LOSS_LIMIT), "quote_asset": "USDT",
+                "cooldown_seconds": STRATEGY_COOLDOWN_SECONDS,
+            },
+            "strategy_drawdown_breaker": {
+                "drawdown_limit_pct": str(self.strategy_drawdown_limit),
+                "cooldown_seconds": STRATEGY_COOLDOWN_SECONDS,
+            },
+            "portfolio_loss_breaker": {
+                "loss_limit_quote": str(COMBINED_LOSS_LIMIT), "quote_asset": "USDT",
+                "cooldown_seconds": PORTFOLIO_COOLDOWN_SECONDS,
+            },
+            "portfolio_drawdown_breaker": {
+                "drawdown_limit_pct": str(self.portfolio_drawdown_limit),
+                "cooldown_seconds": PORTFOLIO_COOLDOWN_SECONDS,
+            },
+            "position_protection": {
+                "stop_loss_pct": "0.05", "cooldown_seconds": POSITION_COOLDOWN_SECONDS,
+                "healthy_cycles_before_reentry": REQUIRED_HEALTHY_CYCLES,
+            },
+            "capital_budget_gate": {
+                "mode": "alert_only", "strategy_budget_quote": str(STRATEGY_BUDGET_QUOTE),
+                "quote_asset": "USDT",
+            },
+            "infrastructure_integrity_breaker": {
+                "fail_closed_seconds": self.fail_closed_seconds,
+                "auto_recovery": False,
+            },
+        }
         for bot in state.get("bots", {}).values():
             bot["recovery"] = normalize_state(bot.get("recovery"))
         return state

@@ -75,6 +75,23 @@ Stock PAPER收益独立读取 Stock Runtime 的 `GET /stocks/paper/summary`：
 当前是否受限。总览展示正常交易、BUY/SELL和恢复阶段；BTC/ETH独立详情页
 展示全部实际生效门控。账户整体健康值不会覆盖最终库存归属门的结论。
 
+## 模型与参数只读合同
+
+“模型与参数”读取 `dca-live-report` 每分钟原子生成的
+`management_parameter_catalog.json`，不直接挂载机器人配置、connector配置或密钥。
+页面通过Inline向导分别展示Grid、DCA、风控门、v22现网模型、候选及最近3个
+内容寻址历史版本。配置值和运行时值同时存在时必须核对；不一致显示“配置与运行
+不一致”，不能将YAML默认值描述成已生效参数。
+
+Guard在各自状态合同的 `mechanism_parameters` 中发布脱敏阈值、冷却和恢复规则；
+`trading_status.json` 继续提供实时状态和最终BUY/SELL权限。管理Bot只读展示，任何
+参数修改和模型审批仍由原有独立流程处理。
+
+v22 PNG/PDF先由报告服务依据manifest和SHA256验证，再复制到管理专用公开目录，
+并写入 `model_evidence_catalog.json`。Bot只允许从该索引选择
+`Grid/DCA → BTC/ETH → 360天/1–2月/5–6月`。证据模型哈希与当前模型不同的图片
+明确标注“历史覆盖证据，不是当前模型精确回放”；缺失或哈希错误不会借用旧图。
+
 ## Stock 接口合同
 
 Stock Runtime提供以下受控接口：

@@ -42,6 +42,10 @@ try:
     from trading_status import evaluate_status, gate_row
 except ModuleNotFoundError:
     from live_guard.trading_status import evaluate_status, gate_row
+try:
+    from management_parameters import ManagementParameterPublisher
+except ModuleNotFoundError:
+    from live_guard.management_parameters import ManagementParameterPublisher
 
 try:
     from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE
@@ -960,6 +964,16 @@ class UnifiedTelegramReporting:
         self.parameter_worker = ParameterReportWorker(
             root=self.output, release_root=self.release_root, outbox=self.outbox,
         )
+        self.management_parameters = ManagementParameterPublisher(
+            bots_path=self.bots_path,
+            dca_state=self.dca_state,
+            grid_state=self.grid_state,
+            release_root=self.release_root,
+            approval_root=Path(os.getenv(
+                "MODEL_APPROVAL_PUBLIC_ROOT", "/workspace/model-approvals",
+            )),
+            output=self.output,
+        )
         self.enabled = os.getenv("TELEGRAM_NOTIFY_ENABLED", "false").lower() == "true"
         self.profit_enabled = os.getenv(
             "TELEGRAM_PROFIT_REPORT_ENABLED", "true"
@@ -1497,6 +1511,9 @@ class UnifiedTelegramReporting:
     def cycle(self, report: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
         robots = self.update_snapshots(report, now)
+        parameter_catalog = self.management_parameters.publish(
+            [item["trading_status"] for item in robots], now=now,
+        )
         due, slot = self.outbox.slot_due(now=now)
         if self.enabled and self.profit_enabled and due:
             self._queue_profit_report(robots, slot, now)
@@ -1510,6 +1527,7 @@ class UnifiedTelegramReporting:
         evidence_receipts = self.parameter_worker.finalize_delivery_receipts()
         return {"enabled": self.enabled, "sent": sent, **self.outbox.health(),
                 "slot": slot, "parameter_worker": worker,
+                "parameter_catalog_sha256": parameter_catalog["catalog_sha256"],
                 "evidence_receipts_written": evidence_receipts}
 
 

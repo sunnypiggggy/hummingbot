@@ -19,7 +19,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from grid_live_common import PORTFOLIO_DRAWDOWN_LIMIT_PCT, PORTFOLIOS, budget_for_quote
+from grid_live_common import (
+    PAIR_DRAWDOWN_LIMIT_PCT, PORTFOLIO_DRAWDOWN_LIMIT_PCT, PORTFOLIOS,
+    budget_for_quote,
+)
 from grid_xgboost_risk_gate import MODEL_VERSION as XGBOOST_MODEL_VERSION
 from grid_xgboost_risk_gate import SCHEMA as XGBOOST_GATE_SCHEMA
 from grid_xgboost_risk_gate import atomic_json as atomic_gate_json
@@ -34,6 +37,9 @@ from ethbtc_forced_exit_contract import (
 from risk_recovery import (
     EMERGENCY_ESCALATION_SECONDS,
     EXITING,
+    PORTFOLIO_COOLDOWN_SECONDS,
+    REQUIRED_HEALTHY_CYCLES,
+    STRATEGY_COOLDOWN_SECONDS,
     advance_integrity_failure,
 )
 try:
@@ -407,6 +413,39 @@ class Guard:
             "v22_package_id": V22_PACKAGE_ID,
             "fdusd_external_breakers_enabled": self.fdusd_external_breakers_enabled,
         })
+        fdusd_budget = budget_for_quote("FDUSD")
+        self.state["mechanism_parameters"] = {
+            "v22_weekly_buy_gate": {
+                "update_cycle": "weekly", "contract_max_age_seconds": 150,
+                "scope": "ordinary_buy_only", "threshold_source": "fold_local_signed_model",
+            },
+            "fomc_gate": {
+                "contract_max_age_seconds": 150, "scope": "configured_direction",
+            },
+            "strategy_loss_breaker": {
+                "loss_limit_quote": str(fdusd_budget.pair_loss_limit), "quote_asset": "FDUSD",
+                "cooldown_seconds": STRATEGY_COOLDOWN_SECONDS,
+            },
+            "strategy_drawdown_breaker": {
+                "drawdown_limit_pct": str(PAIR_DRAWDOWN_LIMIT_PCT),
+                "cooldown_seconds": STRATEGY_COOLDOWN_SECONDS,
+            },
+            "portfolio_loss_breaker": {
+                "loss_limit_quote": str(fdusd_budget.portfolio_loss_limit), "quote_asset": "FDUSD",
+                "cooldown_seconds": PORTFOLIO_COOLDOWN_SECONDS,
+            },
+            "portfolio_drawdown_breaker": {
+                "drawdown_limit_pct": str(PORTFOLIO_DRAWDOWN_LIMIT_PCT),
+                "cooldown_seconds": PORTFOLIO_COOLDOWN_SECONDS,
+            },
+            "position_protection": {
+                "maximum_extra_inventory_hold_seconds": 48 * 60 * 60,
+                "healthy_cycles_before_reentry": REQUIRED_HEALTHY_CYCLES,
+            },
+            "infrastructure_integrity_breaker": {
+                "fail_closed_seconds": self.fail_closed_seconds, "auto_recovery": False,
+            },
+        }
         emergency_error = None
         shadow_preflight = None
         if (self.shadow or self.armed) and self.emergency_exchange is not None:

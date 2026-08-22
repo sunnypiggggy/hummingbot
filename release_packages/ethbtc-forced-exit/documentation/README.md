@@ -16,6 +16,7 @@ OCI 运维见 [TELEGRAM_NOTIFICATIONS.md](TELEGRAM_NOTIFICATIONS.md)。
 - [CONTAINERS_AND_SIGNAL_FLOW.md](CONTAINERS_AND_SIGNAL_FLOW.md)：OCI 实际运行容器、启动/信号/应急/观测依赖、唯一 producer、故障域与恢复顺序。
 - [RISK_MECHANISMS.md](RISK_MECHANISMS.md)：Grid/DCA 七类风控、阈值、作用范围和开关。
 - [V22_WEEKLY_MODEL.md](V22_WEEKLY_MODEL.md)：v22 周度模型、阈值、状态连续性、训练防泄漏和 Fail-Closed。
+- [TELEGRAM_MODEL_PARAMETERS.md](TELEGRAM_MODEL_PARAMETERS.md)：管理Bot的Grid/DCA/风控参数与v22证据只读合同。
 - [WEEKLY_APPROVAL_NOTIFICATIONS.md](WEEKLY_APPROVAL_NOTIFICATIONS.md)：每周候选、默认审批、原子切换时间及 12 张回测 PNG 的同步通知链路。
 - [V22_ZERO_DOWNTIME_CUTOVER.md](V22_ZERO_DOWNTIME_CUTOVER.md)：两阶段预热、事务型 runtime generation、周状态继承、失败回滚与统一交易状态。
 - [FORCED_EXIT_AND_RECOVERY.md](FORCED_EXIT_AND_RECOVERY.md)：强制退出、双通道接管、冷却、自动重入和人工解锁。
