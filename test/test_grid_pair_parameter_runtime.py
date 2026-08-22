@@ -82,6 +82,21 @@ class PairParameterRuntimeTest(unittest.TestCase):
         self.assertTrue(all(price * amount >= Decimal("11") for price, amount in orders))
         self.assertLessEqual(sum(price * amount for price, amount in orders), Decimal("35"))
 
+    def test_eth_single_layer_uses_executable_minimum_instead_of_overspending(self):
+        # 2026-08-22 live incident: using the full 11.223 FDUSD layer budget
+        # rounds 0.00464 ETH up to 0.0047 and overspends.  A 0.0042 ETH order
+        # clears the 10 FDUSD minimum and must be retained.
+        price = Decimal("2418.22")
+        budget = Decimal("11.223135676")
+        orders = clip_quantized_buy_levels(
+            [price], budget, Decimal("10"), lambda value: value,
+            self.quantizer(Decimal("0.0001")),
+            amount_step=Decimal("0.0001"), minimum_amount=Decimal("0.0001"),
+        )
+        self.assertEqual([(price, Decimal("0.0046"))], orders)
+        self.assertGreaterEqual(price * orders[0][1], Decimal("10"))
+        self.assertLessEqual(price * orders[0][1], budget)
+
     def test_buy_builder_returns_explicit_empty_below_minimum_budget(self):
         self.assertEqual([], clip_quantized_buy_levels(
             [Decimal("70000")], Decimal("9.99"), Decimal("10"), lambda value: value,

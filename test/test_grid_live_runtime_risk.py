@@ -12,7 +12,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from grid_live_common import PairLedger  # noqa: E402
-from walk_forward_portfolio_grid_live import GridState, LivePortfolioGrid  # noqa: E402
+from walk_forward_portfolio_grid_live import (  # noqa: E402
+    GridState,
+    LivePortfolioGrid,
+    ParameterBuildError,
+)
 from risk_recovery import ACTIVE, EXITING, REENTRY, active_state, normalize_state, trigger_state  # noqa: E402
 
 
@@ -178,6 +182,75 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertLessEqual(total, Decimal("100"))
         self.assertEqual(Decimal("100") - total, remaining)
         self.assertEqual("HEALTHY", strategy.order_build_status["BTC-FDUSD"]["state"])
+
+    def test_eth_single_layer_incident_builds_without_exceeding_budget(self):
+        strategy = self.strategy()
+        strategy.pair_parameters["ETH-FDUSD"].update({
+            "profile": "long_volatility",
+            "minimum_order_quote": Decimal("10"),
+        })
+        strategy.connector.trading_rules = {
+            "ETH-FDUSD": SimpleNamespace(
+                min_notional_size=Decimal("10"),
+                min_base_amount_increment=Decimal("0.0001"),
+                min_order_size=Decimal("0.0001"),
+            )
+        }
+        strategy.connector.quantize_order_amount = lambda pair, amount: (
+            (Decimal(amount) / Decimal("0.0001")).to_integral_value(
+                rounding=ROUND_DOWN
+            ) * Decimal("0.0001")
+        )
+        strategy.connector.quantize_order_price = lambda pair, order_price: (
+            Decimal(order_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        )
+
+        budget = Decimal("11.223135676")
+        orders = strategy._build_buy_orders(
+            "ETH-FDUSD", [Decimal("2418.22")], budget,
+        )
+
+        self.assertEqual(1, len(orders))
+        self.assertGreaterEqual(orders[0][0] * orders[0][1], Decimal("10"))
+        self.assertLessEqual(orders[0][0] * orders[0][1], budget)
+
+    def test_buy_build_failure_preserves_safe_sell_side_and_remains_degraded(self):
+        strategy = self.strategy()
+        pair = "ETH-FDUSD"
+        price = Decimal("2418.22")
+        strategy.grid_states[pair] = strategy._new_grid(pair, price)
+        strategy._build_buy_orders = lambda *args, **kwargs: []
+        strategy._build_sell_orders = lambda *args, **kwargs: [
+            (Decimal("2500"), Decimal("0.004")),
+        ]
+        submitted_sells = []
+        strategy.buy = lambda *args, **kwargs: self.fail("unexpected buy")
+        strategy.sell = lambda exchange, trading_pair, amount, order_type, order_price: (
+            submitted_sells.append((trading_pair, amount, order_price)) or "sell-safe"
+        )
+
+        with self.assertRaisesRegex(ParameterBuildError, "BUY build produced no executable"):
+            strategy._place_pair_grid(pair, price, Decimal("100"))
+
+        self.assertEqual([(pair, Decimal("0.004"), Decimal("2500"))], submitted_sells)
+        status = strategy.order_build_status[pair]
+        self.assertGreaterEqual(status["expected_buy_layers"], 1)
+        self.assertEqual(1, status["expected_sell_layers"])
+        self.assertEqual(0, status["actual_buy_layers"])
+        self.assertEqual(1, status["actual_sell_layers"])
+
+        status.update({
+            "state": "RETRYING", "consecutive_empty_cycles": 3,
+            "first_empty_at": 900.0, "first_failure_at": 900.0,
+            "next_retry_at": 999.0, "retry_count": 1,
+        })
+        rebuilt = []
+        strategy._place_pair_grid = lambda *args: rebuilt.append(args) or Decimal("0")
+        strategy._check_order_liveness_and_rebuild(
+            {"BTC-FDUSD": Decimal("71532"), pair: price},
+            [Order("sell-safe", pair)],
+        )
+        self.assertEqual(pair, rebuilt[0][0])
 
     def test_targeted_btc_rebuild_does_not_touch_eth_orders(self):
         strategy = self.strategy()

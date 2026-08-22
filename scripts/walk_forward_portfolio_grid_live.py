@@ -1029,7 +1029,11 @@ class LivePortfolioGrid(StrategyV2Base):
                 status["consecutive_empty_cycles"] = 0
                 status["first_empty_at"] = None
                 continue
-            if actual > 0:
+            order_set_complete = (
+                buy_count >= int(status.get("expected_buy_layers", 0))
+                and sell_count >= int(status.get("expected_sell_layers", 0))
+            )
+            if order_set_complete and actual > 0:
                 if status.get("state") in {"MISSING", "RETRYING", "RESTRICTED"}:
                     self._mark_order_build_healthy(
                         pair, expected_buy=int(status.get("expected_buy_layers", 0)),
@@ -1124,6 +1128,7 @@ class LivePortfolioGrid(StrategyV2Base):
         minimum_order_quote = self._pair_minimum_order_quote(pair)
         amount_step, _ = self._pair_amount_filters(pair)
         buy_orders: List[tuple[Decimal, Decimal]] = []
+        buy_build_error: Optional[str] = None
         if lower_levels and self.technical_buy_enabled_by_pair.get(pair, False):
             buy_orders = self._build_buy_orders(pair, lower_levels, buy_budget)
             if buy_budget >= minimum_order_quote and not buy_orders:
@@ -1133,10 +1138,9 @@ class LivePortfolioGrid(StrategyV2Base):
                     "minimum_order_quote": str(minimum_order_quote),
                     "amount_step": str(amount_step),
                 })
-                raise ParameterBuildError(
-                    pair,
+                buy_build_error = (
                     f"BUY build produced no executable order: price={price} "
-                    f"budget={buy_budget} minimum={minimum_order_quote} step={amount_step}",
+                    f"budget={buy_budget} minimum={minimum_order_quote} step={amount_step}"
                 )
         submitted_quote = Decimal("0")
         submitted_buy = 0
@@ -1171,6 +1175,21 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.sell_order_ids.add(order_id)
         expected_buy = len(buy_orders)
         expected_sell = len(sell_orders)
+        if buy_build_error is not None:
+            # Preserve and execute the safe SELL side even if a future exchange
+            # filter combination makes the BUY side temporarily unbuildable.
+            # Persist the missing BUY expectation so liveness recovery does not
+            # mistake the surviving SELL orders for a healthy complete set.
+            status = self._order_status(pair)
+            status.update({
+                "expected_buy_layers": min(
+                    len(lower_levels), int(buy_budget // minimum_order_quote),
+                ),
+                "expected_sell_layers": expected_sell,
+                "actual_buy_layers": submitted_buy,
+                "actual_sell_layers": expected_sell,
+            })
+            raise ParameterBuildError(pair, buy_build_error)
         if expected_buy + expected_sell == 0:
             reason = (
                 "technical_buy_gate_blocks_buy" if not self.technical_buy_enabled_by_pair.get(pair, False)

@@ -312,11 +312,15 @@ def clip_quantized_buy_levels(
     initial_count = len(candidates)
     if initial_count == 0:
         return []
-    # Keep the original per-layer allocation while clipping. Re-dividing the
-    # entire budget after every removal would make an upward-rounded final
-    # layer exceed the budget forever (including when only one layer remains).
-    per_order_budget = budget / Decimal(initial_count)
     while candidates:
+        # Reallocate the remaining budget after dropping a far level.  The
+        # desired amount is connector-quantized down so it cannot exceed its
+        # equal budget share.  We only round up when the downward-quantized
+        # amount does not clear the exchange minimum.  This distinction matters
+        # for coarse amount steps such as ETH's 0.0001: rounding an 11.22 FDUSD
+        # target up can cost 11.36 FDUSD even though a valid 10.15 FDUSD order
+        # exists.
+        per_order_budget = budget / Decimal(len(candidates))
         built: list[tuple[Decimal, Decimal]] = []
         valid = True
         for level in candidates:
@@ -324,12 +328,20 @@ def clip_quantized_buy_levels(
             if price <= 0:
                 valid = False
                 break
-            raw_amount = max(per_order_budget / price, minimum_quote / price, min_amount)
-            if step > 0:
-                raw_amount = (
-                    (raw_amount / step).to_integral_value(rounding=ROUND_CEILING) * step
+            desired_amount = max(per_order_budget / price, min_amount)
+            amount = max(
+                Decimal(str(quantize_amount(desired_amount))), Decimal("0")
+            )
+            raw_amount = desired_amount
+            if amount < min_amount or price * amount < minimum_quote:
+                raw_amount = max(minimum_quote / price, min_amount)
+                if step > 0:
+                    raw_amount = (
+                        (raw_amount / step).to_integral_value(rounding=ROUND_CEILING) * step
+                    )
+                amount = max(
+                    Decimal(str(quantize_amount(raw_amount))), Decimal("0")
                 )
-            amount = max(Decimal(str(quantize_amount(raw_amount))), Decimal("0"))
             # A connector may apply a second downward normalization.  Advance
             # one exchange step at a time until the actual quantized order is
             # executable.  The budget check below still prevents overspending.
