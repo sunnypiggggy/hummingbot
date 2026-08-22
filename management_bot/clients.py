@@ -347,6 +347,21 @@ class ParameterCatalogReader:
             raise ServiceError("证据文件哈希不匹配")
         return {**item, "path": str(path), "notice": evidence.get("notice")}
 
+    def model_attachment(self, release_sha256: str, model_sha256: str,
+                         strategy: str, asset: str, window: str = "360d") -> dict:
+        """Return only evidence bound to both the exact release and exact model."""
+        if not release_sha256 or not model_sha256:
+            raise ServiceError("模型身份不完整，不能读取证据")
+        evidence_sets = [item for item in self.evidence().get("sets", [])
+                         if item.get("release_sha256") == release_sha256
+                         and item.get("evidence_model_sha256") == model_sha256]
+        for evidence in evidence_sets:
+            if any(row.get("strategy") == strategy
+                   and str(row.get("pair", "")).split("-", 1)[0] == asset
+                   and row.get("window") == window for row in evidence.get("attachments", [])):
+                return self.attachment(str(evidence["evidence_set_id"]), strategy, asset, window)
+        raise ServiceError("当前模型精确360天回测缺失")
+
     def history(self, digest_prefix: str) -> dict:
         catalog = self.catalog()
         match = next((item for item in catalog.get("history", [])

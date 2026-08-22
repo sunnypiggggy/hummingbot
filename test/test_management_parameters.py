@@ -47,6 +47,7 @@ connector_secret: must-not-leak
               "mechanism_parameters": {"strategy_loss_breaker": {"loss_limit_quote": "16"}}})
         write(grid / "xgboost_risk_gate.json", {
             "release_sha256": "r" * 64, "model_sha256": "m" * 64,
+            "runtime_generation": "g" * 64, "source_healthy": True, "cutover_phase": "ACTIVE",
             "pairs": {"BTC-FDUSD": {"probability": .2, "entry_threshold": .5}},
         })
         release = releases / "releases" / ("r" * 64)
@@ -61,6 +62,7 @@ connector_secret: must-not-leak
         write(audit / "manifest.json", {
             "generated_at": "2026-08-22T00:00:00Z", "evidence_model_sha256": "m" * 64,
             "production_model_sha256": "m" * 64,
+            "release_sha256": "r" * 64,
             "images": [{"strategy": "grid", "pair": "BTC-FDUSD", "window": "360d",
                         "path": "release_packages\\ethbtc-forced-exit\\audits\\evidence\\grid_btcfdusd_360d.png",
                         "sha256": image_sha, "width": 1440, "height": 2400}],
@@ -87,10 +89,15 @@ connector_secret: must-not-leak
         )
         attachment = reader.attachment(evidence["sets"][0]["evidence_set_id"], "grid", "BTC", "360d")
         assert Path(attachment["path"]).read_bytes() == image
+        exact = reader.model_attachment("r" * 64, "m" * 64, "grid", "BTC")
+        assert Path(exact["path"]).read_bytes() == image
+        with __import__("pytest").raises(ServiceError, match="精确360天回测缺失"):
+            reader.model_attachment("x" * 64, "m" * 64, "grid", "BTC")
 
         first_sha = result["catalog_sha256"]
         write(grid / "xgboost_risk_gate.json", {
             "release_sha256": "r" * 64, "model_sha256": "m" * 64,
+            "runtime_generation": "g" * 64, "source_healthy": True, "cutover_phase": "ACTIVE",
             "generated_at": "2026-08-22T00:01:00Z", "valid_until": "2026-08-22T00:03:30Z",
             "pairs": {"BTC-FDUSD": {"probability": .8, "entry_threshold": .5,
                        "model_signal": "RISK_OFF"}},
@@ -109,6 +116,77 @@ connector_secret: must-not-leak
         changed = publisher.publish([dynamic_robot], now=datetime.now(timezone.utc))
         assert changed["catalog_sha256"] != first_sha
         assert len(changed["history"]) == 2
+
+
+def test_unbound_legacy_evidence_is_not_current_or_navigable():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        output = root / "state" / "telegram"
+        image = root / "releases" / "audits" / "legacy" / "grid_btcfdusd_360d.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"legacy")
+        write(image.parent / "manifest.json", {
+            "evidence_model_sha256": "m" * 64,
+            "production_model_sha256": "m" * 64,
+            "images": [{"strategy": "grid", "pair": "BTC-FDUSD", "window": "360d",
+                        "path": image.name, "sha256": hashlib.sha256(b"legacy").hexdigest()}],
+        })
+        write(root / "grid" / "xgboost_risk_gate.json", {
+            "release_sha256": "r" * 64, "model_sha256": "m" * 64,
+            "runtime_generation": "g" * 64, "source_healthy": True, "cutover_phase": "ACTIVE",
+            "pairs": {},
+        })
+        publisher = ManagementParameterPublisher(
+            bots_path=root / "bots", dca_state=root / "dca", grid_state=root / "grid",
+            release_root=root / "releases", approval_root=root / "approvals", output=output,
+        )
+        result = publisher.publish([], now=datetime.now(timezone.utc))
+        assert result["models"]["active"]["exact_evidence_count"] == 0
+        evidence = json.loads((output / "model_evidence_catalog.json").read_text(encoding="utf-8"))
+        assert evidence["sets"][0]["relation_to_active"] == "UNBOUND_LEGACY"
+        reader = ParameterCatalogReader(output / "management_parameter_catalog.json",
+                                        output / "model_evidence_catalog.json", output, 300)
+        with __import__("pytest").raises(ServiceError, match="精确360天回测缺失"):
+            reader.model_attachment("r" * 64, "m" * 64, "grid", "BTC")
+
+
+def test_model_history_requires_trusted_cutover_and_excludes_current():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        grid = root / "grid"
+        output = root / "state" / "telegram"
+        publisher = ManagementParameterPublisher(
+            bots_path=root / "bots", dca_state=root / "dca", grid_state=grid,
+            release_root=root / "releases", approval_root=root / "approvals", output=output,
+        )
+        write(grid / "xgboost_risk_gate.json", {
+            "release_sha256": "a" * 64, "model_sha256": "b" * 64,
+            "runtime_generation": "c" * 64, "source_healthy": True, "cutover_phase": "ACTIVE",
+            "pairs": {"BTC-FDUSD": {"model_week": 39, "week_start": 100, "week_end": 200}},
+        })
+        first = publisher.publish([], now=datetime.now(timezone.utc))
+        assert first["models"]["history"] == []
+        first_event = json.dumps({
+            "transition": "MODEL_CUTOVER_STABLE", "occurred_at": "2026-08-17T05:44:43Z",
+            "release_sha256": "a" * 64, "details": {"runtime_generation": "c" * 64},
+        })
+        write(grid / "telegram_events.jsonl", first_event + "\n")
+        publisher.publish([], now=datetime.now(timezone.utc))
+        write(grid / "xgboost_risk_gate.json", {
+            "release_sha256": "d" * 64, "model_sha256": "e" * 64,
+            "runtime_generation": "f" * 64, "source_healthy": True, "cutover_phase": "ACTIVE",
+            "pairs": {"BTC-FDUSD": {"model_week": 40, "week_start": 200, "week_end": 300}},
+        })
+        second_event = json.dumps({
+            "transition": "MODEL_CUTOVER_STABLE", "occurred_at": "2026-08-24T05:44:43Z",
+            "release_sha256": "d" * 64, "details": {"runtime_generation": "f" * 64},
+        })
+        write(grid / "telegram_events.jsonl", first_event + "\n" + second_event + "\n")
+        second = publisher.publish([], now=datetime.now(timezone.utc))
+        assert len(second["models"]["history"]) == 1
+        assert second["models"]["history"][0]["release_sha256"] == "a" * 64
+        assert second["models"]["history"][0]["activated_at"] == "2026-08-17T05:44:43Z"
+        assert second["models"]["active"]["release_sha256"] == "d" * 64
 
 
 def test_evidence_reader_rejects_path_escape_and_hash_mismatch():

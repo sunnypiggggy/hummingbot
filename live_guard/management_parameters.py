@@ -12,7 +12,8 @@ import yaml
 
 
 SCHEMA = "management-parameter-catalog-v1"
-EVIDENCE_SCHEMA = "management-model-evidence-catalog-v1"
+EVIDENCE_SCHEMA = "management-model-evidence-catalog-v2"
+LIFECYCLE_SCHEMA = "management-model-lifecycle-v1"
 HISTORY_SCHEMA = "management-parameter-history-v2"
 HISTORY_LIMIT = 3
 
@@ -192,49 +193,109 @@ class ManagementParameterPublisher:
 
     def _approval_candidates(self) -> list[dict[str, Any]]:
         state = _json(self.approval_root / "automation_state.json")
+        candidate_release = str(state.get("candidate_release_sha256") or "")
+        terminal = {"ACTIVE", "REJECTED"}
+        if not candidate_release or str(state.get("phase")) in terminal:
+            return []
         output = []
-        for path in sorted(self.approval_root.glob("approval-request-*.json"),
-                           key=lambda item: item.stat().st_mtime, reverse=True)[:3]:
+        for path in self.approval_root.glob("approval-request-*.json"):
             value = _json(path)
-            if not value.get("release_sha256"):
+            if str(value.get("release_sha256") or "") != candidate_release:
                 continue
             release = str(value["release_sha256"])
+            checks = value.get("checks") or state.get("checks") or {}
             output.append({
                 "release_sha256": release,
                 "model_sha256": value.get("model_sha256"),
+                "model_week": value.get("candidate_model_week") or state.get("candidate_model_week"),
                 "review_started_at": value.get("review_started_at"),
                 "review_deadline": value.get("review_deadline"),
                 "effective_start": value.get("activation_boundary"),
                 "effective_end": value.get("candidate_effective_end"),
-                "checks": value.get("checks", {}),
-                "status": "PENDING" if state.get("candidate_release_sha256") == release
-                and state.get("phase") == "AWAITING_APPROVAL" else "HISTORY",
+                "checks": checks,
+                "status": str(state.get("phase") or "UNKNOWN"),
+                "last_error": state.get("last_error"),
+                "approval_mode": state.get("approval_mode"),
                 "request_sha256": _file_sha(path),
             })
         return output
 
-    def _release_history(self) -> list[dict[str, Any]]:
-        releases = self.release_root / "releases"
-        values = []
-        for path in sorted(releases.iterdir(), key=lambda item: item.stat().st_mtime,
-                           reverse=True) if releases.is_dir() else []:
-            if not path.is_dir():
-                continue
-            release = _json(path / "release.json")
-            lock = _json(path / "production_lock.json")
-            values.append({
-                "release_sha256": release.get("release_sha256") or path.name,
-                "model_sha256": lock.get("model_sha256") or release.get("model_sha256"),
-                "feature_sha256": lock.get("feature_schema_sha256") or release.get("feature_schema_sha256"),
-                "strategy_sha256": lock.get("strategy_sha256") or release.get("strategy_sha256"),
-                "effective_start": release.get("effective_start"),
-                "effective_end": release.get("effective_end"),
-            })
-            if len(values) == HISTORY_LIMIT:
-                break
-        return values
+    def _model_lifecycle(self, active: Mapping[str, Any], *, now: datetime) -> list[dict[str, Any]]:
+        """Persist only observed, healthy production activations; never infer from directory mtimes."""
+        path = self.output / "model_lifecycle.json"
+        ledger = _json(path)
+        if ledger.get("schema") != LIFECYCLE_SCHEMA:
+            ledger = {"schema": LIFECYCLE_SCHEMA, "current": {}, "history": []}
+        release = str(active.get("release_sha256") or "")
+        model = str(active.get("model_sha256") or "")
+        generation = str(active.get("runtime_generation") or "")
+        healthy = bool(active.get("source_healthy")) and str(active.get("cutover_phase")) in {
+            "ACTIVE", "WARM_ACTIVE", "WARM_ACTIVE_PENDING_FOLD",
+        }
+        current = ledger.get("current") if isinstance(ledger.get("current"), dict) else {}
+        identity = (release, model, generation)
+        previous = (str(current.get("release_sha256") or ""),
+                    str(current.get("model_sha256") or ""),
+                    str(current.get("runtime_generation") or ""))
+        cutover_at = None
+        event_path = self.grid_state / "telegram_events.jsonl"
+        try:
+            for line in event_path.read_text(encoding="utf-8").splitlines():
+                event = json.loads(line)
+                details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
+                if (event.get("transition") == "MODEL_CUTOVER_STABLE"
+                        and str(event.get("release_sha256") or "") == release
+                        and str(details.get("runtime_generation") or "") == generation):
+                    cutover_at = event.get("occurred_at")
+        except (OSError, ValueError, TypeError):
+            cutover_at = None
+        if all(identity) and healthy:
+            if not all(previous):
+                ledger["current"] = {
+                    "release_sha256": release, "model_sha256": model,
+                    "runtime_generation": generation,
+                    "model_week": active.get("model_week"), "week_start": active.get("week_start"),
+                    "week_end": active.get("week_end"),
+                    "activated_at": cutover_at,
+                    "first_observed_at": now.astimezone(timezone.utc).isoformat(),
+                    "activation_evidence": ("MODEL_CUTOVER_STABLE" if cutover_at
+                                            else "bootstrap_current_without_cutover_timestamp"),
+                }
+            elif identity != previous:
+                if not cutover_at:
+                    return list(ledger.get("history", []))[:HISTORY_LIMIT]
+                retired = {
+                    **current,
+                    "retired_at": cutover_at,
+                    "replacement_reason": "MODEL_CUTOVER_STABLE",
+                    "lifecycle_evidence": "observed_atomic_runtime_generation_transition",
+                }
+                history = list(ledger.get("history", []))
+                if current.get("activated_at"):
+                    history = [retired] + [item for item in history
+                                           if item.get("release_sha256") != retired.get("release_sha256")]
+                ledger["history"] = history[:HISTORY_LIMIT]
+                ledger["current"] = {
+                    "release_sha256": release, "model_sha256": model,
+                    "runtime_generation": generation,
+                    "model_week": active.get("model_week"), "week_start": active.get("week_start"),
+                    "week_end": active.get("week_end"),
+                    "activated_at": cutover_at,
+                    "first_observed_at": now.astimezone(timezone.utc).isoformat(),
+                    "activation_evidence": "MODEL_CUTOVER_STABLE",
+                }
+            else:
+                current.update({"model_week": active.get("model_week"),
+                                "week_start": active.get("week_start"),
+                                "week_end": active.get("week_end")})
+                if not current.get("activated_at") and cutover_at:
+                    current.update({"activated_at": cutover_at,
+                                    "activation_evidence": "MODEL_CUTOVER_STABLE"})
+                ledger["current"] = current
+            _atomic_json(path, ledger)
+        return list(ledger.get("history", []))[:HISTORY_LIMIT]
 
-    def _models(self) -> dict[str, Any]:
+    def _models(self, robots: list[Mapping[str, Any]], *, now: datetime) -> dict[str, Any]:
         gate = _json(self.grid_state / "xgboost_risk_gate.json")
         active = {
             key: gate.get(key) for key in (
@@ -245,18 +306,40 @@ class ManagementParameterPublisher:
             ) if key in gate
         }
         active["pairs"] = gate.get("pairs", {})
+        weeks = [row for row in active["pairs"].values() if isinstance(row, Mapping)]
+        active["model_week"] = next((row.get("model_week") for row in weeks
+                                     if row.get("model_week") is not None), None)
+        active["week_start"] = max((int(row["week_start"]) for row in weeks
+                                    if row.get("week_start") is not None), default=None)
+        active["week_end"] = min((int(row["week_end"]) for row in weeks
+                                  if row.get("week_end") is not None), default=None)
+        active["system_healthy"] = bool(active.get("source_healthy"))
+        active["trading"] = {
+            f"{robot.get('strategy')}:{robot.get('pair')}": {
+                "trading_normal": robot.get("trading_normal"),
+                "final_permissions": robot.get("final_permissions", {}),
+            } for robot in robots
+        }
+        candidates = self._approval_candidates()
+        for item in candidates:
+            if item.get("model_week") is None and active.get("model_week") is not None:
+                item["model_week"] = int(active["model_week"]) + 1
         return {
             "active": active,
-            "candidate": self._approval_candidates(),
-            "history": self._release_history(),
+            "candidate": candidates,
+            "history": self._model_lifecycle(active, now=now),
         }
 
     def _publish_evidence(self, models: Mapping[str, Any]) -> dict[str, Any]:
         sets = []
         audits = self.release_root / "audits"
-        manifests = sorted(audits.glob("*/manifest.json"), key=lambda item: item.stat().st_mtime,
-                           reverse=True) if audits.is_dir() else []
+        manifests = list(audits.glob("*/manifest.json")) if audits.is_dir() else []
+        generated = self.output.parent / "parameters"
+        if generated.is_dir():
+            manifests.extend(generated.glob("*/manifest.json"))
+        manifests = sorted(set(manifests), key=lambda item: item.stat().st_mtime, reverse=True)
         active_model = str(models.get("active", {}).get("model_sha256") or "")
+        active_release = str(models.get("active", {}).get("release_sha256") or "")
         for manifest_path in manifests:
             manifest = _json(manifest_path)
             images = manifest.get("images", [])
@@ -289,18 +372,28 @@ class ManagementParameterPublisher:
                 })
             evidence_model = str(manifest.get("evidence_model_sha256") or "")
             production_model = str(manifest.get("production_model_sha256") or "")
-            relation = "EXACT" if active_model and evidence_model == active_model else "HISTORICAL_COVERAGE"
+            evidence_release = str(manifest.get("release_sha256") or "")
+            if not evidence_release:
+                relation = "UNBOUND_LEGACY"
+            elif evidence_release == active_release and evidence_model == active_model:
+                relation = "EXACT"
+            else:
+                relation = "BOUND_OTHER_MODEL"
             sets.append({
                 "evidence_set_id": set_id, "generated_at": manifest.get("generated_at"),
                 "execution_policy": manifest.get("execution_policy"),
                 "production_model_sha256": production_model,
                 "evidence_model_sha256": evidence_model,
+                "release_sha256": evidence_release or None,
                 "relation_to_active": relation,
-                "notice": None if relation == "EXACT" else "历史覆盖证据，不是当前模型精确回放",
+                "notice": None if relation == "EXACT" else (
+                    "旧证据未同时绑定发布版本和模型，已保留审计但不提供导航"
+                    if relation == "UNBOUND_LEGACY" else "该证据属于其他已绑定模型"
+                ),
                 "attachments": verified,
                 "manifest_sha256": _file_sha(manifest_path),
             })
-            if len(sets) == HISTORY_LIMIT:
+            if len(sets) == HISTORY_LIMIT + 2:
                 break
         catalog = {
             "schema": EVIDENCE_SCHEMA,
@@ -379,10 +472,24 @@ class ManagementParameterPublisher:
             "grid": self._grid(),
             "dca": self._dca(),
             "risks": self._risks(robots),
-            "models": self._models(),
+            "models": self._models(robots, now=now),
         }
         catalog["catalog_sha256"] = _canonical_sha(self._version_snapshot(catalog))
         evidence = self._publish_evidence(catalog["models"])
+        def evidence_count(subject: Mapping[str, Any]) -> int:
+            identities = {
+                (row.get("strategy"), row.get("pair"))
+                for item in evidence["sets"]
+                if item.get("release_sha256") == subject.get("release_sha256")
+                and item.get("evidence_model_sha256") == subject.get("model_sha256")
+                for row in item.get("attachments", []) if row.get("window") == "360d"
+            }
+            return len(identities)
+        catalog["models"]["active"]["exact_evidence_count"] = evidence_count(
+            catalog["models"]["active"])
+        for group in ("candidate", "history"):
+            for item in catalog["models"].get(group, []):
+                item["exact_evidence_count"] = evidence_count(item)
         catalog["evidence"] = [{
             "evidence_set_id": item["evidence_set_id"],
             "relation_to_active": item["relation_to_active"],

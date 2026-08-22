@@ -315,6 +315,7 @@ def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
         signed_start=_signed_start(identity_root),
         production_model_sha256=requested_model or evidence_model,
         evidence_model_sha256=evidence_model,
+        release_sha256=str(event.get("release_sha256") or ""),
     )
     labels = {
         "360d": "过去360天",

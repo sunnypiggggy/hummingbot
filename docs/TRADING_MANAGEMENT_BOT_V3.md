@@ -79,8 +79,8 @@ Stock PAPER收益独立读取 Stock Runtime 的 `GET /stocks/paper/summary`：
 
 “模型与参数”读取 `dca-live-report` 每分钟原子生成的
 `management_parameter_catalog.json`，不直接挂载机器人配置、connector配置或密钥。
-页面通过Inline向导分别展示Grid、DCA、风控门、v22现网模型、候选及最近3个
-内容寻址历史版本。配置值和运行时值同时存在时必须核对；不一致显示“配置与运行
+页面通过Inline向导分别展示Grid、DCA、风控门，以及互相隔离的v22当前模型、
+候选模型和最近3个可信实盘历史模型。配置值和运行时值同时存在时必须核对；不一致显示“配置与运行
 不一致”，不能将YAML默认值描述成已生效参数。
 
 Guard在各自状态合同的 `mechanism_parameters` 中发布脱敏阈值、冷却和恢复规则；
@@ -88,9 +88,11 @@ Guard在各自状态合同的 `mechanism_parameters` 中发布脱敏阈值、冷
 参数修改和模型审批仍由原有独立流程处理。
 
 v22 PNG/PDF先由报告服务依据manifest和SHA256验证，再复制到管理专用公开目录，
-并写入 `model_evidence_catalog.json`。Bot只允许从该索引选择
-`Grid/DCA → BTC/ETH → 360天/1–2月/5–6月`。证据模型哈希与当前模型不同的图片
-明确标注“历史覆盖证据，不是当前模型精确回放”；缺失或哈希错误不会借用旧图。
+并写入 `model_evidence_catalog.json`。当前模型只提供Grid BTC、Grid ETH、DCA BTC、
+DCA ETH四张360天图片的直达按钮，且证据必须同时精确绑定release和model。缺失时
+只显示缺失，不跳转或借用历史图。历史模型只能来自可信的实盘激活和下线记录；
+被拒绝、未激活候选和参数快照不进入历史。技术哈希仅保留在后台校验及审批合同中，
+Telegram参数页、模型页、审批详情和图片说明均不显示。
 
 ## Stock 接口合同
 

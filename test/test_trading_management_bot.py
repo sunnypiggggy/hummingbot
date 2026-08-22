@@ -9,7 +9,7 @@ from unittest import TestCase
 import yaml
 
 from management_bot.approvals import ApprovalStore
-from management_bot.clients import ContractReader, OperationsReportReader
+from management_bot.clients import ContractReader, OperationsReportReader, ServiceError
 from management_bot.config import Settings
 from management_bot.app import TradingManagementBot
 from management_bot.storage import BotStore
@@ -202,17 +202,34 @@ class FakeParameters:
             "models": {"active": {"release_sha256": "a" * 64,
                 "runtime_generation": "b" * 64, "model_sha256": "c" * 64,
                 "feature_schema_sha256": "d" * 64, "valid_until": "2026-08-23T00:00:00Z",
-                "cutover_phase": "ACTIVE", "pairs": {"BTC-FDUSD": {
+                "cutover_phase": "ACTIVE", "system_healthy": True, "model_week": 39,
+                "week_start": 1786892400, "week_end": 1787497200,
+                "exact_evidence_count": 0, "trading": {
+                    "grid:BTC-FDUSD": {"trading_normal": True, "final_permissions": {"buy": True, "sell": True}},
+                    "grid:ETH-FDUSD": {"trading_normal": True, "final_permissions": {"buy": True, "sell": True}},
+                    "dca:BTC-USDT": {"trading_normal": True, "final_permissions": {"buy": True, "sell": True}},
+                    "dca:ETH-USDT": {"trading_normal": True, "final_permissions": {"buy": True, "sell": True}},
+                }, "pairs": {"BTC-FDUSD": {
                     "model_signal": "RISK_ON", "probability": .2,
-                    "entry_threshold": .5, "model_week": 39}}},
-                "candidate": [{"release_sha256": "e" * 64, "status": "PENDING"}],
-                "history": [{"release_sha256": "9" * 64, "effective_end": 1}]},
+                    "entry_threshold": .5, "model_week": 39}, "ETH-FDUSD": {
+                    "model_signal": "RISK_OFF", "model_week": 39}}},
+                "candidate": [{"release_sha256": "e" * 64, "model_sha256": "f" * 64,
+                    "status": "AWAITING_APPROVAL", "model_week": 40,
+                    "effective_start": 1787497200, "effective_end": 1788102000,
+                    "review_deadline": int(time.time()) + 7200,
+                    "checks": {"hashes": True, "evidence": False}, "exact_evidence_count": 0}],
+                "history": [{"release_sha256": "9" * 64, "model_sha256": "7" * 64,
+                    "activated_at": "2026-08-10T00:00:00Z", "retired_at": "2026-08-17T00:00:00Z",
+                    "replacement_reason": "MODEL_CUTOVER_STABLE", "exact_evidence_count": 0}]},
             "history": [{"catalog_sha256": "8" * 64,
                          "recorded_at": "2026-08-22T00:00:00Z"}],
         }
 
     def evidence(self):
         return {"sets": []}
+
+    def model_attachment(self, *_args, **_kwargs):
+        raise ServiceError("当前模型精确360天回测缺失")
 
     def history(self, _digest):
         value = self.catalog()
@@ -606,8 +623,14 @@ class TelegramFlowTests(TestCase):
             bot.parameters = FakeParameters()
             menu, rows = bot._models()
             self.assertIn("模型与参数（只读）", menu)
-            self.assertIn("最近历史版本：1", menu)
+            self.assertIn("已上线历史模型：1个", menu)
             self.assertTrue(any(callback == "p:grid" for row in rows for _, callback in row))
+            callbacks = [callback for row in rows for _, callback in row]
+            self.assertIn("p:model", callbacks)
+            self.assertIn("p:candidate", callbacks)
+            self.assertIn("p:model_history", callbacks)
+            self.assertNotIn("p:evidence", callbacks)
+            self.assertNotIn("p:versions", callbacks)
             grid, _ = bot._grid_parameters("BTC")
             self.assertIn("Grid总范围：6.0000%", grid)
             self.assertIn("Maker费用：0.0000%", grid)
@@ -618,11 +641,83 @@ class TelegramFlowTests(TestCase):
             self.assertIn("最终权限：BUY=放行 / SELL=放行", risk)
             self.assertIn("亏损阈值=6", risk)
             model, _ = bot._v22_model()
-            self.assertIn("概率/阈值：0.2 / 0.5", model)
-            history, _ = bot._parameter_versions()
-            self.assertIn("最近3个版本", history)
+            self.assertIn("当前模型周：第39周", model)
+            self.assertIn("BTC：Risk-On（普通BUY放行）", model)
+            self.assertIn("ETH：Risk-Off（普通BUY阻止）", model)
+            self.assertIn("当前模型精确360天回测：缺失", model)
+            self.assertNotIn("Release", model)
+            self.assertNotIn("Generation", model)
+            self.assertNotIn("哈希", model)
+            self.assertNotIn("valid_until", model)
+            _, model_rows = bot._v22_model()
+            self.assertFalse(any("p:img:" in callback for row in model_rows for _, callback in row))
+            candidate, candidate_rows = bot._candidate_model()
+            self.assertIn("目标模型周：第40周", candidate)
+            self.assertIn("360天证据：0/4张已验证", candidate)
+            self.assertNotIn("e" * 16, candidate)
+            self.assertTrue(any(callback.startswith("a:") for row in candidate_rows for _, callback in row))
+            history, history_rows = bot._model_history()
+            self.assertIn("曾参与实盘", history)
+            self.assertTrue(any(callback == "p:hist_model:0" for row in history_rows for _, callback in row))
+            detail, _ = bot._model_history_detail(0)
+            self.assertIn("实际上线", detail)
+            self.assertIn("精确360天证据：无可信记录", detail)
+            self.assertNotIn("9" * 16, detail)
             for _, callback in [button for row in rows for button in row]:
                 self.assertLessEqual(len(callback.encode()), 64)
+            bot.store.close()
+
+    def test_current_model_exact_evidence_buttons_send_directly_without_hash_caption(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            parameters = FakeParameters()
+            original_catalog = parameters.catalog
+            parameters.catalog = lambda: {
+                **original_catalog(),
+                "models": {**original_catalog()["models"], "active": {
+                    **original_catalog()["models"]["active"], "exact_evidence_count": 4,
+                }},
+            }
+            image = Path(raw) / "current.png"
+            image.write_bytes(b"png")
+            parameters.model_attachment = lambda *_args, **_kwargs: {"path": str(image)}
+            bot.parameters = parameters
+            _, rows = bot._v22_model()
+            callbacks = [callback for row in rows for _, callback in row]
+            self.assertIn("p:img:current:grid:BTC", callbacks)
+            text, _ = bot._handle_parameters("p:img:current:grid:BTC", 7)
+            self.assertIn("已发送", text)
+            caption = bot.telegram.sent[-1][1]
+            self.assertNotIn("sha", caption.lower())
+            self.assertNotIn("哈希", caption)
+            bot.store.close()
+
+    def test_model_approval_pages_do_not_expose_technical_hashes(self):
+        class Approvals:
+            item = {"candidate_id": "a" * 16, "model_type": "v22_weekly_buy_gate",
+                    "release_sha256": "a" * 64, "model_sha256": "b" * 64,
+                    "review_deadline": int(time.time()) + 3600, "checks": {"hashes": True},
+                    "status": "PENDING"}
+
+            def pending(self):
+                return [self.item]
+
+            def find(self, _candidate_id):
+                return self.item
+
+            def evidence(self, _item):
+                return {"attachments": []}
+
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.approvals = Approvals()
+            menu, _ = bot._approvals_menu()
+            detail, _ = bot._approval_detail("a" * 16)
+            combined = menu + detail
+            self.assertNotIn("a" * 16, combined)
+            self.assertNotIn("b" * 16, combined)
+            self.assertNotIn("Release", combined)
+            self.assertNotIn("模型哈希", combined)
             bot.store.close()
 
 

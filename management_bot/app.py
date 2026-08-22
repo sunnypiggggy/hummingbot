@@ -545,21 +545,20 @@ class TradingManagementBot:
     def _models(self) -> tuple[str, list]:
         catalog = self._parameter_catalog()
         models = catalog.get("models", {})
-        pending = [item for item in models.get("candidate", []) if item.get("status") == "PENDING"]
-        active = models.get("active", {})
+        pending = models.get("candidate", [])
         lines = [
             "⚙️ 模型与参数（只读）",
             f"快照年龄：{catalog.get('age_seconds', 0):.0f}秒",
-            f"当前Release：{str(active.get('release_sha256') or '-')[:16]}",
-            f"待审批候选：{len(pending)}",
-            f"最近历史版本：{min(3, len(catalog.get('history', [])))}",
+            f"当前候选：{'1个' if pending else '无'}",
+            f"已上线历史模型：{min(3, len(models.get('history', [])))}个",
             "",
-            "这里只查看现网、候选和最近3个版本；修改与审批仍走独立安全流程。",
+            "模型按当前、候选、历史分开查看；此页面不能修改参数或审批模型。",
         ]
         rows = [
             [("🟦 Grid 参数", "p:grid"), ("🟩 DCA 参数", "p:dca")],
-            [("🛡 风控门参数", "p:risk"), ("🧠 v22 当前模型", "p:model")],
-            [("🕒 候选与历史", "p:versions"), ("🖼 模型证据", "p:evidence")],
+            [("🛡 风控门参数", "p:risk")],
+            [("🧠 当前模型", "p:model"), ("🆕 候选模型", "p:candidate")],
+            [("🕒 历史模型", "p:model_history")],
             [("🔄 刷新", "m:models"), ("🏠 主菜单", "m:home")],
         ]
         return "\n".join(lines), rows
@@ -577,7 +576,6 @@ class TradingManagementBot:
             f"🟦 Grid {pair} 当前生效参数",
             f"落地状态：{_state_cn(grid.get('application_state'))}",
             f"参数版本：{parameter_version}",
-            f"参数哈希：{str(grid.get('runtime_sha256') or grid.get('configured_sha256') or '-')[:16]}",
             "",
             f"单对资金：{value.get('pair_budget_quote', '-')} FDUSD",
             f"单侧资金：{value.get('side_budget_quote', '-')} FDUSD",
@@ -604,7 +602,6 @@ class TradingManagementBot:
         lines = [
             f"🟩 DCA {pair} 当前生效参数",
             f"落地状态：{_state_cn(row.get('application_state'))}",
-            f"参数哈希：{str(row.get('parameter_sha256') or '-')[:16]}",
             "",
             f"执行资金：{value.get('total_amount_quote', '-')} USDT",
             f"DCA跌幅档位：{value.get('dca_spreads', '-')}",
@@ -677,113 +674,184 @@ class TradingManagementBot:
         ]
         return "\n".join(lines)[:4000], rows
 
+    @staticmethod
+    def _bj_time(value: Any) -> str:
+        if value in (None, ""):
+            return "无可信记录"
+        try:
+            stamp = float(value)
+        except (TypeError, ValueError):
+            try:
+                stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return "无可信记录"
+        return datetime.fromtimestamp(stamp, timezone.utc).astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _model_status_cn(value: Any) -> str:
+        return {
+            "AWAITING_APPROVAL": "等待审批", "APPROVED_PENDING_PREWARM": "已批准，等待预热",
+            "PREWARMED_PENDING_ACTIVATION": "预热完成，等待激活",
+            "WARM_ACTIVE_PENDING_FOLD": "已热切换，等待进入目标周",
+            "ACTIVE": "已激活", "BLOCKED": "检查失败", "SIGNED_WEEK_UNAVAILABLE": "签名周不可用",
+        }.get(str(value), _state_cn(value))
+
+    @staticmethod
+    def _check_label(value: Any) -> str:
+        key = str(value)
+        labels = {
+            "hashes": "模型文件完整性", "model_hashes": "模型文件完整性",
+            "continuity": "签名周连续性", "week_continuity": "签名周连续性",
+            "evidence": "回测证据完整性", "telegram_png_evidence": "频道证据送达",
+            "current_week": "当前签名周有效", "candidate_not_expired": "候选有效期",
+            "minimum_signed_runway": "签名覆盖时长", "grid_emergency_channel_ready": "Grid退出通道",
+            "dca_emergency_channel_ready": "DCA退出通道", "grid_ownership_covered": "Grid库存归属",
+            "dca_ownership_covered": "DCA库存归属", "exchange_filters_verified": "交易所规则校验",
+        }
+        return labels.get(key, "候选完整性检查")
+
+    @staticmethod
+    def _robot_line(active: Mapping[str, Any], strategy: str, pair: str) -> str:
+        row = active.get("trading", {}).get(f"{strategy}:{pair}", {})
+        if not row:
+            return f"{strategy.upper()} {pair}：数据不可用（最终权限请查看风控状态）"
+        permissions = row.get("final_permissions", {})
+        buy = permissions.get("buy_enabled", permissions.get("buy"))
+        sell = permissions.get("sell_enabled", permissions.get("sell"))
+        state = "正常交易" if row.get("trading_normal") else "交易受限"
+        return f"{strategy.upper()} {pair}：{state}（BUY {_permission_cn(buy)} / SELL {_permission_cn(sell)}）"
+
     def _v22_model(self) -> tuple[str, list]:
-        catalog = self._parameter_catalog()
-        active = catalog.get("models", {}).get("active", {})
+        active = self._parameter_catalog().get("models", {}).get("active", {})
+        healthy = bool(active.get("system_healthy"))
         lines = [
             "🧠 v22 当前模型",
-            f"Release：{str(active.get('release_sha256') or '-')[:16]}",
-            f"Generation：{str(active.get('runtime_generation') or '-')[:16]}",
-            f"模型哈希：{str(active.get('model_sha256') or '-')[:16]}",
-            f"特征哈希：{str(active.get('feature_schema_sha256') or '-')[:16]}",
-            f"有效至：{active.get('valid_until', '-')}",
-            f"切换阶段：{_state_cn(active.get('cutover_phase'))}",
+            f"系统状态：{'正常' if healthy else '异常'}",
+            f"v22门：{'信号正常' if healthy else '模型信号不可用'}",
+            f"当前模型周：第{active.get('model_week', '-')}周",
+            f"有效期（北京时间）：{self._bj_time(active.get('week_start'))} 至 {self._bj_time(active.get('week_end'))}",
             "",
         ]
-        for pair, row in active.get("pairs", {}).items():
-            lines.extend((
-                f"{pair}：{_state_cn(row.get('model_signal') or ('RISK_OFF' if row.get('risk_off_active') else 'RISK_ON'))}",
-                f"概率/阈值：{row.get('probability', '-')} / {row.get('entry_threshold', '-')}",
-                f"模型周：{row.get('model_week', row.get('week_start', '-'))}",
-            ))
-        rows = [[("🖼 查看证据", "p:evidence"), ("🕒 候选与历史", "p:versions")],
+        for asset in ("BTC", "ETH"):
+            pair = f"{asset}-FDUSD"
+            row = active.get("pairs", {}).get(pair, {})
+            signal = row.get("model_signal")
+            if not signal and "risk_off_active" in row:
+                signal = "RISK_OFF" if row.get("risk_off_active") else "RISK_ON"
+            if signal == "RISK_ON":
+                lines.append(f"{asset}：Risk-On（普通BUY放行）")
+            elif signal == "RISK_OFF":
+                lines.append(f"{asset}：Risk-Off（普通BUY阻止）")
+            else:
+                lines.append(f"{asset}：无可信模型信号（普通BUY权限以完整风控门为准）")
+        lines.extend(["", self._robot_line(active, "grid", "BTC-FDUSD"),
+                      self._robot_line(active, "grid", "ETH-FDUSD"),
+                      self._robot_line(active, "dca", "BTC-USDT"),
+                      self._robot_line(active, "dca", "ETH-USDT"), ""])
+        rows: list[list[tuple[str, str]]] = []
+        if int(active.get("exact_evidence_count") or 0) >= 4:
+            rows.extend([
+                [("Grid BTC 360天", "p:img:current:grid:BTC"), ("Grid ETH 360天", "p:img:current:grid:ETH")],
+                [("DCA BTC 360天", "p:img:current:dca:BTC"), ("DCA ETH 360天", "p:img:current:dca:ETH")],
+            ])
+        else:
+            lines.append("当前模型精确360天回测：缺失")
+            lines.append("不会使用历史图片替代，也不会自动补生成。")
+        rows.extend([[("🆕 候选模型", "p:candidate"), ("🕒 历史模型", "p:model_history")],
+                     [("⬅️ 模型与参数", "m:models"), ("🏠 主菜单", "m:home")]])
+        return "\n".join(lines), rows
+
+    def _candidate_model(self) -> tuple[str, list]:
+        candidates = self._parameter_catalog().get("models", {}).get("candidate", [])
+        if not candidates:
+            return "🆕 v22 候选模型\n\n当前没有尚未激活的候选模型。", [
                 [("🧠 模型审批", "m:approvals"), ("⬅️ 模型与参数", "m:models")]]
-        return "\n".join(lines), rows
-
-    def _parameter_versions(self) -> tuple[str, list]:
-        catalog = self._parameter_catalog()
-        models = catalog.get("models", {})
-        lines = ["🕒 现网、候选和最近3个版本"]
-        active = models.get("active", {})
-        lines.append(f"现网：{str(active.get('release_sha256') or '-')[:16]}")
-        rows = []
-        for item in models.get("candidate", [])[:3]:
-            lines.append(f"候选：{str(item.get('release_sha256'))[:16]}｜{item.get('status')}")
-        for item in models.get("history", [])[:3]:
-            release = str(item.get("release_sha256") or "")
-            lines.append(f"历史模型：{release[:16]}｜有效至 {item.get('effective_end', '-')}")
-        for item in catalog.get("history", [])[:3]:
-            digest = str(item.get("catalog_sha256") or "")
-            lines.append(f"参数快照：{digest[:12]}｜{item.get('recorded_at', '-')}")
-            rows.append([(f"查看参数 {digest[:8]}", f"p:history:{digest[:12]}")])
-        rows.extend([[('🧠 模型审批', 'm:approvals'), ('🖼 模型证据', 'p:evidence')],
-                     [('⬅️ 模型与参数', 'm:models'), ('🏠 主菜单', 'm:home')]])
-        return "\n".join(lines), rows
-
-    def _parameter_history(self, digest: str) -> tuple[str, list]:
-        value = self.parameters.history(digest)
-        grid = value.get("grid", {})
-        models = value.get("models", {})
+        item = candidates[0]
+        checks = item.get("checks", {})
+        passed = sum(value is True for value in checks.values())
+        failed = [self._check_label(key) for key, value in checks.items() if value is not True]
+        deadline = item.get("review_deadline")
+        remaining = max(0, int(float(deadline)) - int(time.time())) if deadline else 0
+        evidence_count = int(item.get("exact_evidence_count") or 0)
         lines = [
-            "🕒 历史参数快照",
-            f"记录时间：{value.get('recorded_at', '-')}",
-            f"快照哈希：{str(value.get('catalog_sha256') or '-')[:16]}",
-            f"Grid版本：{grid.get('runtime', {}).get('active_parameter_version', '-')}",
-            f"Grid落地：{_state_cn(grid.get('application_state'))}",
-            f"v22 Release：{str(models.get('active', {}).get('release_sha256') or '-')[:16]}",
-            f"DCA BTC参数：{str(value.get('dca', {}).get('BTC-USDT', {}).get('parameter_sha256') or '-')[:16]}",
-            f"DCA ETH参数：{str(value.get('dca', {}).get('ETH-USDT', {}).get('parameter_sha256') or '-')[:16]}",
+            "🆕 v22 候选模型",
+            f"状态：{self._model_status_cn(item.get('status'))}",
+            f"目标模型周：第{item.get('model_week', '-')}周",
+            f"有效期（北京时间）：{self._bj_time(item.get('effective_start'))} 至 {self._bj_time(item.get('effective_end'))}",
+            f"自动审批倒计时：{remaining // 3600}小时{remaining % 3600 // 60}分钟" if deadline else "自动审批倒计时：未开始",
+            f"硬门槛：{passed}/{len(checks)}项通过" if checks else "硬门槛：无可信检查结果",
+            f"失败原因：{'、'.join(failed) if failed else ('候选检查失败，请查看审批证据' if item.get('last_error') else '无')}",
+            f"360天证据：{min(evidence_count, 4)}/4张已验证",
+            "",
+            "本页只读；批准或拒绝请进入模型审批。",
         ]
-        return "\n".join(lines), [[("⬅️ 版本列表", "p:versions"), ("🏠 主菜单", "m:home")]]
+        candidate_id = str(item.get("release_sha256") or "")[:16]
+        rows = [[("前往模型审批", f"a:{candidate_id}:view")],
+                [("⬅️ 模型与参数", "m:models"), ("🏠 主菜单", "m:home")]]
+        return "\n".join(lines), rows
 
-    def _evidence_menu(self) -> tuple[str, list]:
-        sets = self.parameters.evidence().get("sets", [])[:3]
-        lines = ["🖼 v22 模型证据", "请选择证据版本："]
+    def _model_history(self) -> tuple[str, list]:
+        history = self._parameter_catalog().get("models", {}).get("history", [])[:3]
+        lines = ["🕒 v22 历史模型", "仅展示有可信激活记录、曾参与实盘且已下线的最近3个模型。", ""]
         rows = []
-        for index, item in enumerate(sets):
-            relation = "当前精确证据" if item.get("relation_to_active") == "EXACT" else "历史覆盖证据"
-            lines.append(f"• {item.get('evidence_set_id')}｜{relation}｜{len(item.get('attachments', []))}张")
-            rows.append([(f"{index + 1}. {relation}", f"p:es:{item.get('evidence_set_id')}")])
-        if not sets:
-            lines.append("当前没有通过哈希验证的PNG/PDF证据。")
+        if not history:
+            lines.append("当前没有可确认的已下线实盘模型记录。")
+        for index, item in enumerate(history):
+            lines.append(f"{index + 1}. 上线 {self._bj_time(item.get('activated_at'))}｜下线 {self._bj_time(item.get('retired_at'))}")
+            rows.append([(f"查看历史模型 {index + 1}", f"p:hist_model:{index}")])
         rows.append([("⬅️ 模型与参数", "m:models"), ("🏠 主菜单", "m:home")])
         return "\n".join(lines), rows
 
-    def _evidence_step(self, parts: list[str], chat_id: int) -> tuple[str, list]:
-        set_id = parts[2]
-        evidence = self.parameters.evidence_set(set_id)
-        if not evidence:
-            raise ValueError("证据集不存在")
-        notice = evidence.get("notice") or "证据模型与当前模型哈希一致"
-        if len(parts) == 3:
-            return f"🖼 证据集 {set_id}\n{notice}\n请选择策略：", [
-                [("Grid", f"p:es:{set_id}:grid"), ("DCA", f"p:es:{set_id}:dca")],
-                [("⬅️ 证据列表", "p:evidence")],
-            ]
-        strategy = parts[3]
-        if len(parts) == 4:
-            quote = "FDUSD" if strategy == "grid" else "USDT"
-            return f"请选择{strategy.upper()}机器人：", [[
-                (f"BTC-{quote}", f"p:es:{set_id}:{strategy}:BTC"),
-                (f"ETH-{quote}", f"p:es:{set_id}:{strategy}:ETH"),
-            ], [("⬅️ 证据集", f"p:es:{set_id}")]]
-        asset = parts[4]
-        if len(parts) == 5:
-            return "请选择回测窗口：", [[
-                ("360天", f"p:es:{set_id}:{strategy}:{asset}:360d"),
-                ("1–2月", f"p:es:{set_id}:{strategy}:{asset}:2026_jan_feb"),
-            ], [("5–6月", f"p:es:{set_id}:{strategy}:{asset}:2026_may_june")],
-                [("⬅️ 选择机器人", f"p:es:{set_id}:{strategy}")]]
-        window = parts[5]
-        attachment = self.parameters.attachment(set_id, strategy, asset, window)
-        caption = f"v22 {strategy.upper()} {asset} {window}｜sha256 {attachment['sha256'][:16]}"
-        if attachment.get("notice"):
-            caption += f"\n{attachment['notice']}"
-        self.telegram.send_file(chat_id, attachment["path"], caption)
-        return "✅ 已发送所选证据PNG。", [[
-            ("继续选择", f"p:es:{set_id}:{strategy}:{asset}"),
-            ("⬅️ 模型与参数", "m:models"),
-        ]]
+    def _model_history_detail(self, index: int) -> tuple[str, list]:
+        history = self._parameter_catalog().get("models", {}).get("history", [])[:3]
+        if index < 0 or index >= len(history):
+            raise ValueError("历史模型不存在或列表已更新")
+        item = history[index]
+        lines = [
+            f"🕒 历史模型 {index + 1}",
+            f"模型周：第{item.get('model_week', '-')}周",
+            f"签名有效期（北京时间）：{self._bj_time(item.get('week_start'))} 至 {self._bj_time(item.get('week_end'))}",
+            f"实际上线：{self._bj_time(item.get('activated_at'))}",
+            f"实际下线：{self._bj_time(item.get('retired_at'))}",
+            f"替换原因：{'周度模型稳定切换' if item.get('replacement_reason') == 'MODEL_CUTOVER_STABLE' else '无可信记录'}",
+        ]
+        rows: list[list[tuple[str, str]]] = []
+        if int(item.get("exact_evidence_count") or 0) >= 4:
+            rows.extend([
+                [("Grid BTC 360天", f"p:img:history:{index}:grid:BTC"),
+                 ("Grid ETH 360天", f"p:img:history:{index}:grid:ETH")],
+                [("DCA BTC 360天", f"p:img:history:{index}:dca:BTC"),
+                 ("DCA ETH 360天", f"p:img:history:{index}:dca:ETH")],
+            ])
+        else:
+            lines.append("精确360天证据：无可信记录")
+        rows.append([("⬅️ 历史模型", "p:model_history"), ("🏠 主菜单", "m:home")])
+        return "\n".join(lines), rows
+
+    def _send_model_image(self, parts: list[str], chat_id: int) -> tuple[str, list]:
+        scope = parts[2]
+        catalog = self._parameter_catalog()
+        if scope == "current":
+            subject = catalog.get("models", {}).get("active", {})
+            strategy, asset = parts[3], parts[4]
+            back = "p:model"
+        elif scope == "history":
+            index, strategy, asset = int(parts[3]), parts[4], parts[5]
+            history = catalog.get("models", {}).get("history", [])[:3]
+            if index >= len(history):
+                raise ValueError("历史模型不存在或列表已更新")
+            subject = history[index]
+            back = f"p:hist_model:{index}"
+        else:
+            raise ValueError("不支持的证据范围")
+        attachment = self.parameters.model_attachment(
+            str(subject.get("release_sha256") or ""), str(subject.get("model_sha256") or ""),
+            strategy, asset, "360d",
+        )
+        quote = "FDUSD" if strategy == "grid" else "USDT"
+        self.telegram.send_file(chat_id, attachment["path"],
+                                f"v22 {strategy.upper()} {asset}-{quote}｜精确360天回测")
+        return "✅ 已发送精确绑定的360天回测图。", [[("返回模型详情", back), ("🏠 主菜单", "m:home")]]
 
     def _handle_parameters(self, data: str, chat_id: int) -> tuple[str, list]:
         parts = data.split(":")
@@ -799,14 +867,14 @@ class TradingManagementBot:
             )
         if action == "model":
             return self._v22_model()
-        if action == "versions":
-            return self._parameter_versions()
-        if action == "history":
-            return self._parameter_history(parts[2])
-        if action == "evidence":
-            return self._evidence_menu()
-        if action == "es":
-            return self._evidence_step(parts, chat_id)
+        if action == "candidate":
+            return self._candidate_model()
+        if action == "model_history":
+            return self._model_history()
+        if action == "hist_model":
+            return self._model_history_detail(int(parts[2]))
+        if action == "img":
+            return self._send_model_image(parts, chat_id)
         return self._models()
 
     def _bot_menu(self, key: str) -> tuple[str, list[list[tuple[str, str]]]]:
@@ -1321,11 +1389,11 @@ class TradingManagementBot:
         pending = [item for item in self.approvals.pending() if item["status"] == "PENDING"]
         lines = ["🧠 模型审批", f"待审批：{len(pending)}", ""]
         rows: list[list[tuple[str, str]]] = []
-        for item in pending[:10]:
+        for index, item in enumerate(pending[:10], 1):
             deadline = item.get("review_deadline")
             remain = max(0, int(deadline) - int(time.time())) if deadline else 0
-            lines.append(f"• {item['model_type']} / {item['candidate_id']} / 剩余{remain // 3600}小时")
-            rows.append([(f"查看 {item['candidate_id']}", f"a:{item['candidate_id']}:view")])
+            lines.append(f"• {item['model_type']} 候选{index} / 剩余{remain // 3600}小时")
+            rows.append([(f"查看候选 {index}", f"a:{item['candidate_id']}:view")])
         if not pending:
             lines.append("当前没有待审批模型。")
         rows.append([("刷新", "m:approvals"), ("🏠 主菜单", "m:home")])
@@ -1348,7 +1416,7 @@ class TradingManagementBot:
             self.telegram.send(
                 self.settings.admin_user_id,
                 "🧠 新模型候选等待审批\n\n"
-                f"类型：{item['model_type']}\n候选：{item['candidate_id']}\n"
+                f"类型：{item['model_type']}\n"
                 f"默认审批截止：{deadline_text}\n"
                 "截止前无人拒绝且硬门槛持续通过时自动批准；当前模型继续交易。",
                 [[("查看证据并审批", f"a:{item['candidate_id']}:view")]],
@@ -1361,12 +1429,10 @@ class TradingManagementBot:
             return "模型候选不存在或已归档。", self._back("m:approvals")
         evidence = self.approvals.evidence(item)
         checks = item.get("checks", {})
-        check_lines = [f"• {key}：{'通过' if value else '失败'}" for key, value in checks.items()]
+        check_lines = [f"• {self._check_label(key)}：{'通过' if value else '失败'}"
+                       for key, value in checks.items()]
         lines = [
             f"🧠 {item['model_type']}",
-            f"候选：{item['candidate_id']}",
-            f"Release：{item['release_sha256']}",
-            f"模型：{item['model_sha256']}",
             f"状态：{item['status']}",
             f"证据附件：{len(evidence['attachments'])}",
             "硬门槛：",
@@ -1393,11 +1459,11 @@ class TradingManagementBot:
                 item for item in evidence["attachments"]
                 if str(item["name"]).lower().endswith((".png", ".jpg", ".jpeg", ".pdf"))
             ]
-            for item in attachments[:8]:
+            for number, item in enumerate(attachments[:8], 1):
                 self.telegram.send_file(
                     int(callback["message"]["chat"]["id"]),
                     item["path"],
-                    f"{candidate_id} · {item['name']} · sha256 {item['sha256'][:16]}",
+                    f"{candidate['model_type']} 候选证据 {number}",
                 )
             return (
                 f"已发送 {min(len(attachments), 8)} 个PNG/PDF证据附件。"
@@ -1406,7 +1472,7 @@ class TradingManagementBot:
             )
         if action == "approve":
             return (
-                f"确认批准模型候选 {candidate_id}？\n决定将绑定请求和证据哈希。",
+                "确认批准这个模型候选？\n后台仍会绑定并复核完整请求和证据身份。",
                 [[("确认批准", f"a:{candidate_id}:approve2"), ("取消", f"a:{candidate_id}:view")]],
             )
         if action == "reject":
@@ -1432,7 +1498,7 @@ class TradingManagementBot:
                 self.store.finish_action(key, "APPROVED", result)
             else:
                 result = existing or {}
-            return f"✅ 模型候选已批准\n{candidate_id}\nScheduler 将再次验证后预热和激活。", self._back("m:approvals")
+            return "✅ 模型候选已批准\nScheduler 将再次验证后预热和激活。", self._back("m:approvals")
         raise ValueError("未知审批动作")
 
     def _handle_text_session(self, message: dict, session: dict) -> tuple[str, list]:
@@ -1554,7 +1620,7 @@ class TradingManagementBot:
                 telegram_callback_query_id=str(callback["id"]),
             )
             self.store.delete_session(sid)
-            return f"❌ 模型候选已拒绝\n{result['release_sha256'][:16]}", self._back("m:approvals")
+            return "❌ 模型候选已拒绝，原因已记录。", self._back("m:approvals")
         if action == "exec_view":
             return self._stock_executor_detail(session)
         if action in {"exec_pause", "exec_close"}:

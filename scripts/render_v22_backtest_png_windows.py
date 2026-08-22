@@ -254,8 +254,7 @@ def render_card(*, strategy: str, pair: str, quote: str, rows: list[dict[str, fl
            color=COLORS["drawdown"], **common)
     _panel(draw, title="v22 概率（蓝）与逐周阈值（红）", field="probability",
            second_field="entry_threshold", box=boxes[3], color=COLORS["probability"], **common)
-    sha_short = production_model_sha256[:16] if production_model_sha256 else "未提供"
-    draw.text((64, 2320), f"UTC｜生产模型 {sha_short}…｜离线反事实，不代表未来收益",
+    draw.text((64, 2320), "UTC｜v22 周度模型｜离线反事实，不代表未来收益",
               fill="#64748b", font=report_font(24))
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target, "PNG", optimize=True)
@@ -264,7 +263,8 @@ def render_card(*, strategy: str, pair: str, quote: str, rows: list[dict[str, fl
 
 
 def build_report(evidence_dir: Path, output_dir: Path, *, signed_start: int,
-                 production_model_sha256: str, evidence_model_sha256: str) -> dict[str, Any]:
+                 production_model_sha256: str, evidence_model_sha256: str,
+                 release_sha256: str = "") -> dict[str, Any]:
     series = _read_series(evidence_dir / "audit_series.csv.gz")
     intervals = _read_intervals(evidence_dir / "risk_intervals.csv")
     missing = [key for key in ((strategy, pair) for strategy, pair, _ in PAIR_SPECS) if key not in series]
@@ -278,6 +278,7 @@ def build_report(evidence_dir: Path, output_dir: Path, *, signed_start: int,
         "execution_policy": "v22-risk-off-forced-exit-v2",
         "production_model_sha256": production_model_sha256,
         "evidence_model_sha256": evidence_model_sha256,
+        "release_sha256": release_sha256 or None,
         "historical_week_identity_verified": True,
         "common_complete_evidence_end": common_end // DAY * DAY,
         "images": [],
@@ -309,11 +310,13 @@ def main() -> int:
     parser.add_argument("--signed-start", type=int, required=True)
     parser.add_argument("--production-model-sha256", required=True)
     parser.add_argument("--evidence-model-sha256", required=True)
+    parser.add_argument("--release-sha256", default="")
     args = parser.parse_args()
     manifest = build_report(
         args.evidence_dir, args.output_dir, signed_start=args.signed_start,
         production_model_sha256=args.production_model_sha256,
         evidence_model_sha256=args.evidence_model_sha256,
+        release_sha256=args.release_sha256,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
