@@ -41,6 +41,7 @@ from stocks_runtime.paper_broker import PostgresPaperBroker  # noqa: E402
 from stocks_runtime.paper_exchange import BinanceStocksPaperExchange  # noqa: E402
 from stocks_runtime.router import router as stocks_router  # noqa: E402
 from stocks_runtime.settings import StocksRuntimeSettings  # noqa: E402
+from stocks_runtime.whitelist_market_data import refresh_whitelist_quotes  # noqa: E402
 from routers import executors as executors_router  # noqa: E402
 from services.accounts_service import AccountsService  # noqa: E402
 from services.executor_service import ExecutorService  # noqa: E402
@@ -116,22 +117,16 @@ async def _refresh_runtime(app, stop: asyncio.Event) -> None:
                 total, available = await client.funding_usdc()
             ledger.set_quote_balances(total, available)
             symbols = _direct_symbols(app.state.stocks_market_info)
-            prices: Dict[str, Decimal] = {}
-            # Only managed/active symbols need repeated private-risk valuation.
-            managed = await ledger.managed_positions()
-            active_pairs = {
-                str(meta.get("trading_pair", "")).split("-")[0]
-                for meta in app.state.executor_service._executor_metadata.values()
-            }
-            for symbol in (set(managed) | active_pairs):
-                if symbol in symbols:
-                    quote = await client.quote(symbol)
-                    connector = getattr(app.state, "stocks_connector", None)
-                    if app.state.stocks_settings.mode == "PAPER" and connector is not None:
-                        connector.process_quote_event(quote)
-                    bid = Decimal(str(quote.get("bidPrice", quote.get("bid", "0"))))
-                    ask = Decimal(str(quote.get("askPrice", quote.get("ask", "0"))))
-                    prices[symbol] = ask if ask > 0 else bid
+            refresh = await refresh_whitelist_quotes(
+                client=client,
+                ledger=ledger,
+                available_symbols=symbols,
+                connector=getattr(app.state, "stocks_connector", None),
+                market_data_service=app.state.market_data_service,
+            )
+            prices = refresh.prices
+            app.state.stocks_price_symbols = list(refresh.symbols)
+            app.state.stocks_price_errors = dict(refresh.errors)
             trading_date = _trading_date(app.state.stocks_market_info)
             policy.update_market(symbols, prices, trading_date)
             if client.api_key and app.state.stocks_settings.mode != "PAPER":
@@ -421,6 +416,8 @@ async def stocks_lifespan(runtime_app):
         runtime_app.state.stocks_read_client = client
         runtime_app.state.stocks_market_info = market_info
         runtime_app.state.stocks_activation_ms = int(time.time() * 1000)
+        runtime_app.state.stocks_price_symbols = []
+        runtime_app.state.stocks_price_errors = {}
         runtime_app.state.stocks_policy = StocksExecutorPolicy(ledger, settings.mode, settings.live_authorized)
         if broker is not None:
             broker.update_market_state("UNKNOWN", trading_date=_trading_date(market_info))
@@ -470,7 +467,10 @@ async def stocks_lifespan(runtime_app):
         await ledger.ensure_whitelist(default_whitelist)
         runtime_app.state.stocks_policy.update_market(direct_symbols, {}, _trading_date(market_info))
         _install_executor_policy(runtime_app)
-        market_data_service.start()
+        # The upstream service assumes every connector has a bulk ticker endpoint. Binance
+        # Stocks only exposes one-symbol Quote, so its generic collector would inspect all
+        # ~8k symbols and emit a warning every 30 seconds. _refresh_runtime instead refreshes
+        # only the operator whitelist and pushes those mids into this rate provider.
         if paper_mode:
             await _restore_paper_executors(runtime_app)
         else:
