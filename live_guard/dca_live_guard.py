@@ -714,8 +714,11 @@ class Guard:
         generated_at = float(status.get("generated_at") or 0)
         fresh = generated_at > 0 and now - generated_at < 30
         contract_healthy = bool(
-            fresh and status.get("sources_healthy") is True
-            and status.get("healthy") is True
+            fresh
+            and status.get("schema") == "account-inventory-status-v3"
+            and status.get("sources_healthy") is True
+            and bool(status.get("account_fingerprint"))
+            and bool(status.get("evidence_sha256"))
         )
         result: Dict[str, Dict[str, Any]] = {}
         for pair, spec in LIVE_PAIRS.items():
@@ -742,7 +745,7 @@ class Guard:
                 "generated_at": generated_at,
                 "age_seconds": max(0.0, now - generated_at) if generated_at else None,
                 "reason": "current_strategy_ownership_covered" if covered else (
-                    "inventory_contract_unhealthy_or_stale" if not contract_healthy
+                    "inventory_contract_untrusted_or_stale" if not contract_healthy
                     else "current_strategy_ownership_exceeds_account_balance"
                 ),
             }
@@ -1168,8 +1171,17 @@ class Guard:
         runtime = self._inventory_runtime_status(order_counts)
         status["runtime"] = runtime
         managed = self._read_json(self.managed_inventory_path)
-        self.state["ownership_preflight"] = self._ownership_preflight_from_status(
+        ownership_preflight = self._ownership_preflight_from_status(
             status, managed,
+        )
+        self.state["ownership_preflight"] = ownership_preflight
+        ownership_ready = bool(ownership_preflight) and all(
+            bool(row.get("covered")) for row in ownership_preflight.values()
+        )
+        self.state["ownership_preflight_checked_at"] = time.time()
+        self.state["ownership_preflight_healthy_cycles"] = (
+            int(self.state.get("ownership_preflight_healthy_cycles", 0)) + 1
+            if ownership_ready else 0
         )
         self.state["account_inventory"] = {
             "healthy": status["healthy"], "evidence_sha256": evidence,

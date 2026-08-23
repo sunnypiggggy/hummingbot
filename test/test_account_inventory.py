@@ -92,9 +92,13 @@ def test_ownership_does_not_double_count_adjustments_already_in_latest_net_base(
 
 def test_dca_approval_preflight_uses_current_unified_ownership():
     status = {
+        "schema": "account-inventory-status-v3",
         "generated_at": 95,
         "sources_healthy": True,
-        "healthy": True,
+        # Normal activity can make overall healthy false without invalidating
+        # ownership evidence used by the weekly model preflight.
+        "healthy": False,
+        "account_fingerprint": "f" * 64,
         "evidence_sha256": "evidence",
         "assets": {
             "BTC": {

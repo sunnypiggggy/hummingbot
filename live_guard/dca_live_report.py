@@ -1313,6 +1313,7 @@ class UnifiedTelegramReporting:
             order_build_state = str(order_build.get("state") or "UNKNOWN").upper()
             order_build_healthy = order_build_state in {
                 "HEALTHY", "EXPECTED_EMPTY", "INTENTIONAL_IDLE",
+                "REFRESH_REQUESTED", "CANCEL_PENDING", "REBUILDING",
             }
             mechanisms = state.get("mechanisms", {})
             technical_contract = gate.get("pairs", {}).get(pair, {})
@@ -1431,6 +1432,16 @@ class UnifiedTelegramReporting:
                     "order_build_reason": order_build.get("reason"),
                 },
                 "order_build_status": order_build,
+                "runtime_code": {
+                    "loaded_source_sha256": runtime.get("loaded_source_sha256"),
+                    "disk_source_sha256": runtime.get("disk_source_sha256"),
+                    "loaded_at": runtime.get("loaded_at"),
+                    "current": bool(
+                        runtime.get("loaded_source_sha256")
+                        and runtime.get("loaded_source_sha256")
+                        == runtime.get("disk_source_sha256")
+                    ),
+                },
                 "grid_parameters": {
                     "profile": pair_params.get("profile"),
                     "grid_range": pair_params.get("grid_range"),

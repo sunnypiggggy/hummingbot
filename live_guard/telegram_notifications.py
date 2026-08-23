@@ -1196,6 +1196,9 @@ GATE_STATE_DISPLAY = {
     "MISSING": "挂单缺失",
     "RETRYING": "自动重建中",
     "RESTRICTED": "该交易对受限",
+    "REFRESH_REQUESTED": "成交后准备刷新",
+    "CANCEL_PENDING": "正在撤销旧网格",
+    "REBUILDING": "正在建立新网格",
     "N/A": "不适用",
 }
 GATE_REASON_DISPLAY = {
@@ -1213,6 +1216,7 @@ GATE_REASON_DISPLAY = {
     "active_orders_confirmed": "活动挂单已确认",
     "expected_orders_missing": "应有挂单但当前为零",
     "pair_order_set_rebuilt": "挂单已自动恢复",
+    "expected_fill_refresh": "正常成交后刷新网格",
     "technical_buy_gate_blocks_buy": "模型门预期阻止BUY",
     "insufficient_budget_or_inventory_for_legal_order": "余额不足以形成合格订单",
     "runtime_order_status_unavailable": "暂无挂单执行状态",

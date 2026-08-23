@@ -252,7 +252,8 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             {"BTC-FDUSD": Decimal("71532"), pair: price},
             [Order("sell-safe", pair)],
         )
-        self.assertEqual(pair, rebuilt[0][0])
+        self.assertEqual([], rebuilt)
+        self.assertEqual("REFRESH_REQUESTED", status["state"])
 
     def test_targeted_btc_rebuild_does_not_touch_eth_orders(self):
         strategy = self.strategy()
@@ -279,8 +280,87 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         )
 
         self.assertTrue(changed)
-        self.assertEqual(["BTC-FDUSD"], [value[0] for value in rebuilt])
+        self.assertEqual([], rebuilt)
+        self.assertEqual("REFRESH_REQUESTED", status["state"])
         self.assertIn("eth-live", strategy.ledgers["ETH-FDUSD"].open_order_ids)
+
+    def test_expected_fill_refresh_cancels_only_filled_pair_before_single_rebuild(self):
+        strategy = self.strategy()
+        btc_filled = "btc-filled"
+        btc_old = "btc-old"
+        eth_old = "eth-old"
+        strategy.sell_order_ids.update({btc_filled, btc_old, eth_old})
+        strategy.ledgers["BTC-FDUSD"].open_order_ids.update({btc_filled, btc_old})
+        strategy.ledgers["ETH-FDUSD"].open_order_ids.add(eth_old)
+        cancelled = []
+        strategy.cancel = lambda exchange, pair, order_id: cancelled.append((pair, order_id))
+        rebuilt = []
+        def rebuild(pair, price, quote):
+            rebuilt.append((pair, price, quote))
+            strategy._mark_order_build_healthy(
+                pair, expected_buy=1, expected_sell=1,
+                actual_buy=1, actual_sell=1,
+            )
+            return quote
+        strategy._place_pair_grid = rebuild
+
+        strategy.did_complete_sell_order(SimpleNamespace(
+            order_id=btc_filled, trading_pair="BTC-FDUSD",
+        ))
+        self.assertEqual("REFRESH_REQUESTED", strategy.order_build_status["BTC-FDUSD"]["state"])
+        self.assertFalse(any(event["event"] == "grid_order_set_missing" for event in strategy.runtime_events))
+
+        prices = {"BTC-FDUSD": Decimal("71532"), "ETH-FDUSD": Decimal("2100")}
+        active = [Order(btc_old, "BTC-FDUSD"), Order(eth_old, "ETH-FDUSD")]
+        self.assertTrue(strategy._advance_pair_order_refreshes(prices, active))
+        self.assertEqual([("BTC-FDUSD", btc_old)], cancelled)
+        self.assertEqual([], rebuilt)
+        self.assertIn(eth_old, strategy.ledgers["ETH-FDUSD"].open_order_ids)
+
+        strategy._set_current_timestamp(1005.0)
+        self.assertTrue(strategy._advance_pair_order_refreshes(
+            prices, [Order(eth_old, "ETH-FDUSD")],
+        ))
+        self.assertEqual(["BTC-FDUSD"], [row[0] for row in rebuilt])
+        self.assertIn(eth_old, strategy.ledgers["ETH-FDUSD"].open_order_ids)
+
+        # The committed generation is not submitted twice on the next cycle.
+        self.assertFalse(strategy._advance_pair_order_refreshes(
+            prices, [Order(eth_old, "ETH-FDUSD")],
+        ))
+        self.assertEqual(1, len(rebuilt))
+
+    def test_unexpected_gap_waits_fifteen_seconds_before_requesting_refresh(self):
+        strategy = self.strategy()
+        status = strategy.order_build_status["BTC-FDUSD"]
+        status.update({"state": "HEALTHY", "expected_buy_layers": 2})
+        prices = {"BTC-FDUSD": Decimal("71532"), "ETH-FDUSD": Decimal("2100")}
+        for timestamp in (1000.0, 1005.0, 1014.9):
+            strategy._set_current_timestamp(timestamp)
+            strategy._check_order_liveness_and_rebuild(prices, [])
+        self.assertEqual("HEALTHY", status["state"])
+        self.assertFalse(strategy.runtime_events)
+        strategy._set_current_timestamp(1015.0)
+        strategy._check_order_liveness_and_rebuild(prices, [])
+        self.assertEqual("REFRESH_REQUESTED", status["state"])
+        self.assertEqual(1, len([
+            event for event in strategy.runtime_events
+            if event["event"] == "grid_order_set_missing"
+        ]))
+
+    def test_generation_rejects_duplicate_prices_and_sell_inventory_overflow(self):
+        with self.assertRaisesRegex(ParameterBuildError, "duplicate normalized SELL"):
+            LivePortfolioGrid._validate_order_generation(
+                "ETH-FDUSD", [],
+                [(Decimal("2100"), Decimal("0.01")),
+                 (Decimal("2100"), Decimal("0.01"))],
+                Decimal("0.02"),
+            )
+        with self.assertRaisesRegex(ParameterBuildError, "exceeds owned inventory"):
+            LivePortfolioGrid._validate_order_generation(
+                "ETH-FDUSD", [], [(Decimal("2100"), Decimal("0.021"))],
+                Decimal("0.02"),
+            )
 
     def test_risk_off_pair_does_not_trigger_zero_order_rebuild(self):
         strategy = self.strategy()

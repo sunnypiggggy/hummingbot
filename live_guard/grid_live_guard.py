@@ -472,14 +472,10 @@ class Guard:
                 "fail_closed_seconds": self.fail_closed_seconds, "auto_recovery": False,
             },
         }
-        emergency_error = None
-        shadow_preflight = None
-        if (self.shadow or self.armed) and self.emergency_exchange is not None:
-            try:
-                pairs = [pair for key in self.portfolio_keys for pair in PORTFOLIOS[key].pairs]
-                shadow_preflight = self.verify_shadow_exchange_ready(pairs)
-            except Exception as exc:
-                emergency_error = repr(exc)
+        self.emergency_preflight_refresh_seconds = int(os.getenv(
+            "GRID_EMERGENCY_PREFLIGHT_REFRESH_SECONDS", "15",
+        ))
+        self.next_emergency_preflight = 0.0
         if self.emergency_docker is not None:
             for key in self.portfolio_keys:
                 portfolio = PORTFOLIOS[key]
@@ -490,24 +486,62 @@ class Guard:
                         "tripped": False,
                         "action_complete": False,
                     })
-            self.state["emergency_ready"] = bool(
-                self.emergency_exchange is not None
-                and self.emergency_docker is not None
-                and emergency_error is None
-            )
-            self.state["emergency_checked_at"] = time.time()
-            if emergency_error:
-                self.state["emergency_error"] = emergency_error
-            else:
-                self.state.pop("emergency_error", None)
-            if shadow_preflight is not None:
-                self.state["shadow_preflight"] = shadow_preflight
-            self.save()
+        self._refresh_emergency_readiness(force=True)
 
     def save(self):
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
         temporary.replace(self.state_path)
+
+    def _refresh_emergency_readiness(self, *, force: bool = False) -> None:
+        """Refresh dynamic emergency evidence instead of preserving startup state."""
+        now = time.time()
+        if not force and now < float(getattr(self, "next_emergency_preflight", 0)):
+            return
+        self.next_emergency_preflight = now + int(getattr(
+            self, "emergency_preflight_refresh_seconds", 15,
+        ))
+        self.state["emergency_checked_at"] = now
+        if (
+            getattr(self, "emergency_exchange", None) is None
+            or getattr(self, "emergency_docker", None) is None
+        ):
+            self.state.update({
+                "emergency_ready": False,
+                "emergency_status": "FAILED",
+                "emergency_error": "independent emergency channel is unavailable",
+                "emergency_healthy_cycles": 0,
+            })
+            self.save()
+            return
+        try:
+            pairs = [
+                pair for key in self.portfolio_keys for pair in PORTFOLIOS[key].pairs
+            ]
+            preflight = self.verify_shadow_exchange_ready(pairs)
+            self.state["shadow_preflight"] = preflight
+            self.state["emergency_ready"] = True
+            self.state["emergency_status"] = "READY"
+            self.state["emergency_last_success_at"] = now
+            self.state["emergency_healthy_cycles"] = int(
+                self.state.get("emergency_healthy_cycles", 0)
+            ) + 1
+            self.state.pop("emergency_error", None)
+        except Exception as exc:
+            message = repr(exc)
+            immediate_integrity_failure = any(token in message.lower() for token in (
+                "ownership deficit", "account fingerprint", "sources are unhealthy",
+                "status is stale", "evidence hash", "managed inventory exceeds",
+            ))
+            last_success = float(self.state.get("emergency_last_success_at") or 0)
+            within_retry_grace = not immediate_integrity_failure and now - last_success <= 30
+            self.state["emergency_ready"] = bool(within_retry_grace)
+            self.state["emergency_status"] = (
+                "RETRYING" if within_retry_grace else "FAILED"
+            )
+            self.state["emergency_error"] = message
+            self.state["emergency_healthy_cycles"] = 0
+        self.save()
 
     def _scan_runtime_logs(self) -> None:
         if self.emergency_docker is None:
@@ -1412,6 +1446,7 @@ class Guard:
             self.save()
 
     def cycle(self):
+        self._refresh_emergency_readiness()
         if self.manifest_path.exists():
             self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         status = json.dumps(self.api.status(), ensure_ascii=True)

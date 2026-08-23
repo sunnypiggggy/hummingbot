@@ -8,6 +8,7 @@ reserved quote and base inventory.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -69,8 +70,11 @@ try:
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
 
-RUNTIME_STATE_SCHEMA_VERSION = 10
+RUNTIME_STATE_SCHEMA_VERSION = 11
 ORDER_REBUILD_BACKOFF_SECONDS = (5, 15, 30, 60)
+UNEXPECTED_ORDER_GAP_SECONDS = 15
+PAIR_REFRESH_WARNING_SECONDS = 30
+PAIR_REFRESH_RESTRICT_SECONDS = 60
 
 
 @dataclass
@@ -289,6 +293,9 @@ class LivePortfolioGrid(StrategyV2Base):
         self.order_build_status: Dict[str, Dict[str, Any]] = {
             pair: self._empty_order_build_status() for pair in config.trading_pairs
         }
+        source_path = Path(__file__)
+        self.loaded_source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        self.loaded_at = time.time()
         self.next_parameter_poll = 0.0
         self.selection_mtime_ns = -1
         self.state_invalid_reason: Optional[str] = None
@@ -423,6 +430,10 @@ class LivePortfolioGrid(StrategyV2Base):
                 return
 
             if self.portfolio_tripped:
+                self._persist(prices)
+                self.first_cycle_failure_at = None
+                return
+            if self._advance_pair_order_refreshes(prices, active):
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
@@ -850,6 +861,14 @@ class LivePortfolioGrid(StrategyV2Base):
             "buy_budget": None,
             "minimum_order_quote": None,
             "amount_step": None,
+            "refresh_reason": None,
+            "refresh_requested_at": None,
+            "cancel_started_at": None,
+            "last_cancel_attempt_at": None,
+            "refresh_generation": 0,
+            "refresh_warning_notified": False,
+            "refresh_restricted_notified": False,
+            "completed_order_ids": [],
         }
 
     def _pair_amount_filters(self, pair: str) -> tuple[Decimal, Decimal]:
@@ -999,6 +1018,120 @@ class LivePortfolioGrid(StrategyV2Base):
             len(active_ids & self.sell_order_ids),
         )
 
+    def _pair_owned_active_orders(self, pair: str, active_orders: list) -> list:
+        owned = self._owned_order_ids()
+        return [
+            order for order in active_orders
+            if str(getattr(order, "trading_pair", "")) == pair
+            and str(getattr(order, "client_order_id", "")) in owned
+        ]
+
+    def _request_pair_order_refresh(
+        self, pair: str, *, reason: str, completed_order_id: str | None = None,
+    ) -> None:
+        status = self._order_status(pair)
+        if completed_order_id:
+            completed = list(status.get("completed_order_ids") or [])
+            if completed_order_id not in completed:
+                completed.append(completed_order_id)
+            status["completed_order_ids"] = completed[-20:]
+        if status.get("state") in {
+            "REFRESH_REQUESTED", "CANCEL_PENDING", "REBUILDING",
+        }:
+            return
+        now = float(self.current_timestamp)
+        status.update({
+            "state": "REFRESH_REQUESTED",
+            "reason": reason,
+            "refresh_reason": reason,
+            "refresh_requested_at": now,
+            "cancel_started_at": None,
+            "last_cancel_attempt_at": None,
+            "refresh_generation": int(status.get("refresh_generation", 0)) + 1,
+            "refresh_warning_notified": False,
+            "refresh_restricted_notified": False,
+            "consecutive_empty_cycles": 0,
+            "first_empty_at": None,
+        })
+
+    def _advance_pair_order_refreshes(
+        self, prices: Dict[str, Decimal], active_orders: list,
+    ) -> bool:
+        """Cancel then rebuild one pair generation without overlapping old orders."""
+        now = float(self.current_timestamp)
+        for pair in self.config.trading_pairs:
+            status = self._order_status(pair)
+            phase = str(status.get("state", ""))
+            if phase not in {"REFRESH_REQUESTED", "CANCEL_PENDING", "REBUILDING"}:
+                continue
+            if (
+                self.pair_recovery.get(pair, {}).get("phase") != ACTIVE
+                or self.ledgers[pair].halted
+                or self.macro_paused
+                or not self.technical_gate_healthy_by_pair.get(pair, False)
+            ):
+                status.update({
+                    "state": "INTENTIONAL_IDLE",
+                    "reason": "pair_refresh_aborted_by_active_risk_gate",
+                    "refresh_reason": None,
+                    "refresh_requested_at": None,
+                })
+                return True
+            pair_orders = self._pair_owned_active_orders(pair, active_orders)
+            if phase == "REFRESH_REQUESTED":
+                status["state"] = "CANCEL_PENDING"
+                status["cancel_started_at"] = now
+                phase = "CANCEL_PENDING"
+            if phase == "CANCEL_PENDING" and pair_orders:
+                last_attempt = float(status.get("last_cancel_attempt_at") or 0)
+                if now - last_attempt >= 5:
+                    self.cancel_owned_orders(active=pair_orders, pairs={pair})
+                    status["last_cancel_attempt_at"] = now
+                age = now - float(status.get("refresh_requested_at") or now)
+                if age >= PAIR_REFRESH_WARNING_SECONDS and not status.get("refresh_warning_notified"):
+                    status["refresh_warning_notified"] = True
+                    self._record_runtime_event(
+                        "grid_pair_refresh_delayed", pair=pair,
+                        reason=str(status.get("refresh_reason") or "pair_refresh"),
+                        duration_seconds=age,
+                        refresh_generation=status.get("refresh_generation"),
+                    )
+                if age >= PAIR_REFRESH_RESTRICT_SECONDS and not status.get("refresh_restricted_notified"):
+                    status["refresh_restricted_notified"] = True
+                    self._record_runtime_event(
+                        "grid_order_rebuild_failed", pair=pair,
+                        reason="pair cancellation remained incomplete",
+                        duration_seconds=age,
+                        refresh_generation=status.get("refresh_generation"),
+                    )
+                return True
+            if phase == "CANCEL_PENDING":
+                self._prune_inactive_order_ownership(active_orders)
+                status["state"] = "REBUILDING"
+                phase = "REBUILDING"
+            if phase == "REBUILDING":
+                if self._pair_owned_active_orders(pair, active_orders):
+                    status["state"] = "CANCEL_PENDING"
+                    return True
+                try:
+                    self._place_pair_grid(
+                        pair, prices[pair], self._available_balance(self.config.quote_asset),
+                    )
+                except ParameterBuildError as exc:
+                    self._record_order_build_failure(pair, str(exc))
+                    return True
+                self._order_status(pair).update({
+                    "refresh_reason": None,
+                    "refresh_requested_at": None,
+                    "cancel_started_at": None,
+                    "last_cancel_attempt_at": None,
+                    "refresh_warning_notified": False,
+                    "refresh_restricted_notified": False,
+                    "completed_order_ids": [],
+                })
+                return True
+        return False
+
     def _check_order_liveness_and_rebuild(
         self, prices: Dict[str, Decimal], active_orders: list,
     ) -> bool:
@@ -1055,23 +1188,13 @@ class LivePortfolioGrid(StrategyV2Base):
                 status.get("consecutive_empty_cycles", 0)
             ) + 1
             empty_age = now - float(status["first_empty_at"])
-            if status["consecutive_empty_cycles"] < 3 or empty_age < 5:
+            if status["consecutive_empty_cycles"] < 3 or empty_age < UNEXPECTED_ORDER_GAP_SECONDS:
                 continue
             if status.get("state") not in {"MISSING", "RETRYING", "RESTRICTED"}:
                 status["state"] = "MISSING"
                 self._record_order_build_failure(pair, "expected_orders_missing")
-            next_retry = status.get("next_retry_at")
-            if next_retry is not None and now < float(next_retry):
-                continue
-            try:
-                # Available balance excludes quote locked by the other pair,
-                # so this targeted rebuild cannot consume or cancel peer orders.
-                self._place_pair_grid(
-                    pair, prices[pair], self._available_balance(self.config.quote_asset),
-                )
-                rebuilt = True
-            except ParameterBuildError as exc:
-                self._record_order_build_failure(pair, str(exc))
+            self._request_pair_order_refresh(pair, reason="expected_orders_missing")
+            rebuilt = True
         return rebuilt
 
     def _place_grids(self, prices: Dict[str, Decimal]) -> None:
@@ -1111,6 +1234,14 @@ class LivePortfolioGrid(StrategyV2Base):
         ledger = self.ledgers[pair]
         if ledger.halted:
             return remaining_quote
+        existing = [
+            order for order in self._strategy_pair_active_orders()
+            if str(getattr(order, "trading_pair", "")) == pair
+        ]
+        if existing:
+            raise ParameterBuildError(
+                pair, f"refusing overlapping grid generation: {len(existing)} active orders remain",
+            )
         params = self._pair_params(pair)
         state = self.grid_states.get(pair)
         if state is None:
@@ -1149,17 +1280,6 @@ class LivePortfolioGrid(StrategyV2Base):
                     f"BUY build produced no executable order: price={price} "
                     f"budget={buy_budget} minimum={minimum_order_quote} step={amount_step}"
                 )
-        submitted_quote = Decimal("0")
-        submitted_buy = 0
-        for order_price, amount in buy_orders:
-            order_id = self.buy(
-                self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, order_price,
-            )
-            ledger.open_order_ids.add(order_id)
-            self.buy_order_ids.add(order_id)
-            submitted_quote += amount * order_price
-            submitted_buy += 1
-        remaining_quote = max(remaining_quote - submitted_quote, Decimal("0"))
         base_asset = pair.split("-", 1)[0]
         sell_budget = min(
             max(ledger.base, Decimal("0")), ledger.initial_base,
@@ -1174,12 +1294,24 @@ class LivePortfolioGrid(StrategyV2Base):
             sell_orders = self._build_sell_orders(
                 pair, upper_levels, sell_budget, price, cost_floor,
             )
-            for sell_price, amount in sell_orders:
-                order_id = self.sell(
-                    self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, sell_price,
-                )
-                ledger.open_order_ids.add(order_id)
-                self.sell_order_ids.add(order_id)
+        self._validate_order_generation(pair, buy_orders, sell_orders, sell_budget)
+        submitted_quote = Decimal("0")
+        submitted_buy = 0
+        for order_price, amount in buy_orders:
+            order_id = self.buy(
+                self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, order_price,
+            )
+            ledger.open_order_ids.add(order_id)
+            self.buy_order_ids.add(order_id)
+            submitted_quote += amount * order_price
+            submitted_buy += 1
+        remaining_quote = max(remaining_quote - submitted_quote, Decimal("0"))
+        for sell_price, amount in sell_orders:
+            order_id = self.sell(
+                self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, sell_price,
+            )
+            ledger.open_order_ids.add(order_id)
+            self.sell_order_ids.add(order_id)
         expected_buy = len(buy_orders)
         expected_sell = len(sell_orders)
         if buy_build_error is not None:
@@ -1209,6 +1341,28 @@ class LivePortfolioGrid(StrategyV2Base):
             actual_buy=submitted_buy, actual_sell=len(sell_orders), reason=reason,
         )
         return remaining_quote
+
+    @staticmethod
+    def _validate_order_generation(
+        pair: str,
+        buy_orders: List[tuple[Decimal, Decimal]],
+        sell_orders: List[tuple[Decimal, Decimal]],
+        sell_budget: Decimal,
+    ) -> None:
+        """Reject duplicate prices or inventory-unsafe SELL generations pre-submit."""
+        for side, orders in (("BUY", buy_orders), ("SELL", sell_orders)):
+            prices = [Decimal(str(order_price)) for order_price, _ in orders]
+            if len(prices) != len(set(prices)):
+                raise ParameterBuildError(
+                    pair, f"duplicate normalized {side} prices in grid generation",
+                )
+            if any(Decimal(str(amount)) <= 0 for _, amount in orders):
+                raise ParameterBuildError(pair, f"non-positive {side} quantity")
+        sell_total = sum((Decimal(str(amount)) for _, amount in sell_orders), Decimal("0"))
+        if sell_total > sell_budget:
+            raise ParameterBuildError(
+                pair, f"SELL generation exceeds owned inventory: {sell_total}>{sell_budget}",
+            )
 
     def _available_balance(self, asset: str) -> Decimal:
         value = Decimal(str(self.connector.get_available_balance(asset)))
@@ -1629,10 +1783,11 @@ class LivePortfolioGrid(StrategyV2Base):
 
     def cancel_owned_orders(
         self, exclude: set[str] | None = None, pairs: set[str] | None = None,
+        active: list | None = None,
     ) -> int:
         exclude = exclude or set()
         cancelled = 0
-        for order in self._owned_active_orders(exclude=exclude):
+        for order in self._owned_active_orders(active=active, exclude=exclude):
             if pairs is not None and order.trading_pair not in pairs:
                 continue
             if order.client_order_id not in exclude:
@@ -1946,10 +2101,28 @@ class LivePortfolioGrid(StrategyV2Base):
         self._forget_order(event.order_id)
 
     def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
+        if self._is_ordinary_grid_order(event.order_id):
+            self._request_pair_order_refresh(
+                event.trading_pair, reason="expected_fill_refresh",
+                completed_order_id=event.order_id,
+            )
         self._forget_order(event.order_id)
 
     def did_complete_sell_order(self, event: SellOrderCompletedEvent):
+        if self._is_ordinary_grid_order(event.order_id):
+            self._request_pair_order_refresh(
+                event.trading_pair, reason="expected_fill_refresh",
+                completed_order_id=event.order_id,
+            )
         self._forget_order(event.order_id)
+
+    def _is_ordinary_grid_order(self, order_id: str) -> bool:
+        special = (
+            set(getattr(self, "flatten_order_ids", {}).values())
+            | set(getattr(self, "reentry_order_ids", {}).values())
+            | set(getattr(self, "inventory_exit_order_ids", {}).values())
+        )
+        return order_id in (self.buy_order_ids | self.sell_order_ids) and order_id not in special
 
     def reference_price(self, pair: str) -> Decimal:
         price = self.connector.get_price_by_type(pair, PriceType.LastTrade)
@@ -2150,6 +2323,9 @@ class LivePortfolioGrid(StrategyV2Base):
             "active_parameter_sha256": self.active_parameter_sha256,
             "parameter_blocked_pairs": self.parameter_blocked_pairs,
             "order_build_status": self.order_build_status,
+            "loaded_source_sha256": self.loaded_source_sha256,
+            "loaded_at": self.loaded_at,
+            "disk_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "cost_floor_enabled": self.config.cost_floor_enabled,
             "pair_breakers_enabled": self.config.pair_breakers_enabled,
             "portfolio_breakers_enabled": self.config.portfolio_breakers_enabled,

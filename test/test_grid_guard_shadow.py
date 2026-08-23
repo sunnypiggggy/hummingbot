@@ -258,6 +258,41 @@ class GridGuardShadowTest(unittest.TestCase):
             self.assertTrue(all(call.args[1] == "/api/v3/order/test" for call in test_calls))
             self.assertEqual("0.001", result["commissions"]["BTC-FDUSD"]["taker_fee"])
 
+    def test_dynamic_preflight_replaces_stale_error_after_three_healthy_cycles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guard = Guard.__new__(Guard)
+            guard.state_path = Path(directory) / "guard_state.json"
+            guard.state = {
+                "emergency_ready": False,
+                "emergency_status": "FAILED",
+                "emergency_error": "shared inventory ownership deficit for ETH",
+                "emergency_healthy_cycles": 0,
+            }
+            guard.emergency_exchange = Mock()
+            guard.emergency_docker = Mock()
+            guard.portfolio_keys = ["FDUSD"]
+            guard.emergency_preflight_refresh_seconds = 0
+            guard.next_emergency_preflight = 0
+            guard.verify_shadow_exchange_ready = Mock(return_value={
+                "ownership_coverage": {
+                    "BTC-FDUSD": {"covered": True},
+                    "ETH-FDUSD": {"covered": True},
+                },
+                "test_order_no_fill": True,
+            })
+
+            for _ in range(3):
+                guard._refresh_emergency_readiness(force=True)
+
+            self.assertTrue(guard.state["emergency_ready"])
+            self.assertEqual("READY", guard.state["emergency_status"])
+            self.assertEqual(3, guard.state["emergency_healthy_cycles"])
+            self.assertNotIn("emergency_error", guard.state)
+            self.assertEqual(
+                {"covered": True},
+                guard.state["shadow_preflight"]["ownership_coverage"]["ETH-FDUSD"],
+            )
+
     def test_shadow_preflight_rejects_stale_shared_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             guard = Guard.__new__(Guard)

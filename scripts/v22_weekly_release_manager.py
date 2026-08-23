@@ -330,13 +330,29 @@ class WeeklyReleaseManager:
         grid, dca = load_json(self.grid_state_path, {}) or {}, load_json(self.dca_state_path, {}) or {}
         ownership = grid.get("shadow_preflight", {}).get("ownership_coverage", {})
         dca_ownership = dca.get("ownership_preflight", {})
+        grid_checked_at = float(grid.get("emergency_checked_at") or 0)
+        dca_checked_at = float(dca.get("ownership_preflight_checked_at") or 0)
+        grid_fresh = grid_checked_at > 0 and 0 <= observed - grid_checked_at <= 30
+        dca_fresh = dca_checked_at > 0 and 0 <= observed - dca_checked_at <= 30
         return {
             "candidate_not_expired": observed < int(production["effective_end"]),
             "minimum_signed_runway": int(production["effective_end"]) - observed >= self.policy.minimum_runway_seconds,
-            "grid_emergency_channel_ready": bool(grid.get("emergency_ready")),
+            "grid_emergency_evidence_fresh": grid_fresh,
+            "grid_emergency_channel_ready": bool(
+                grid.get("emergency_ready")
+                and grid.get("emergency_status") == "READY"
+                and int(grid.get("emergency_healthy_cycles", 0)) >= 3
+                and grid_fresh
+            ),
             "dca_emergency_channel_ready": bool(dca.get("emergency_ready")),
+            "dca_ownership_evidence_fresh": dca_fresh,
             "grid_ownership_covered": bool(ownership) and all(bool(row.get("covered")) for row in ownership.values()),
-            "dca_ownership_covered": bool(dca_ownership) and all(bool(row.get("covered")) for row in dca_ownership.values()),
+            "dca_ownership_covered": bool(
+                dca_fresh
+                and int(dca.get("ownership_preflight_healthy_cycles", 0)) >= 3
+                and dca_ownership
+                and all(bool(row.get("covered")) for row in dca_ownership.values())
+            ),
             "exchange_filters_verified": bool(grid.get("shadow_preflight", {}).get("test_order_no_fill")),
         }
 

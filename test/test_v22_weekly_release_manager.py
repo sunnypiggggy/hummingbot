@@ -358,6 +358,46 @@ def _write_generation(value: WeeklyReleaseManager, generation: str, *, release: 
     return path
 
 
+def test_runtime_preflight_uses_fresh_ownership_evidence_not_overall_order_health(tmp_path: Path):
+    observed = 2_000_000_000
+    value = manager(tmp_path, observed, observed + 100_000)
+    release = _write_release(value, "c" * 64, observed + 100_000)
+    atomic_json(value.grid_state_path, {
+        "emergency_ready": True,
+        "emergency_status": "READY",
+        "emergency_checked_at": observed - 2,
+        "emergency_healthy_cycles": 3,
+        "shadow_preflight": {
+            "ownership_coverage": {
+                "BTC-FDUSD": {"covered": True},
+                "ETH-FDUSD": {"covered": True},
+            },
+            "test_order_no_fill": True,
+        },
+    })
+    atomic_json(value.dca_state_path, {
+        "emergency_ready": True,
+        "ownership_preflight_checked_at": observed - 1,
+        "ownership_preflight_healthy_cycles": 3,
+        "account_inventory": {"healthy": False, "active_order_count": 24},
+        "ownership_preflight": {
+            "BTC-USDT": {"covered": True},
+            "ETH-USDT": {"covered": True},
+        },
+    })
+
+    checks = value._runtime_checks(release, observed)
+
+    assert checks["grid_emergency_channel_ready"] is True
+    assert checks["dca_ownership_covered"] is True
+    assert checks["grid_emergency_evidence_fresh"] is True
+    assert checks["dca_ownership_evidence_fresh"] is True
+
+    stale = value._runtime_checks(release, observed + 31)
+    assert stale["grid_emergency_channel_ready"] is False
+    assert stale["dca_ownership_covered"] is False
+
+
 def test_release_retention_keeps_current_plus_three_old_and_preserves_png_evidence(tmp_path: Path):
     value = manager(tmp_path, 2_000_000_000, 2_000_000_000)
     old = [str(number) * 64 for number in range(1, 6)]
