@@ -687,6 +687,31 @@ def test_risk_event_message_explains_cause_and_follow_up_impact_in_one_line():
     assert "\n" not in explain_event(multiline)
 
 
+def test_grid_drawdown_exit_message_has_threshold_cooldown_dust_and_reentry_conditions():
+    value = event(
+        strategy="grid", pair="ETH-FDUSD",
+        mechanism="strategy_drawdown_breaker", transition="COOLDOWN",
+        reason="drawdown=3.03%", trigger_value="0.0303437469709546",
+        threshold="0.03", phase_to="COOLDOWN", action="risk_exit_complete",
+        details={
+            "cooldown_until": 1787482112,
+            "remaining_dust_base": "0.00009420",
+            "remaining_dust_quote": "0.225644706",
+            "quote_asset": "FDUSD",
+            "auto_reentry_enabled": True,
+            "healthy_cycles_required": 3,
+        },
+    )
+    message = format_event(value)
+    assert "触发值：3.0344%" in message
+    assert "保护阈值：3.0000%" in message
+    assert "冷却结束：2026-08-23 18:48:32（北京时间）" in message
+    assert "剩余 Dust：0.00009420 ETH / 约 0.225644706 FDUSD" in message
+    assert "自动恢复：已开启" in message
+    assert "连续3个健康周期" in message
+    assert "v22/FOMC及其他风控门全部放行" in message
+
+
 def test_capital_budget_alert_explains_that_trading_is_not_blocked():
     explanation = explain_event({
         "mechanism": "capital_budget_gate",

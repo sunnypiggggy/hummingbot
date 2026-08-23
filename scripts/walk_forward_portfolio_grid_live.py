@@ -58,6 +58,7 @@ from scripts.grid_macro_gate import load_runtime_macro_gate
 from scripts.grid_xgboost_risk_gate import load_runtime_xgboost_gate
 from scripts.risk_recovery import (
     ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
+    REQUIRED_HEALTHY_CYCLES,
     advance_integrity_failure, advance_recovery, active_state,
     mark_exit_complete, mark_reentry_complete,
     normalize_state, trigger_state,
@@ -381,8 +382,13 @@ class LivePortfolioGrid(StrategyV2Base):
 
             # Risk flattening always has priority over a macro pause.
             if self.pending_flatten:
-                outstanding_grid, outstanding_flatten = self._partition_flatten_orders(active)
-                self.cancel_owned_orders(exclude=set(self.flatten_order_ids.values()))
+                flatten_pairs = self._flatten_target_pairs()
+                outstanding_grid, outstanding_flatten = self._partition_flatten_orders(
+                    active, pairs=flatten_pairs,
+                )
+                self.cancel_owned_orders(
+                    exclude=set(self.flatten_order_ids.values()), pairs=flatten_pairs,
+                )
                 if not outstanding_grid and not outstanding_flatten:
                     self._restore_inventory(prices)
                 self._persist(prices)
@@ -1482,6 +1488,9 @@ class LivePortfolioGrid(StrategyV2Base):
                 )
                 self._record_runtime_event(
                     "risk_exit_complete", pair=pair, recovery=completed_state,
+                    remaining_dust_base=str(delta),
+                    remaining_dust_quote=str(delta * prices[pair]),
+                    quote_asset=self.config.quote_asset,
                 )
                 if state is self.portfolio_recovery:
                     if all(
@@ -1617,11 +1626,18 @@ class LivePortfolioGrid(StrategyV2Base):
         )
         return False
 
-    def cancel_owned_orders(self, exclude: set[str] | None = None):
+    def cancel_owned_orders(
+        self, exclude: set[str] | None = None, pairs: set[str] | None = None,
+    ) -> int:
         exclude = exclude or set()
+        cancelled = 0
         for order in self._owned_active_orders(exclude=exclude):
+            if pairs is not None and order.trading_pair not in pairs:
+                continue
             if order.client_order_id not in exclude:
                 self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+                cancelled += 1
+        return cancelled
 
     def cancel_owned_buy_orders(self, pair: str | None = None) -> bool:
         active = [
@@ -1701,6 +1717,24 @@ class LivePortfolioGrid(StrategyV2Base):
                 and not bool(getattr(self.config, "risk_auto_reentry_enabled", False))
             )
             event_details = dict(details)
+            if recovery:
+                event_details.update({
+                    "quote_asset": self.config.quote_asset,
+                    "cooldown_until": recovery.get("cooldown_until"),
+                    "exit_completed_at": recovery.get("exit_completed_at"),
+                    "remaining_base": recovery.get("remaining_base", {}),
+                    "auto_reentry_enabled": bool(getattr(
+                        self.config, "risk_auto_reentry_enabled", False,
+                    )),
+                    "healthy_cycles_required": REQUIRED_HEALTHY_CYCLES,
+                    "auto_reentry_conditions": [
+                        "exit_complete_and_no_active_orders",
+                        "market_and_filters_fresh",
+                        "v22_fomc_and_other_enabled_gates_allow",
+                        f"{REQUIRED_HEALTHY_CYCLES}_consecutive_healthy_cycles",
+                        "base_inventory_rebuild_succeeds",
+                    ],
+                })
             if mechanism == "runtime_error":
                 event_details.update({
                     "component": f"grid_order_execution:{pair}",
@@ -1730,6 +1764,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 phase_to=str(recovery.get("phase") or transition),
                 action="cancel_orders_and_flatten" if transition in {"TRIGGERED", "EXITING", "LATCHED"} else runtime_event,
                 trigger_value=recovery.get("trigger_value") or details.get("excess_quote"),
+                threshold=self._notification_threshold(mechanism),
                 model_sha256=str(
                     signal.get("model_sha256")
                     or getattr(self.config, "technical_model_sha256", "")
@@ -1742,6 +1777,17 @@ class LivePortfolioGrid(StrategyV2Base):
                 details=event_details,
             )
             append_event(target, notification)
+
+    def _notification_threshold(self, mechanism: str) -> Any:
+        return {
+            "strategy_loss_breaker": self.config.pair_stop_loss_quote,
+            "strategy_drawdown_breaker": self.config.pair_drawdown_limit_pct,
+            "portfolio_loss_breaker": self.config.portfolio_stop_loss_quote,
+            "portfolio_drawdown_breaker": self.config.portfolio_drawdown_limit_pct,
+            "position_protection": getattr(
+                self.config, "max_extra_inventory_hold_seconds", None,
+            ),
+        }.get(mechanism)
 
     def _owned_order_ids(self) -> set[str]:
         return set().union(*(ledger.open_order_ids for ledger in self.ledgers.values()))
@@ -1767,8 +1813,25 @@ class LivePortfolioGrid(StrategyV2Base):
         for ledger in self.ledgers.values():
             ledger.open_order_ids.intersection_update(active_ids)
 
-    def _partition_flatten_orders(self, active) -> tuple[set[str], set[str]]:
-        active_ids = {order.client_order_id for order in self._owned_active_orders(active)}
+    def _flatten_target_pairs(self) -> set[str]:
+        """Return the exact order-cancellation scope for the active exit.
+
+        A portfolio exit owns both pairs.  Independent pair exits own only the
+        pairs currently awaiting flattening, so an ETH breaker cannot create a
+        BTC order gap (and vice versa).
+        """
+        if self.portfolio_recovery.get("phase") == EXITING:
+            return set(self.config.trading_pairs)
+        return set(self.pending_flatten)
+
+    def _partition_flatten_orders(
+        self, active, pairs: set[str] | None = None,
+    ) -> tuple[set[str], set[str]]:
+        active_ids = {
+            order.client_order_id
+            for order in self._owned_active_orders(active)
+            if pairs is None or order.trading_pair in pairs
+        }
         flatten_ids = set(self.flatten_order_ids.values())
         return active_ids - flatten_ids, active_ids & flatten_ids
 

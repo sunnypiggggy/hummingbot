@@ -523,6 +523,49 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertEqual({"flatten"}, flatten)
         self.assertEqual((set(), set()), strategy._partition_flatten_orders([]))
 
+    def test_pair_exit_cancels_only_the_affected_pair_orders(self):
+        strategy = self.strategy()
+        strategy.pending_flatten = {"ETH-FDUSD"}
+        strategy.portfolio_recovery = active_state()
+        strategy.ledgers["BTC-FDUSD"].open_order_ids.add("btc-grid")
+        strategy.ledgers["ETH-FDUSD"].open_order_ids.add("eth-grid")
+        active = [Order("btc-grid", "BTC-FDUSD"), Order("eth-grid", "ETH-FDUSD")]
+        strategy.get_active_orders = lambda exchange: active
+        cancelled = []
+        strategy.cancel = lambda exchange, pair, order_id: cancelled.append((pair, order_id))
+
+        targets = strategy._flatten_target_pairs()
+        grid, flatten = strategy._partition_flatten_orders(active, pairs=targets)
+        strategy.cancel_owned_orders(pairs=targets)
+
+        self.assertEqual({"ETH-FDUSD"}, targets)
+        self.assertEqual({"eth-grid"}, grid)
+        self.assertEqual(set(), flatten)
+        self.assertEqual([("ETH-FDUSD", "eth-grid")], cancelled)
+
+    def test_portfolio_exit_cancels_both_pair_order_sets(self):
+        strategy = self.strategy()
+        strategy.pending_flatten = {"ETH-FDUSD"}
+        strategy.portfolio_recovery = trigger_state(
+            mechanism="portfolio_drawdown_breaker", scope="portfolio", now=1000,
+            trigger_value=Decimal("0.06"), signal_price={}, reason="portfolio drawdown",
+        )
+        for pair, order_id in (("BTC-FDUSD", "btc-grid"), ("ETH-FDUSD", "eth-grid")):
+            strategy.ledgers[pair].open_order_ids.add(order_id)
+        active = [Order("btc-grid", "BTC-FDUSD"), Order("eth-grid", "ETH-FDUSD")]
+        strategy.get_active_orders = lambda exchange: active
+        cancelled = []
+        strategy.cancel = lambda exchange, pair, order_id: cancelled.append((pair, order_id))
+
+        targets = strategy._flatten_target_pairs()
+        strategy.cancel_owned_orders(pairs=targets)
+
+        self.assertEqual(set(strategy.config.trading_pairs), targets)
+        self.assertEqual(
+            {("BTC-FDUSD", "btc-grid"), ("ETH-FDUSD", "eth-grid")},
+            set(cancelled),
+        )
+
     def test_breaker_exit_sells_all_managed_base_not_only_inventory_delta(self):
         strategy = self.strategy()
         pair = "BTC-FDUSD"

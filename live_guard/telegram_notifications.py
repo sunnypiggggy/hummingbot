@@ -15,6 +15,7 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -563,6 +564,31 @@ def _format_inventory_impact(details: Mapping[str, Any]) -> str:
     return f"影响：{effect}。运行状态：{state_text}{order_text}。"
 
 
+def _risk_metric_display(event: Mapping[str, Any], value: Any) -> str:
+    if value is None:
+        return "-"
+    mechanism = str(event.get("mechanism") or "")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return str(value)
+    if mechanism in {"strategy_drawdown_breaker", "portfolio_drawdown_breaker"}:
+        return f"{number * Decimal('100'):.4f}%"
+    if mechanism in {"strategy_loss_breaker", "portfolio_loss_breaker"}:
+        quote = str(event.get("details", {}).get("quote_asset") or "报价币")
+        return f"{number} {quote}"
+    return str(value)
+
+
+def _beijing_time_from_epoch(value: Any) -> str:
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).astimezone(SHANGHAI).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "-"
+
+
 def format_event(event: Mapping[str, Any]) -> str:
     if event.get("mechanism") == "runtime_error":
         details = event.get("details", {})
@@ -728,7 +754,34 @@ def format_event(event: Mapping[str, Any]) -> str:
         f"事件ID：{str(event.get('event_id', ''))[:20]}",
     ]
     if event.get("trigger_value") is not None or event.get("threshold") is not None:
-        lines.append(f"触发值/阈值：{event.get('trigger_value', '-')} / {event.get('threshold', '-')}")
+        lines.extend((
+            f"触发值：{_risk_metric_display(event, event.get('trigger_value'))}",
+            f"保护阈值：{_risk_metric_display(event, event.get('threshold'))}",
+        ))
+    details = event.get("details", {})
+    details = details if isinstance(details, Mapping) else {}
+    if details.get("cooldown_until") is not None:
+        lines.append(
+            f"冷却结束：{_beijing_time_from_epoch(details.get('cooldown_until'))}（北京时间）"
+        )
+    if details.get("remaining_dust_base") is not None:
+        pair = str(event.get("pair") or "")
+        base_asset = pair.split("-", 1)[0] if "-" in pair else "基础币"
+        quote_asset = str(details.get("quote_asset") or "报价币")
+        lines.append(
+            f"剩余 Dust：{details.get('remaining_dust_base')} {base_asset} / "
+            f"约 {details.get('remaining_dust_quote', '-')} {quote_asset}"
+        )
+    if details.get("auto_reentry_enabled") is not None:
+        if details.get("auto_reentry_enabled"):
+            cycles = int(details.get("healthy_cycles_required") or 3)
+            lines.append(
+                "自动恢复：已开启；冷却结束后还需确认退出完成且无活动订单、"
+                "行情与交易所过滤器新鲜、v22/FOMC及其他风控门全部放行、"
+                f"连续{cycles}个健康周期，并成功重建基础库存。"
+            )
+        else:
+            lines.append("自动恢复：未开启；冷却结束后仍需人工复核，系统不会自行重建库存。")
     if event.get("mechanism") == "fomc_gate":
         details = event.get("details", {})
         if details.get("buy_enabled") is not None or details.get("sell_enabled") is not None:
