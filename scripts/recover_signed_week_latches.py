@@ -59,7 +59,11 @@ def cooldown_state(now: float) -> dict[str, Any]:
         **active_state(),
         "phase": "COOLDOWN",
         "mechanism": "infrastructure_integrity_breaker",
-        "scope": "infrastructure",
+        # The integrity incident has already been manually reviewed and the
+        # latch cleared.  From this point recovery follows the zero-delay
+        # technical health gate; keeping the latched-only infrastructure scope
+        # would send older Grid runtimes through an unsupported cooldown path.
+        "scope": "technical",
         "triggered_at": now,
         "exit_target": "quote_only",
         "remaining_base": {},
