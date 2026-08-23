@@ -104,6 +104,10 @@ def advance_integrity_failure(
 def cooldown_for_scope(scope: str) -> int:
     return {
         "technical": TECHNICAL_COOLDOWN_SECONDS,
+        # Infrastructure faults normally latch and therefore never reach a
+        # cooldown.  After an explicitly reviewed recovery they use the same
+        # zero-delay, health-cycle-gated reentry as a technical gate.
+        "infrastructure": TECHNICAL_COOLDOWN_SECONDS,
         "position": POSITION_COOLDOWN_SECONDS,
         "strategy": STRATEGY_COOLDOWN_SECONDS,
         "portfolio": PORTFOLIO_COOLDOWN_SECONDS,

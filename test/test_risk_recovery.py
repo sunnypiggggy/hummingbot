@@ -100,6 +100,16 @@ def test_unhealthy_cycle_resets_confirmation_and_latched_never_recovers() -> Non
     )["phase"] == LATCHED
 
 
+def test_explicitly_reviewed_infrastructure_recovery_can_use_health_gated_cooldown() -> None:
+    state = trigger_state(
+        mechanism="infrastructure_integrity_breaker", scope="infrastructure",
+        now=10, trigger_value="expired", signal_price="", reason="reviewed",
+    )
+    state = mark_exit_complete(state, now=11, remaining_base={}, execution={})
+    assert state["phase"] == COOLDOWN
+    assert state["cooldown_until"] == 11 + TECHNICAL_COOLDOWN_SECONDS
+
+
 def test_technical_exit_has_zero_fixed_cooldown_but_requires_health_confirmation() -> None:
     state = trigger_state(
         mechanism="v22_weekly_buy_gate", scope="technical", now=100,
