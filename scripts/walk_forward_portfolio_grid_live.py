@@ -71,6 +71,7 @@ except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
 
 RUNTIME_STATE_SCHEMA_VERSION = 11
+SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS = frozenset(range(2, RUNTIME_STATE_SCHEMA_VERSION + 1))
 ORDER_REBUILD_BACKOFF_SECONDS = (5, 15, 30, 60)
 UNEXPECTED_ORDER_GAP_SECONDS = 15
 PAIR_REFRESH_WARNING_SECONDS = 30
@@ -2149,7 +2150,7 @@ class LivePortfolioGrid(StrategyV2Base):
         try:
             state = json.loads(target.read_text(encoding="utf-8"))
             schema_version = int(state.get("schema_version", -1))
-            if schema_version not in {2, 3, 4, 5, 6, 7, 8, 9, RUNTIME_STATE_SCHEMA_VERSION}:
+            if schema_version not in SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS:
                 raise ValueError("runtime state schema version mismatch")
             if tuple(state.get("trading_pairs", ())) != tuple(self.config.trading_pairs):
                 raise ValueError("runtime state trading pairs mismatch")

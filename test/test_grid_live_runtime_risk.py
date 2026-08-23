@@ -18,6 +18,7 @@ from walk_forward_portfolio_grid_live import (  # noqa: E402
     GridState,
     LivePortfolioGrid,
     ParameterBuildError,
+    SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS,
 )
 from risk_recovery import ACTIVE, EXITING, REENTRY, active_state, normalize_state, trigger_state  # noqa: E402
 
@@ -42,6 +43,9 @@ class Connector:
 
 
 class GridLiveRuntimeRiskTest(unittest.TestCase):
+    def test_runtime_schema_migration_accepts_every_persisted_version_through_v10(self):
+        self.assertTrue(set(range(2, 11)).issubset(SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS))
+
     def strategy(self):
         strategy = LivePortfolioGrid.__new__(LivePortfolioGrid)
         strategy.config = SimpleNamespace(
