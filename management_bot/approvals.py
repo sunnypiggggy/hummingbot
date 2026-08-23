@@ -93,23 +93,59 @@ class ApprovalStore:
 
     def evidence(self, candidate: dict) -> dict:
         release = candidate["release_sha256"]
+        model = candidate["model_sha256"]
         paths: set[Path] = set()
+        evidence_root = self.evidence_root.resolve()
+
+        def attachment_path(attachment: dict) -> Optional[Path]:
+            raw = str(attachment.get("path") or attachment.get("relative_path") or "").strip()
+            if not raw:
+                return None
+            source = Path(raw)
+            if source.is_absolute():
+                # Report and management Bot mount the same Telegram evidence tree
+                # at different container paths. Translate only these known roots;
+                # never fall back to a global basename search because historical
+                # evidence deliberately contains duplicate filenames.
+                translated = None
+                for prefix in ("/workspace/state/telegram/", "/approvals/evidence/"):
+                    if raw.startswith(prefix):
+                        translated = self.evidence_root / raw[len(prefix):]
+                        break
+                path = translated or source
+            else:
+                path = self.evidence_root / source
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(evidence_root)
+            except (OSError, ValueError):
+                return None
+            if not resolved.is_file():
+                return None
+            expected_sha = str(attachment.get("sha256") or "")
+            if expected_sha and _sha(resolved) != expected_sha:
+                return None
+            return resolved
+
         if self.evidence_root.exists():
             for path in self.evidence_root.rglob("*"):
-                relative = str(path.relative_to(self.evidence_root)) if path.is_file() else ""
-                if path.is_file() and release in relative:
-                    paths.add(path)
                 if path.is_file() and path.suffix.lower() == ".json":
                     payload = _json(path)
                     if str(payload.get("release_sha256", "")) != release:
                         continue
-                    paths.add(path)
-                    for attachment in payload.get("attachments", []):
+                    payload_model = str(payload.get("production_model_sha256")
+                                        or payload.get("model_sha256") or "")
+                    if payload_model and payload_model != model:
+                        continue
+                    rows = list(payload.get("attachments", [])) + list(payload.get("images", []))
+                    for attachment in rows:
                         if not isinstance(attachment, dict):
                             continue
-                        name = Path(str(attachment.get("path", ""))).name
-                        if name:
-                            paths.update(candidate_path for candidate_path in self.evidence_root.rglob(name) if candidate_path.is_file())
+                        resolved = attachment_path(attachment)
+                        if resolved is not None:
+                            paths.add(resolved)
+        paths = {path for path in paths
+                 if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".pdf"}}
         attachments = [{
             "name": path.name,
             "path": str(path),

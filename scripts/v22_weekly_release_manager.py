@@ -123,6 +123,12 @@ class WeeklyReleaseManager:
     def _state(self) -> dict[str, Any]:
         return load_json(self.state_path, {}) or {}
 
+    @staticmethod
+    def _publish_public_json(path: Path, value: Mapping[str, Any]) -> None:
+        """Publish a secret-free approval view readable by the unprivileged management Bot."""
+        atomic_json(path, dict(value))
+        os.chmod(path, 0o644)
+
     def _save(self, value: Mapping[str, Any]) -> None:
         atomic_json(self.state_path, dict(value))
         approval_public = self.work_root / "approval_public"
@@ -135,13 +141,15 @@ class WeeklyReleaseManager:
                 "runtime_generation", "last_error",
             )
         }
-        atomic_json(approval_public / "automation_state.json", approval_state)
+        self._publish_public_json(approval_public / "automation_state.json", approval_state)
         request_path = Path(str(value.get("request_path", "")))
         release_sha = str(value.get("candidate_release_sha256", ""))
         if release_sha and request_path.is_file():
             request = load_json(request_path, {}) or {}
             if request.get("release_sha256") == release_sha:
-                atomic_json(approval_public / f"approval-request-{release_sha}.json", request)
+                self._publish_public_json(
+                    approval_public / f"approval-request-{release_sha}.json", request,
+                )
         public = {
             "schema": "ethbtc-forced-exit-cutover-status-v1",
             "updated_at": int(self.now()),
@@ -294,7 +302,7 @@ class WeeklyReleaseManager:
         atomic_json(request_path, request)
         approval_public = self.work_root / "approval_public"
         approval_public.mkdir(parents=True, exist_ok=True)
-        atomic_json(approval_public / request_path.name, request)
+        self._publish_public_json(approval_public / request_path.name, request)
         event = build_event(
             source="v22-weekly-release-manager", strategy="grid+dca",
             bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",

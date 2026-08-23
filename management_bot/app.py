@@ -707,8 +707,17 @@ class TradingManagementBot:
             "minimum_signed_runway": "签名覆盖时长", "grid_emergency_channel_ready": "Grid退出通道",
             "dca_emergency_channel_ready": "DCA退出通道", "grid_ownership_covered": "Grid库存归属",
             "dca_ownership_covered": "DCA库存归属", "exchange_filters_verified": "交易所规则校验",
+            "candidate_stays_closed": "候选默认保持未授权",
+            "fallback_forbidden": "禁止回退旧模型",
+            "immutable_package_integrity": "发布包完整性",
+            "release_directory_matches": "发布目录身份一致",
+            "signed_week_is_contiguous": "签名周连续性",
         }
         return labels.get(key, "候选完整性检查")
+
+    @staticmethod
+    def _model_type_cn(value: Any) -> str:
+        return {"v22_weekly_buy_gate": "v22 周度模型"}.get(str(value), "模型候选")
 
     @staticmethod
     def _robot_line(active: Mapping[str, Any], strategy: str, pair: str) -> str:
@@ -1392,7 +1401,7 @@ class TradingManagementBot:
         for index, item in enumerate(pending[:10], 1):
             deadline = item.get("review_deadline")
             remain = max(0, int(deadline) - int(time.time())) if deadline else 0
-            lines.append(f"• {item['model_type']} 候选{index} / 剩余{remain // 3600}小时")
+            lines.append(f"• {self._model_type_cn(item['model_type'])} 候选{index} / 剩余{remain // 3600}小时")
             rows.append([(f"查看候选 {index}", f"a:{item['candidate_id']}:view")])
         if not pending:
             lines.append("当前没有待审批模型。")
@@ -1416,7 +1425,7 @@ class TradingManagementBot:
             self.telegram.send(
                 self.settings.admin_user_id,
                 "🧠 新模型候选等待审批\n\n"
-                f"类型：{item['model_type']}\n"
+                f"类型：{self._model_type_cn(item['model_type'])}\n"
                 f"默认审批截止：{deadline_text}\n"
                 "截止前无人拒绝且硬门槛持续通过时自动批准；当前模型继续交易。",
                 [[("查看证据并审批", f"a:{item['candidate_id']}:view")]],
@@ -1432,7 +1441,7 @@ class TradingManagementBot:
         check_lines = [f"• {self._check_label(key)}：{'通过' if value else '失败'}"
                        for key, value in checks.items()]
         lines = [
-            f"🧠 {item['model_type']}",
+            f"🧠 {self._model_type_cn(item['model_type'])}",
             f"状态：{item['status']}",
             f"证据附件：{len(evidence['attachments'])}",
             "硬门槛：",
@@ -1463,7 +1472,7 @@ class TradingManagementBot:
                 self.telegram.send_file(
                     int(callback["message"]["chat"]["id"]),
                     item["path"],
-                    f"{candidate['model_type']} 候选证据 {number}",
+                    f"{self._model_type_cn(candidate['model_type'])}候选证据 {number}",
                 )
             return (
                 f"已发送 {min(len(attachments), 8)} 个PNG/PDF证据附件。"

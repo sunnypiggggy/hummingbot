@@ -60,7 +60,7 @@ connector_secret: must-not-leak
         image_path.write_bytes(image)
         image_sha = hashlib.sha256(image).hexdigest()
         write(audit / "manifest.json", {
-            "generated_at": "2026-08-22T00:00:00Z", "evidence_model_sha256": "m" * 64,
+            "generated_at": "2026-08-22T00:00:00Z", "evidence_model_sha256": "x" * 64,
             "production_model_sha256": "m" * 64,
             "release_sha256": "r" * 64,
             "images": [{"strategy": "grid", "pair": "BTC-FDUSD", "window": "360d",

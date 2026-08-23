@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -61,6 +62,38 @@ class BotStoreTests(TestCase):
 
 
 class ApprovalStoreTests(TestCase):
+    def test_candidate_manifest_images_are_exposed_only_for_exact_production_model(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            requests, evidence, decisions = root / "requests", root / "evidence", root / "decisions"
+            requests.mkdir(); evidence.mkdir(); decisions.mkdir()
+            release, model = "a" * 64, "b" * 64
+            request = {"release_sha256": release, "model_sha256": model,
+                       "review_started_at": 1, "review_deadline": int(time.time()) + 3600}
+            (requests / f"approval-request-{release}.json").write_text(json.dumps(request), encoding="utf-8")
+            (requests / "automation_state.json").write_text(json.dumps({
+                "phase": "AWAITING_APPROVAL", "candidate_release_sha256": release,
+            }), encoding="utf-8")
+            folder = evidence / "parameters" / "candidate"
+            folder.mkdir(parents=True)
+            image = folder / "grid_btcfdusd_360d.png"
+            image.write_bytes(b"png")
+            duplicate = evidence / "history" / "old" / image.name
+            duplicate.parent.mkdir(parents=True)
+            duplicate.write_bytes(b"old png with the same basename")
+            (folder / "manifest.json").write_text(json.dumps({
+                "release_sha256": release, "production_model_sha256": model,
+                "evidence_model_sha256": "c" * 64,
+                "images": [{"path": str(image), "sha256": hashlib.sha256(image.read_bytes()).hexdigest()}],
+            }), encoding="utf-8")
+            store = ApprovalStore(requests, evidence, decisions)
+            candidate = store.pending()[0]
+            assert [item["name"] for item in store.evidence(candidate)["attachments"]] == [image.name]
+            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            manifest["production_model_sha256"] = "d" * 64
+            (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            assert store.evidence(candidate)["attachments"] == []
+
     def test_hash_bound_decision_is_atomic_and_idempotent(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -65,6 +65,28 @@ def test_default_schedule_generates_16h_before_boundary_and_reviews_for_12h(tmp_
     assert Policy().approval_delay_seconds == DEFAULT_DELAY_SECONDS == 43_200
 
 
+def test_public_approval_contracts_are_readable_by_unprivileged_management_bot(tmp_path: Path):
+    value = manager(tmp_path, 1_000, 2_000)
+    release = "c" * 64
+    request = tmp_path / "work" / f"approval-request-{release}.json"
+    atomic_json(request, {"release_sha256": release, "model_sha256": MODEL})
+    state = {
+        "schema": "ethbtc-forced-exit-weekly-automation-v1",
+        "phase": "AWAITING_APPROVAL", "candidate_release_sha256": release,
+        "request_path": str(request), "review_started_at": 900,
+        "review_deadline": 1_100, "activation_boundary": 2_000,
+    }
+    with patch("scripts.v22_weekly_release_manager.os.chmod") as chmod:
+        value._save(state)
+    public = tmp_path / "work" / "approval_public"
+    assert (public / "automation_state.json").is_file()
+    assert (public / request.name).is_file()
+    assert {Path(call.args[0]) for call in chmod.call_args_list} == {
+        public / "automation_state.json", public / request.name,
+    }
+    assert all(call.args[1] == 0o644 for call in chmod.call_args_list)
+
+
 def test_early_activation_commits_only_runtime_pointer_not_mutable_aliases(tmp_path: Path):
     boundary = 2_000_000_000
     value = manager(tmp_path, boundary - 1_800, boundary)

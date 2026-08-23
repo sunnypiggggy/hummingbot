@@ -375,7 +375,7 @@ class ManagementParameterPublisher:
             evidence_release = str(manifest.get("release_sha256") or "")
             if not evidence_release:
                 relation = "UNBOUND_LEGACY"
-            elif evidence_release == active_release and evidence_model == active_model:
+            elif evidence_release == active_release and production_model == active_model:
                 relation = "EXACT"
             else:
                 relation = "BOUND_OTHER_MODEL"
@@ -481,7 +481,7 @@ class ManagementParameterPublisher:
                 (row.get("strategy"), row.get("pair"))
                 for item in evidence["sets"]
                 if item.get("release_sha256") == subject.get("release_sha256")
-                and item.get("evidence_model_sha256") == subject.get("model_sha256")
+                and item.get("production_model_sha256") == subject.get("model_sha256")
                 for row in item.get("attachments", []) if row.get("window") == "360d"
             }
             return len(identities)

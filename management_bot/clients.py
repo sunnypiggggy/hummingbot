@@ -354,7 +354,7 @@ class ParameterCatalogReader:
             raise ServiceError("模型身份不完整，不能读取证据")
         evidence_sets = [item for item in self.evidence().get("sets", [])
                          if item.get("release_sha256") == release_sha256
-                         and item.get("evidence_model_sha256") == model_sha256]
+                         and item.get("production_model_sha256") == model_sha256]
         for evidence in evidence_sets:
             if any(row.get("strategy") == strategy
                    and str(row.get("pair", "")).split("-", 1)[0] == asset
