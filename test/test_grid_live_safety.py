@@ -545,6 +545,23 @@ class GridLiveSafetyTest(unittest.TestCase):
         self.assertEqual(net_base, Decimal("0.000"))
         self.assertEqual(pnl, Decimal("0.900"))
 
+    def test_guard_grid_ownership_subtracts_base_deducted_buy_fee(self):
+        trade_fee = json.dumps({
+            "fee_type": "DeductedFromReturns",
+            "percent": "0",
+            "percent_token": "ETH",
+            "flat_fees": [{"token": "ETH", "amount": "0.00004120"}],
+        })
+        rows = [(
+            "BUY", 2_419 * 1_000_000, 0.0412 * 1_000_000,
+            99_643, trade_fee,
+        )]
+
+        pnl, net_base = fill_pnl(rows, Decimal("2419"), base_asset="ETH")
+
+        self.assertEqual(Decimal("0.0411588"), net_base)
+        self.assertLess(pnl, Decimal("0"))
+
     def test_current_portfolio_rows_use_available_not_locked_units(self):
         from grid_live_common import extract_balances
 

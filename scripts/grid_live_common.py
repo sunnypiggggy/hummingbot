@@ -553,6 +553,7 @@ def build_live_config(portfolio: GridPortfolio, prices: Mapping[str, Decimal], m
         "max_extra_inventory_hold_seconds": 172800,
         "risk_state_persist_seconds": RISK_STATE_PERSIST_SECONDS,
         "startup_order_reconcile_seconds": STARTUP_ORDER_RECONCILE_SECONDS,
+        "risk_auto_reentry_enabled": True,
         "portfolio_stop_loss_quote": float(budget.portfolio_loss_limit),
         "pair_stop_loss_quote": float(budget.pair_loss_limit),
         "portfolio_drawdown_limit_pct": float(PORTFOLIO_DRAWDOWN_LIMIT_PCT),

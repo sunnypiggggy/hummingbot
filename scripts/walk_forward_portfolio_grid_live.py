@@ -24,6 +24,7 @@ from pydantic import Field, field_validator, model_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     MarketOrderFailureEvent,
@@ -1874,7 +1875,41 @@ class LivePortfolioGrid(StrategyV2Base):
                 fee_quote=str(fee),
                 reason=repr(exc),
             )
-        ledger.apply_fill(event.trade_type.name, event.price, event.amount, fee)
+        side = event.trade_type.name
+        base_fee = Decimal("0")
+        if side.upper() == "BUY":
+            base_asset = event.trading_pair.split("-")[0]
+            base_fee = sum(
+                (
+                    Decimal(str(flat_fee.amount))
+                    for flat_fee in getattr(event.trade_fee, "flat_fees", ())
+                    if str(flat_fee.token).upper() == base_asset
+                ),
+                Decimal("0"),
+            )
+            percent = Decimal(str(getattr(event.trade_fee, "percent", "0")))
+            percent_token = getattr(event.trade_fee, "percent_token", None)
+            percent_is_base = (
+                percent > 0
+                and (
+                    str(percent_token or "").upper() == base_asset
+                    or (
+                        percent_token is None
+                        and isinstance(event.trade_fee, DeductedFromReturnsTradeFee)
+                    )
+                )
+            )
+            if percent_is_base:
+                base_fee += event.amount * percent
+        base_fee_quote = min(fee, base_fee * event.price)
+        accounting_quote_fee = max(fee - base_fee_quote, Decimal("0"))
+        ledger.apply_fill(side, event.price, event.amount, accounting_quote_fee)
+        if base_fee_quote > 0:
+            # A BUY fee deducted from returns reduces received base, not the
+            # quote balance.  Keep its quote equivalent in fee reporting while
+            # assigning only the actually received inventory to this robot.
+            ledger.base -= base_fee
+            ledger.fees_quote += base_fee_quote
         flatten_pair = next(
             (pair for pair, order_id in self.flatten_order_ids.items() if order_id == event.order_id),
             None,
@@ -1899,12 +1934,6 @@ class LivePortfolioGrid(StrategyV2Base):
                 "slippage_bps": str(slippage_bps),
                 "signal_to_fill_seconds": self.current_timestamp - float(state.get("triggered_at") or self.current_timestamp),
             }
-        if event.trade_type == TradeType.BUY:
-            base_asset = event.trading_pair.split("-")[0]
-            ledger.base -= sum(
-                (flat_fee.amount for flat_fee in event.trade_fee.flat_fees if flat_fee.token == base_asset),
-                Decimal("0"),
-            )
         self.notify(f"{event.trade_type.name} {event.amount:.8f} {event.trading_pair} at {event.price:.8f}")
 
     def did_cancel_order(self, event: OrderCancelledEvent):

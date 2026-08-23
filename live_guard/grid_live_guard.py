@@ -13,7 +13,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -106,18 +106,44 @@ BINANCE_API = OFFICIAL_BINANCE_API
 SCALE = Decimal("1000000")
 
 
-def fill_pnl(rows: list[tuple[Any, ...]], mark_price: Decimal) -> tuple[Decimal, Decimal]:
+def fill_pnl(
+    rows: list[tuple[Any, ...]], mark_price: Decimal, base_asset: str | None = None,
+) -> tuple[Decimal, Decimal]:
     cashflow, net_base, fees = Decimal("0"), Decimal("0"), Decimal("0")
-    for side, price_raw, amount_raw, fee_raw in rows:
+    for row in rows:
+        side, price_raw, amount_raw, fee_raw = row[:4]
+        trade_fee_raw = row[4] if len(row) > 4 else None
         price, amount = Decimal(price_raw) / SCALE, Decimal(amount_raw) / SCALE
         fee = Decimal(fee_raw or 0) / SCALE
+        base_fee = Decimal("0")
+        if base_asset and trade_fee_raw:
+            try:
+                trade_fee = (
+                    json.loads(trade_fee_raw)
+                    if isinstance(trade_fee_raw, str) else trade_fee_raw
+                )
+                if isinstance(trade_fee, Mapping):
+                    base_fee += sum(
+                        (
+                            Decimal(str(item.get("amount", "0")))
+                            for item in trade_fee.get("flat_fees", ())
+                            if str(item.get("token", "")).upper() == base_asset.upper()
+                        ),
+                        Decimal("0"),
+                    )
+                    if str(trade_fee.get("percent_token") or "").upper() == base_asset.upper():
+                        base_fee += amount * Decimal(str(trade_fee.get("percent", "0")))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                base_fee = Decimal("0")
         if str(side).upper() == "BUY":
             cashflow -= price * amount
-            net_base += amount
+            net_base += amount - base_fee
         elif str(side).upper() == "SELL":
             cashflow += price * amount
-            net_base -= amount
-        fees += fee
+            net_base -= amount + base_fee
+        # Base-denominated fees are already reflected in net inventory and
+        # therefore must not be charged a second time as quote fees in MTM.
+        fees += max(fee - base_fee * price, Decimal("0"))
     return cashflow + net_base * mark_price - fees, net_base
 
 
@@ -981,7 +1007,8 @@ class Guard:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10)
         try:
             return connection.execute(
-                "SELECT trade_type, price, amount, trade_fee_in_quote FROM TradeFill WHERE symbol=?",
+                "SELECT trade_type, price, amount, trade_fee_in_quote, trade_fee "
+                "FROM TradeFill WHERE symbol=?",
                 (pair,),
             ).fetchall()
         finally:
@@ -997,7 +1024,9 @@ class Guard:
         bot_state = self.state.get("bots", {}).get(portfolio.bot_name, {})
         for pair in portfolio.pairs:
             mark = self.price(pair)
-            fill_value, net_base = fill_pnl(self.rows(database, pair), mark)
+            fill_value, net_base = fill_pnl(
+                self.rows(database, pair), mark, base_asset=pair.split("-")[0],
+            )
             adjustment_pnl = Decimal("0")
             for adjustment in bot_state.get("emergency_adjustments", []):
                 if adjustment.get("pair") != pair:

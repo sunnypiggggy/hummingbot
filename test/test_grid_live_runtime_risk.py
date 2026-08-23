@@ -6,6 +6,8 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from types import SimpleNamespace
 
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -320,6 +322,33 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertEqual(Decimal("0.1"), ledger.fees_quote)
         self.assertEqual("quote_fee_fallback_applied", strategy.runtime_events[-1]["event"])
         self.assertEqual("0.001", strategy.runtime_events[-1]["fee_rate"])
+
+    def test_market_buy_fee_deducted_from_returns_owns_only_received_base(self):
+        strategy = self.strategy()
+        order_id = "market-reentry-base-fee"
+        ledger = strategy.ledgers["ETH-FDUSD"]
+        ledger.open_order_ids.add(order_id)
+        initial_quote = ledger.quote
+        initial_base = ledger.base
+        initial_cost = ledger.base_cost_quote
+        initial_fees = ledger.fees_quote
+
+        event = SimpleNamespace(
+            trading_pair="ETH-FDUSD",
+            order_id=order_id,
+            price=Decimal("2000"),
+            amount=Decimal("0.05"),
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            trade_fee=DeductedFromReturnsTradeFee(percent=Decimal("0.001")),
+        )
+
+        strategy.did_fill_order(event)
+
+        self.assertEqual(initial_quote - Decimal("100"), ledger.quote)
+        self.assertEqual(initial_base + Decimal("0.04995"), ledger.base)
+        self.assertEqual(initial_cost + Decimal("100"), ledger.base_cost_quote)
+        self.assertEqual(initial_fees + Decimal("0.1"), ledger.fees_quote)
 
     def test_shutdown_flag_blocks_new_orders_without_competing_cancellation(self):
         strategy = LivePortfolioGrid.__new__(LivePortfolioGrid)
