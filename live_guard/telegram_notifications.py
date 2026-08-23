@@ -171,6 +171,36 @@ def sanitize_runtime_error(error: BaseException | str, *, limit: int = 600) -> s
     return (text or "unknown runtime error")[:limit]
 
 
+_RUNTIME_ERROR_VOLATILE_PREFIXES = (
+    # Docker prepends RFC3339Nano timestamps when logs are requested with
+    # timestamps enabled.  The application then prepends its own HH:MM:SS
+    # timestamp.  Neither value belongs in an error episode fingerprint.
+    re.compile(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+        r"(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})\s+"
+    ),
+    re.compile(r"^\[\d{4}-\d{2}-\d{2}T[^\]]+\]\s*"),
+    re.compile(r"^\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s*-\s*"),
+)
+
+
+def runtime_error_fingerprint_text(error: BaseException | str) -> str:
+    """Return the stable part of a runtime error for episode correlation.
+
+    The full sanitized line remains available for the human-facing alert.  We
+    remove only volatile logging prefixes here so distinct error messages keep
+    distinct episodes while a once-per-second traceback does not flood the
+    channel with a new event for every timestamp.
+    """
+    value = sanitize_runtime_error(error)
+    previous = None
+    while value != previous:
+        previous = value
+        for pattern in _RUNTIME_ERROR_VOLATILE_PREFIXES:
+            value = pattern.sub("", value, count=1).strip()
+    return value or "unknown runtime error"
+
+
 _RUNTIME_LOG_ERROR = re.compile(
     r"(?i)(\bERROR\b|\bCRITICAL\b|Traceback \(most recent call last\)|"
     r"\bexception\b|cycle failed|\border\b.*\b(?:failed|rejected)\b|"
@@ -211,8 +241,8 @@ class RuntimeErrorChannel:
         try:
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
-            self.state = {"schema": "runtime-error-channel-v2", "components": {}}
-        self.state["schema"] = "runtime-error-channel-v2"
+            self.state = {"schema": "runtime-error-channel-v3", "components": {}}
+        self.state["schema"] = "runtime-error-channel-v3"
         self.state.setdefault("components", {})
         self.state.setdefault("history", [])
 
@@ -302,7 +332,10 @@ class RuntimeErrorChannel:
         now = time.time() if now is None else float(now)
         notify_after_seconds = max(0.0, float(notify_after_seconds))
         summary = sanitize_runtime_error(error)
-        fingerprint = canonical_sha256({"component": component, "summary": summary})
+        fingerprint_summary = runtime_error_fingerprint_text(summary)
+        fingerprint = canonical_sha256({
+            "component": component, "summary": fingerprint_summary,
+        })
         components = self.state["components"]
         previous = components.get(component, {})
         if previous.get("active") and previous.get("fingerprint") == fingerprint:
@@ -326,7 +359,8 @@ class RuntimeErrorChannel:
         })
         row = {
             "active": True, "episode_id": episode_id, "fingerprint": fingerprint,
-            "summary": summary, "first_seen_at": now, "last_seen_at": now,
+            "summary": summary, "fingerprint_summary": fingerprint_summary,
+            "first_seen_at": now, "last_seen_at": now,
             "occurrences": 1, "trading_impact": trading_impact,
             "severity": severity, "action": action, "details": dict(details or {}),
             "notification_delay_seconds": notify_after_seconds, "notified": False,

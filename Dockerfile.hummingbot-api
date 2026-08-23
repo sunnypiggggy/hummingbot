@@ -84,6 +84,93 @@ if source.count(needle) != 2:
 path.write_text(source.replace(needle, replacement), encoding='utf-8')
 PY
 
+# A stable production instance may be reconciled more than once after a timed
+# out deploy response.  Upstream used scalar_one_or_none() on an ordered query
+# without LIMIT and unconditionally inserted another active BotRun, so a later
+# stop succeeded at Docker but failed to update its audit row.  Serialize
+# creates per instance, reuse an existing active row, and make all "latest"
+# lookups explicitly single-row.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path('/hummingbot-api/database/repositories/bot_run_repository.py')
+source = path.read_text(encoding='utf-8')
+
+import_needle = 'from sqlalchemy import and_, desc, func, or_, select\n'
+import_replacement = 'from sqlalchemy import and_, desc, func, or_, select, text\n'
+if source.count(import_needle) != 1:
+    raise SystemExit('BotRunRepository SQLAlchemy imports changed; review idempotency patch.')
+source = source.replace(import_needle, import_replacement, 1)
+
+create_needle = '''        """Create a new bot run record."""
+        bot_run = BotRun(
+'''
+create_replacement = '''        """Create a new bot run record, idempotently per live instance."""
+        # PostgreSQL advisory locking closes the no-existing-row race between
+        # concurrent retries. Other database backends still get the idempotent
+        # lookup below.
+        if self.session.get_bind().dialect.name == "postgresql":
+            await self.session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {"lock_key": f"hummingbot-api:bot-run:{instance_name}"},
+            )
+        active_stmt = select(BotRun).where(
+            and_(
+                BotRun.instance_name == instance_name,
+                BotRun.deployment_status == "DEPLOYED",
+                or_(BotRun.run_status == "RUNNING", BotRun.run_status == "CREATED"),
+            )
+        ).order_by(desc(BotRun.deployed_at)).limit(1)
+        active_result = await self.session.execute(active_stmt)
+        existing = active_result.scalar_one_or_none()
+        if existing:
+            return existing
+
+        bot_run = BotRun(
+'''
+if source.count(create_needle) != 1:
+    raise SystemExit('BotRunRepository create method changed; review idempotency patch.')
+source = source.replace(create_needle, create_replacement, 1)
+
+latest_needle = (
+    ''').order_by(desc(BotRun.deployed_at))\n'''
+    '        \n'
+    '''        result = await self.session.execute(stmt)
+        bot_run = result.scalar_one_or_none()
+'''
+)
+latest_replacement = (
+    ''').order_by(desc(BotRun.deployed_at)).limit(1)\n'''
+    '        \n'
+    '''        result = await self.session.execute(stmt)
+        bot_run = result.scalar_one_or_none()
+'''
+)
+if source.count(latest_needle) != 2:
+    raise SystemExit('BotRunRepository latest-row queries changed; review LIMIT patch.')
+source = source.replace(latest_needle, latest_replacement)
+
+latest_return_needle = (
+    ''').order_by(desc(BotRun.deployed_at))\n'''
+    '        \n'
+    '''        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+'''
+)
+latest_return_replacement = (
+    ''').order_by(desc(BotRun.deployed_at)).limit(1)\n'''
+    '        \n'
+    '''        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+'''
+)
+if source.count(latest_return_needle) != 1:
+    raise SystemExit('BotRunRepository latest return query changed; review LIMIT patch.')
+source = source.replace(latest_return_needle, latest_return_replacement, 1)
+
+path.write_text(source, encoding='utf-8')
+PY
+
 # Live Hummingbot processes reload controller YAML every clock tick. Upstream
 # truncates the file before rewriting it, so a concurrent reader can observe an
 # empty document and fail that tick with ``NoneType.get``. Replace atomically.

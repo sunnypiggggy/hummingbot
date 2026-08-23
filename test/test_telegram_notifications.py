@@ -24,6 +24,7 @@ from live_guard.telegram_notifications import (
     hermes_recovery_prompt,
     phase_display,
     render_mobile_profit_card,
+    runtime_error_fingerprint_text,
     runtime_error_lines,
     sanitize_runtime_error,
     system_health_display,
@@ -95,6 +96,43 @@ def test_runtime_error_channel_alerts_once_then_reports_recovery(tmp_path):
     assert rows[1]["details"]["duration_seconds"] == 10
     assert "运行错误告警" in format_event(rows[0])
     assert "运行错误已恢复" in format_event(rows[1])
+
+
+def test_timestamped_runtime_log_lines_share_one_error_episode(tmp_path):
+    events = tmp_path / "events.jsonl"
+    state = tmp_path / "runtime-errors.json"
+    channel = RuntimeErrorChannel(
+        event_path=events, state_path=state, source="grid-live-guard",
+        strategy="grid", bot="grid-live-fdusd-400",
+        pair="BTC-FDUSD,ETH-FDUSD",
+    )
+    first = (
+        "2026-08-23T15:32:17.005298890Z 15:32:17 - strategy_v2_base - "
+        "Live grid cycle failed: 'infrastructure'"
+    )
+    second = (
+        "2026-08-23T15:32:19.002862618Z 15:32:19 - strategy_v2_base - "
+        "Live grid cycle failed: 'infrastructure'"
+    )
+    assert runtime_error_fingerprint_text(first) == (
+        "strategy_v2_base - Live grid cycle failed: 'infrastructure'"
+    )
+    assert runtime_error_fingerprint_text(first) == runtime_error_fingerprint_text(second)
+    assert channel.failure("container_log:grid", first, trading_impact="monitor", now=100)
+    assert not channel.failure("container_log:grid", second, trading_impact="monitor", now=102)
+    assert channel.recovered("container_log:grid", now=110)
+    rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    assert [row["transition"] for row in rows] == ["ERROR_OCCURRED", "ERROR_RECOVERED"]
+    assert rows[1]["details"]["occurrences"] == 2
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["schema"] == "runtime-error-channel-v3"
+
+
+def test_runtime_error_fingerprint_keeps_distinct_failure_reasons():
+    prefix = "2026-08-23T15:32:19.002862618Z 15:32:19 - strategy - "
+    assert runtime_error_fingerprint_text(prefix + "cycle failed: stale contract") != (
+        runtime_error_fingerprint_text(prefix + "cycle failed: insufficient balance")
+    )
 
 
 def test_short_runtime_error_is_suppressed_and_kept_for_four_hour_summary(tmp_path):

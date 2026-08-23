@@ -25,3 +25,29 @@ def test_controller_yaml_updates_are_atomic():
     assert 'temporary_path = f"{file_path}.tmp"' in dockerfile
     assert "os.fsync(file.fileno())" in dockerfile
     assert "os.replace(temporary_path, file_path)" in dockerfile
+
+
+def test_bot_run_tracking_is_idempotent_and_latest_queries_are_bounded():
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "Dockerfile.hummingbot-api"
+    ).read_text(encoding="utf-8")
+    assert "pg_advisory_xact_lock" in dockerfile
+    assert "hummingbot-api:bot-run:{instance_name}" in dockerfile
+    assert "BotRun.instance_name == instance_name" in dockerfile
+    assert "if existing:" in dockerfile
+    assert "source.count(latest_needle) != 2" in dockerfile
+    assert "source.count(latest_return_needle) != 1" in dockerfile
+    assert ").order_by(desc(BotRun.deployed_at)).limit(1)" in dockerfile
+
+
+def test_bot_run_reconciliation_closes_duplicates_before_unique_index():
+    sql = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "reconcile_hummingbot_api_bot_runs.sql"
+    ).read_text(encoding="utf-8")
+    assert "row_number() OVER" in sql
+    assert "active_rank > 1" in sql
+    assert "duplicate_active_run_reconciled" in sql
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_bot_runs_one_active_instance" in sql
+    assert "run_status IN ('RUNNING', 'CREATED')" in sql
