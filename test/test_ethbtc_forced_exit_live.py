@@ -109,6 +109,69 @@ def test_tampered_or_expired_contract_fails_closed(tmp_path: Path) -> None:
     assert all(item["force_exit"] for item in loaded["pairs"].values())
 
 
+def test_committed_generation_has_bounded_signed_fold_handover(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    payload = contract(now, authorized=True)
+    boundary = now + 3600
+    payload.update({
+        "generated_at": utc(boundary - 10),
+        "valid_until": utc(boundary + 140),
+        "runtime_generation": HASH,
+        "predecessor_release_sha256": "b" * 64,
+        "state_lineage_sha256": "c" * 64,
+        "cutover_phase": "WARM_ACTIVE_PENDING_FOLD",
+        "fold_boundary": boundary,
+        "system_health": "HEALTHY",
+    })
+    for item in payload["pairs"].values():
+        item.update({
+            "next_week_start": boundary,
+            "next_week_end": boundary + 7 * 24 * 3600,
+            "next_week_model_sha256": "d" * 64,
+            "model_signal": "RISK_ON",
+        })
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    handover = load_runtime_contract(
+        path, now=datetime.fromtimestamp(boundary + 30, timezone.utc),
+    )
+    assert handover["runtime_gate_healthy"] is True
+    assert handover["fold_handover_active"] is True
+    assert all(item["buy_enabled"] for item in handover["pairs"].values())
+
+    expired = load_runtime_contract(
+        path, now=datetime.fromtimestamp(boundary + 60, timezone.utc),
+    )
+    assert expired["runtime_gate_healthy"] is False
+    assert all(item["force_exit"] for item in expired["pairs"].values())
+
+
+def test_fold_handover_requires_contiguous_next_signed_model(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    payload = contract(now, authorized=True)
+    boundary = now + 3600
+    payload.update({
+        "generated_at": utc(boundary - 10),
+        "valid_until": utc(boundary + 140),
+        "runtime_generation": HASH,
+        "predecessor_release_sha256": "b" * 64,
+        "state_lineage_sha256": "c" * 64,
+        "cutover_phase": "WARM_ACTIVE_PENDING_FOLD",
+        "fold_boundary": boundary,
+        "system_health": "HEALTHY",
+    })
+    for item in payload["pairs"].values():
+        item["model_signal"] = "RISK_ON"
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = load_runtime_contract(
+        path, now=datetime.fromtimestamp(boundary + 1, timezone.utc),
+    )
+    assert loaded["runtime_gate_healthy"] is False
+    assert "signed week has expired" in loaded["reason"]
+
+
 def test_integrity_failure_exits_before_becoming_latched() -> None:
     state = trigger_state(
         mechanism="infrastructure_integrity_breaker",

@@ -190,9 +190,14 @@ def produce_once(args: argparse.Namespace) -> dict[str, Any]:
             snapshot = values.iloc[-1].drop(labels=["signal_ts"]).to_dict()
         if snapshot is None: raise RuntimeError(f"{pair} has no v22 snapshot")
         week = week_for_timestamp(bundle["pairs"][pair], int(state.last_signal_ts or latest))
+        following = next((candidate for candidate in bundle["pairs"][pair]["weeks"]
+                          if int(candidate["test_start"]) == int(week["test_end"])), None)
         snapshot.update({"fold": int(week["fold"]), "week_train_cutoff": int(week["train_cutoff"]),
                          "week_test_start": int(week["test_start"]), "week_test_end": int(week["test_end"]),
                          "week_model_sha256": week["model_sha256"],
+                         "next_week_start": int(following["test_start"]) if following else None,
+                         "next_week_end": int(following["test_end"]) if following else None,
+                         "next_week_model_sha256": following["model_sha256"] if following else None,
                          "calibration_threshold": float(week["calibration_threshold"])})
         saved.update({"gate_state": state_to_dict(state), "last_snapshot": snapshot})
         snapshots[pair] = snapshot; last_1h[pair] = int(state.last_signal_ts or latest)

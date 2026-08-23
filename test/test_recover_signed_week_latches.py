@@ -29,10 +29,24 @@ def test_recovery_requires_bound_healthy_contract_and_enters_gated_reentry(tmp_p
     }
     write(tmp_path, "grid-live-fdusd-data/ethbtc_forced_exit_observation.json", contract)
     write(tmp_path, "grid-live-fdusd-data/xgboost_risk_gate.json", contract)
-    write(tmp_path, "grid-live-fdusd-data/guard_state.json", {})
+    write(tmp_path, "grid-live-fdusd-data/guard_state.json", {"bots": {
+        "grid-live-fdusd-400": {
+            "tripped": True, "action_complete": True, "stop_complete": True,
+            "stop": {"verified_no_active_orders": True, "verified_no_live_instances": True},
+            "latest": {"pairs": {
+                "BTC-FDUSD": {"pnl": "2", "mark": "50000"},
+                "ETH-FDUSD": {"pnl": "-1", "mark": "2000"},
+            }},
+        },
+    }})
     write(tmp_path, "account-inventory-data/account_inventory_status.json", {
         "healthy": True, "sources_healthy": True, "active_order_count": 0,
-        "assets": {"BTC": {"ownership_deficit": "0"}, "ETH": {"ownership_deficit": "0"}},
+        "assets": {
+            "BTC": {"ownership_deficit": "0", "exchange": {"total": "0.001"},
+                    "owners": {"grid:grid-live-fdusd-400": "0.0001"}},
+            "ETH": {"ownership_deficit": "0", "exchange": {"total": "0.01"},
+                    "owners": {"grid:grid-live-fdusd-400": "0.001"}},
+        },
     })
     write(tmp_path, "results/ethbtc_forced_exit_weekly/automation_state.json", {
         "phase": "ACTIVE", "candidate_release_sha256": release,
@@ -44,13 +58,17 @@ def test_recovery_requires_bound_healthy_contract_and_enters_gated_reentry(tmp_p
     write(tmp_path, "dca-macro-data/state.json", {
         "desired_gates": {"buy": True, "sell": True},
     })
-    latch = {"phase": "LATCHED", "reason": "fail_closed:contract is stale"}
+    write(tmp_path, "grid-live-fdusd-data/capital_reservations.json", {
+        "prices": {"BTC-FDUSD": "50000", "ETH-FDUSD": "2000"},
+        "reservations": {"FDUSD": {"base": {"BTC": "0.002", "ETH": "0.05"}}},
+    })
+    latch = {"phase": "LATCHED", "reason": "fail_closed:signed week has expired"}
     write(tmp_path, "api-files/bots/instances/grid-live-fdusd-400/data/live_grid_runtime_state.json", {
         "portfolio_tripped": True, "portfolio_recovery": latch,
         "pair_recovery": {"BTC-FDUSD": {"phase": "REENTRY"}, "ETH-FDUSD": {"phase": "ACTIVE"}},
         "ledgers": {
-            "BTC-FDUSD": {"halted": True, "open_order_ids": ["stale"]},
-            "ETH-FDUSD": {"halted": True, "open_order_ids": ["stale"]},
+            "BTC-FDUSD": {"initial_quote": "100", "halted": True, "open_order_ids": ["stale"]},
+            "ETH-FDUSD": {"initial_quote": "100", "halted": True, "open_order_ids": ["stale"]},
         },
     })
     write(tmp_path, "dca-live-data/guard_state.json", {
@@ -72,7 +90,13 @@ def test_recovery_requires_bound_healthy_contract_and_enters_gated_reentry(tmp_p
     assert grid["pair_recovery"]["BTC-FDUSD"]["phase"] == "REENTRY"
     assert grid["pair_recovery"]["ETH-FDUSD"]["phase"] == "COOLDOWN"
     assert all(not row["open_order_ids"] for row in grid["ledgers"].values())
+    assert grid["ledgers"]["BTC-FDUSD"]["base"] == "0.0001"
+    assert grid["ledgers"]["BTC-FDUSD"]["quote"] == "197.0000"
+    assert grid["ledgers"]["ETH-FDUSD"]["base"] == "0.001"
+    assert grid["ledgers"]["ETH-FDUSD"]["quote"] == "197.000"
     assert all(bot["recovery"]["phase"] == "COOLDOWN" for bot in dca["bots"].values())
+    guard = json.loads((tmp_path / "grid-live-fdusd-data/guard_state.json").read_text())
+    assert guard["bots"]["grid-live-fdusd-400"]["tripped"] is False
     assert Path(audit["backup"]).is_dir()
 
     with pytest.raises(RuntimeError, match="Grid is not latched"):

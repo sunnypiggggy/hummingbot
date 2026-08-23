@@ -16,6 +16,7 @@ PACKAGE_ID = "ethbtc-forced-exit"
 EXECUTION_POLICY_VERSION = "v22-risk-off-forced-exit-v2"
 MODEL_VERSION = "xgboost-grid-long-risk-gate-v22-weekly-250d"
 STALE_AFTER_SECONDS = 150
+FOLD_HANDOVER_SECONDS = 60
 REQUIRED_PAIRS = ("BTC-FDUSD", "ETH-FDUSD")
 HASH_FIELDS = (
     "release_sha256", "model_sha256", "feature_schema_sha256",
@@ -187,8 +188,30 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
             signal_ts = int(item["signal_ts"])
             if not week_start <= signal_ts < week_end:
                 raise ValueError(f"{pair} signal is outside its signed week")
+            handover_active = False
             if int(observed.timestamp()) >= week_end:
-                raise ValueError(f"{pair} signed week has expired")
+                next_start = item.get("next_week_start")
+                next_end = item.get("next_week_end")
+                next_model = item.get("next_week_model_sha256")
+                boundary = payload.get("fold_boundary")
+                cutover = str(payload.get("cutover_phase") or "")
+                # The producer heartbeat can straddle a fold boundary.  Keep
+                # the last complete decision for at most one minute only when
+                # the already-committed generation proves that the next signed
+                # fold is contiguous.  This is not a previous-release fallback:
+                # missing/invalid next-fold evidence remains immediately
+                # fail-closed.
+                handover_active = bool(
+                    runtime_generation not in {None, "legacy"}
+                    and cutover in {"WARM_ACTIVE_PENDING_FOLD", "ACTIVE"}
+                    and boundary is not None and int(boundary) == week_end
+                    and next_start is not None and int(next_start) == week_end
+                    and next_end is not None and int(next_end) > int(next_start)
+                    and valid_sha256(next_model)
+                    and int(observed.timestamp()) < week_end + FOLD_HANDOVER_SECONDS
+                )
+                if not handover_active:
+                    raise ValueError(f"{pair} signed week has expired")
             risk_off = bool(item["risk_off_active"])
             recommended = bool(item["recommended_buy_enabled"])
             if recommended == risk_off:
@@ -207,6 +230,10 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
             **payload, "pairs": pairs,
             "runtime_gate_healthy": source_healthy,
             "runtime_age_seconds": max(0, int(age)),
+            "fold_handover_active": any(
+                int(observed.timestamp()) >= int(item["week_end"])
+                for item in pairs.values()
+            ),
             "reason": payload.get("reason", "healthy" if source_healthy else "source_unhealthy"),
         }
     except Exception as exc:

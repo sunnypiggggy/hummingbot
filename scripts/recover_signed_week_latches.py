@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ def signed_week_reason(value: Any) -> bool:
     text = str(value or "").lower()
     return any(marker in text for marker in (
         "contract is stale", "no signed weekly model covers", "signed_week_unavailable",
+        "signed week has expired",
     ))
 
 
@@ -89,6 +91,7 @@ def recover(
         "automation": root / "results/ethbtc_forced_exit_weekly/automation_state.json",
         "grid_macro": root / "grid-live-fdusd-data/macro_gate.json",
         "dca_macro": root / "dca-macro-data/state.json",
+        "reservations": root / "grid-live-fdusd-data/capital_reservations.json",
     }
     missing = [str(path) for path in paths.values() if not path.is_file()]
     if missing:
@@ -142,9 +145,21 @@ def recover(
         raise RuntimeError("FOMC gates do not currently allow recovery")
 
     grid_runtime = values["grid_runtime"]
+    grid_guard = values["grid_guard"]
     dca_guard = values["dca_guard"]
     portfolio = grid_runtime.get("portfolio_recovery", {})
-    if portfolio.get("phase") != "LATCHED" or not signed_week_reason(portfolio.get("reason")):
+    grid_bot = grid_guard.get("bots", {}).get("grid-live-fdusd-400", {})
+    grid_exit_verified = bool(
+        grid_bot.get("action_complete") is True
+        and grid_bot.get("stop_complete") is True
+        and grid_bot.get("stop", {}).get("verified_no_active_orders") is True
+        and grid_bot.get("stop", {}).get("verified_no_live_instances") is True
+    )
+    if (
+        portfolio.get("phase") not in {"EXITING", "LATCHED"}
+        or not signed_week_reason(portfolio.get("reason"))
+        or not grid_exit_verified
+    ):
         raise RuntimeError("Grid is not latched by the reviewed signed-week incident")
     for bot_name in BOT_PAIRS:
         recovery = dca_guard.get("bots", {}).get(bot_name, {}).get("recovery", {})
@@ -160,10 +175,43 @@ def recover(
     grid_runtime["portfolio_recovery"] = active_state()
     grid_runtime["portfolio_tripped"] = False
     grid_runtime.pop("integrity_failure_grace", None)
+    reservations = values["reservations"]
+    reservation = reservations.get("reservations", {}).get("FDUSD", {})
+    prices = reservations.get("prices", {})
+    latest_pairs = grid_bot.get("latest", {}).get("pairs", {})
+    reconciled_ledgers: dict[str, dict[str, str]] = {}
     for pair, signal in contract["pairs"].items():
         ledger = grid_runtime["ledgers"][pair]
+        asset = pair.split("-", 1)[0]
+        asset_status = inventory.get("assets", {}).get(asset, {})
+        owner_key = "grid:grid-live-fdusd-400"
+        if owner_key not in asset_status.get("owners", {}):
+            raise RuntimeError(f"unified inventory lacks {owner_key} for {asset}")
+        owned_base = Decimal(str(asset_status["owners"][owner_key]))
+        account_total = Decimal(str(asset_status.get("exchange", {}).get("total", "0")))
+        if owned_base < 0 or owned_base > account_total:
+            raise RuntimeError(f"unified Grid ownership is invalid for {asset}")
+        pair_snapshot = latest_pairs.get(pair, {})
+        if not pair_snapshot:
+            raise RuntimeError(f"Grid exit snapshot is missing {pair}")
+        mark = Decimal(str(pair_snapshot["mark"]))
+        pair_pnl = Decimal(str(pair_snapshot["pnl"]))
+        initial_quote = Decimal(str(ledger["initial_quote"]))
+        initial_base = Decimal(str(reservation.get("base", {}).get(asset)))
+        start_price = Decimal(str(prices.get(pair)))
+        target_equity = initial_quote + initial_base * start_price + pair_pnl
+        quote = target_equity - owned_base * mark
+        if quote < 0:
+            raise RuntimeError(f"reconciled Grid quote balance is negative for {pair}")
+        ledger["base"] = str(owned_base)
+        ledger["quote"] = str(quote)
+        ledger["base_cost_quote"] = str(owned_base * mark)
         ledger["halted"] = True
         ledger["open_order_ids"] = []
+        reconciled_ledgers[pair] = {
+            "base": str(owned_base), "quote": str(quote),
+            "mark": str(mark), "target_equity": str(target_equity),
+        }
         if not bool(signal.get("risk_off_active") or signal.get("force_exit")):
             grid_runtime["pair_recovery"][pair] = cooldown_state(now)
     grid_runtime.setdefault("runtime_events", []).append({
@@ -171,7 +219,16 @@ def recover(
         "event": "approved_signed_week_latch_recovered",
         "release_sha256": release_sha256,
         "runtime_generation": runtime_generation,
+        "reconciled_ledgers": reconciled_ledgers,
     })
+
+    grid_bot["tripped"] = False
+    grid_bot["action_complete"] = False
+    grid_bot["stop_complete"] = False
+    grid_bot["recovered_at"] = now
+    for key in ("reason", "tripped_at", "last_action_error", "flatten", "stop"):
+        grid_bot.pop(key, None)
+    grid_guard["last_success_at"] = now
 
     for bot_name in BOT_PAIRS:
         bot = dca_guard["bots"][bot_name]
@@ -184,6 +241,7 @@ def recover(
     dca_guard["last_success_at"] = now
 
     write_atomic(paths["grid_runtime"], grid_runtime)
+    write_atomic(paths["grid_guard"], grid_guard)
     write_atomic(paths["dca_guard"], dca_guard)
     audit = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -196,6 +254,7 @@ def recover(
             pair: str(signal.get("model_signal"))
             for pair, signal in contract["pairs"].items()
         },
+        "reconciled_ledgers": reconciled_ledgers,
     }
     for audit_path in (
         root / "grid-live-fdusd-data/risk_audit.jsonl",
