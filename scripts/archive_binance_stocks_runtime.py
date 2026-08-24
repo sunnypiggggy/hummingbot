@@ -28,6 +28,7 @@ FILES = (
     "scripts/archive_binance_stocks_runtime.py",
     "scripts/audit_binance_stocks_runtime_deployment.py",
     "scripts/check_binance_stocks_runtime.py",
+    "scripts/deploy_binance_stocks_limits_v3.sh",
     "scripts/install_binance_stocks_runtime.py",
     "scripts/migrate_binance_stocks_limits_v3.sql",
     "scripts/run_binance_stocks_paper_scenario.py",
