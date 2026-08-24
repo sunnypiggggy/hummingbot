@@ -36,6 +36,8 @@ class BinanceStocksRuntimeDeploymentTests(TestCase):
         source = (ROOT / "stocks_runtime" / "app.py").read_text(encoding="utf-8")
         self.assertIn('whitelist_pairs = [f"{symbol}-USDC"', source)
         self.assertIn("trading_pairs=whitelist_pairs", source)
+        self.assertIn("_start_whitelist_order_book_tracker(connector)", source)
+        self.assertIn("tracker.start()", source)
         self.assertNotIn("trading_pairs=[]", source)
         data_source = (ROOT / "hummingbot" / "connector" / "exchange" / "binance_stocks" /
                        "binance_stocks_api_order_book_data_source.py").read_text(encoding="utf-8")

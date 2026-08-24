@@ -56,6 +56,27 @@ from utils.security import BackendAPISecurity  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _start_whitelist_order_book_tracker(connector) -> None:
+    """Start the Stocks BBO tracker without waiting for an Executor request.
+
+    Hummingbot API intentionally starts ordinary connector order books lazily.
+    The Stocks asynchronous scheduler, however, must see a ready connector
+    before it is allowed to create that first Executor. Starting the already
+    whitelist-scoped tracker here breaks that dependency cycle while retaining
+    the connector's normal REST snapshot and WebSocket lifecycle.
+    """
+    tracker = getattr(connector, "order_book_tracker", None)
+    trading_pairs = list(getattr(connector, "trading_pairs", []) or [])
+    if tracker is None or not trading_pairs or tracker.ready:
+        return
+    init_task = getattr(tracker, "_init_order_books_task", None)
+    stream_task = getattr(tracker, "_order_book_stream_listener_task", None)
+    tracker_running = any(task is not None and not task.done() for task in (init_task, stream_task))
+    if not tracker_running:
+        tracker.start()
+        logger.info("Started whitelist-only Binance Stocks BBO tracker for %s", trading_pairs)
+
+
 def _items(payload: Any) -> list[Dict[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
@@ -531,6 +552,8 @@ async def stocks_lifespan(runtime_app):
                 )
                 connector._position_provider = ManagedLedgerEquityPositionProvider(ledger)
         runtime_app.state.stocks_connector = connector
+        if connector is not None:
+            _start_whitelist_order_book_tracker(connector)
         runtime_app.state.stocks_last_market_event_timestamp = 0.0
         await _synchronize_market_state(runtime_app, bootstrap=True)
         await ledger.ensure_whitelist(default_whitelist)
