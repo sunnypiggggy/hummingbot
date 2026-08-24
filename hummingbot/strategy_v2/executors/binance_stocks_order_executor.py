@@ -35,7 +35,7 @@ class BinanceStocksOrderExecutor(OrderExecutor):
         if order_id:
             tracked = TrackedOrder(order_id=order_id)
             tracked.order = self.get_in_flight_order(self.config.connector_name, order_id)
-            self._order = tracked
+            self._order = tracked if tracked.order is not None else None
         self._current_retries = int(state.get("current_retries", 0))
         self._held_position_orders = list(state.get("held_position_orders") or [])
         status = str(state.get("status", "RUNNING"))

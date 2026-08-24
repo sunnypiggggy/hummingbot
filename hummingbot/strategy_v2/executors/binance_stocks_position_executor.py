@@ -280,7 +280,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
                 return None
             value = TrackedOrder(order_id=order_id)
             value.order = self.get_in_flight_order(self.config.connector_name, order_id)
-            return value
+            return value if value.order is not None else None
 
         self._open_order = tracked(state.get("open_order_id"))
         self._close_order = tracked(state.get("close_order_id"))

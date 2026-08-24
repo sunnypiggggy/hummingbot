@@ -2,7 +2,13 @@ import time
 from decimal import Decimal
 from unittest import TestCase
 
-from stocks_runtime.paper_broker import PaperQuote, PostgresPaperBroker, _checkpoint_json, _decode_checkpoint_row
+from stocks_runtime.paper_broker import (
+    PaperQuote,
+    PostgresPaperBroker,
+    _checkpoint_json,
+    _decode_checkpoint_row,
+    reconcile_checkpoint_terminal_orders,
+)
 
 
 class _Ledger:
@@ -21,6 +27,33 @@ class PaperBrokerPureTests(TestCase):
         self.assertEqual("paper-executor-1", decoded["config"]["id"])
         self.assertEqual("stocks_managed", decoded["metadata"]["account_name"])
         self.assertEqual("OPEN", decoded["state"]["phase"])
+
+    def test_terminal_entry_fill_moves_to_backup_and_canceled_orders_are_unbound(self):
+        state = {
+            "open_order_id": "entry-1",
+            "take_profit_order_id": "take-profit-1",
+            "close_order_id": None,
+            "entry_filled_backup": "0",
+            "entry_quote_backup": "0",
+            "exit_filled_backup": "0",
+            "exit_quote_backup": "0",
+            "fees_quote_backup": "0",
+        }
+        reconciled = reconcile_checkpoint_terminal_orders(state, {
+            "entry-1": {
+                "status": "FILLED", "filled_base": "0.25",
+                "filled_quote": "100", "cumulative_fee": "0.35",
+            },
+            "take-profit-1": {
+                "status": "CANCELED", "filled_base": "0",
+                "filled_quote": "0", "cumulative_fee": "0",
+            },
+        })
+        self.assertIsNone(reconciled["open_order_id"])
+        self.assertIsNone(reconciled["take_profit_order_id"])
+        self.assertEqual("0.25", reconciled["entry_filled_backup"])
+        self.assertEqual("100", reconciled["entry_quote_backup"])
+        self.assertEqual("0.35", reconciled["fees_quote_backup"])
 
     def test_quote_parses_bbo_sizes_and_has_stable_event_id(self):
         payload = {

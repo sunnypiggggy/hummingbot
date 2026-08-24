@@ -37,6 +37,46 @@ def _decode_checkpoint_row(row: Any) -> Dict[str, Any]:
     return result
 
 
+def reconcile_checkpoint_terminal_orders(
+    state: Dict[str, Any], orders_by_id: Dict[str, Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Fold terminal PAPER orders into Executor backup counters on restart.
+
+    An earlier failed recovery intentionally cancels open orders. The following
+    healthy restart must not retain dead TrackedOrder references, lose confirmed
+    fills, or create a second entry for an already-filled position.
+    """
+    result = dict(state)
+    processed: set[str] = set()
+    mappings = (
+        ("open_order_id", "entry_filled_backup", "entry_quote_backup"),
+        ("close_order_id", "exit_filled_backup", "exit_quote_backup"),
+        ("take_profit_order_id", "exit_filled_backup", "exit_quote_backup"),
+    )
+    for id_field, base_field, quote_field in mappings:
+        order_id = result.get(id_field)
+        if not order_id:
+            continue
+        row = orders_by_id.get(str(order_id))
+        if row is None:
+            raise RuntimeError(f"paper checkpoint order is missing: {order_id}")
+        if str(row.get("status", "UNKNOWN")).upper() in PAPER_OPEN_STATES:
+            continue
+        if str(order_id) not in processed:
+            result[base_field] = str(
+                _decimal(result.get(base_field)) + _decimal(row.get("filled_base"))
+            )
+            result[quote_field] = str(
+                _decimal(result.get(quote_field)) + _decimal(row.get("filled_quote"))
+            )
+            result["fees_quote_backup"] = str(
+                _decimal(result.get("fees_quote_backup")) + _decimal(row.get("cumulative_fee"))
+            )
+            processed.add(str(order_id))
+        result[id_field] = None
+    return result
+
+
 def _checkpoint_json(value: Any) -> str:
     """Serialize runtime state to PostgreSQL's strict JSON representation."""
     def clean(item: Any) -> Any:

@@ -40,6 +40,7 @@ from stocks_runtime.market_calendar import phases_conflict, xnys_market_state  #
 from stocks_runtime.executor_config import normalize_executor_config  # noqa: E402
 from stocks_runtime.policy import StocksExecutorPolicy  # noqa: E402
 from stocks_runtime.paper_broker import PostgresPaperBroker  # noqa: E402
+from stocks_runtime.paper_broker import reconcile_checkpoint_terminal_orders  # noqa: E402
 from stocks_runtime.paper_exchange import BinanceStocksPaperExchange  # noqa: E402
 from stocks_runtime.router import router as stocks_router  # noqa: E402
 from stocks_runtime.settings import StocksRuntimeSettings  # noqa: E402
@@ -378,6 +379,16 @@ async def _restore_paper_executors(app) -> int:
             config = dict(checkpoint["config"])
             metadata = dict(checkpoint["metadata"])
             state = dict(checkpoint["state"])
+            checkpoint_order_ids = {
+                str(state[field])
+                for field in ("open_order_id", "close_order_id", "take_profit_order_id")
+                if state.get(field)
+            }
+            checkpoint_orders = {
+                order_id: await broker.order(order_id)
+                for order_id in checkpoint_order_ids
+            }
+            state = reconcile_checkpoint_terminal_orders(state, checkpoint_orders)
             interface = service._get_trading_interface(metadata.get("account_name", "stocks_managed"))
             executor_class, _config_class, typed_config = service._validate_executor_config(
                 config, default_timestamp=interface.current_timestamp
