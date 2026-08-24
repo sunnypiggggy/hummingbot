@@ -80,6 +80,11 @@ class BinanceStocksExchange(ExchangePyBase):
         self._last_position_snapshot: Optional[EquityAccountSnapshot] = None
         self._account_authorized = False
         self._market_phase = "UNKNOWN"
+        self._market_phase_source = "UNKNOWN"
+        self._market_event_timestamp = 0.0
+        self._market_trading_date: Optional[str] = None
+        self._market_valid_until = 0.0
+        self._market_state_conflict = False
         self._last_quote_timestamp: Dict[str, float] = {}
         self._last_quote: Dict[str, Tuple[Decimal, Decimal]] = {}
         self._trading_status: Dict[str, str] = {}
@@ -173,6 +178,30 @@ class BinanceStocksExchange(ExchangePyBase):
     def market_phase(self) -> str:
         return self._market_phase
 
+    @property
+    def market_state_metadata(self) -> Dict[str, Any]:
+        return {
+            "phase": self._market_phase,
+            "source": self._market_phase_source,
+            "event_timestamp": self._market_event_timestamp,
+            "valid_until": self._market_valid_until,
+            "trading_date": self._market_trading_date,
+            "conflict": self._market_state_conflict,
+        }
+
+    def restore_market_state(
+        self, phase: str, *, source: str, event_timestamp: float,
+        valid_until: float, trading_date: Optional[str], conflict: bool = False,
+    ) -> None:
+        phase = str(phase).upper()
+        if phase in CONSTANTS.MARKET_PHASES:
+            self._market_phase = phase
+            self._market_phase_source = str(source).upper()
+            self._market_event_timestamp = float(event_timestamp)
+            self._market_valid_until = float(valid_until)
+            self._market_trading_date = trading_date
+            self._market_state_conflict = bool(conflict)
+
     def latest_quote(self, symbol: str) -> Optional[Tuple[Decimal, Decimal]]:
         """Return the current one-level quote only when it is still executable."""
         symbol = symbol.upper()
@@ -209,9 +238,22 @@ class BinanceStocksExchange(ExchangePyBase):
         event_type = str(event.get("e", event.get("eventType", "")))
         symbol = str(event.get("s", event.get("symbol", ""))).upper()
         if event_type == "calendar":
-            phase = str(event.get("phase", event.get("marketPhase", event.get("status", "UNKNOWN")))).upper()
+            # The official transition-only Calendar stream names the new phase
+            # `to`.  Keep legacy aliases for scenario fixtures and old captures.
+            phase = str(event.get(
+                "to", event.get("phase", event.get("marketPhase", event.get("status", "UNKNOWN")))
+            )).upper()
             if phase in CONSTANTS.MARKET_PHASES:
                 self._market_phase = phase
+                self._market_phase_source = "BINANCE"
+                self._market_event_timestamp = self._seconds(event.get("ts", event.get("T", event.get("E")))) or self._clock_time()
+                # A transition must be reconciled against XNYS before an
+                # asynchronous order is activated.
+                self._market_valid_until = 0.0
+                value = event.get("tradingDate", event.get("trading_date"))
+                if value:
+                    self._market_trading_date = str(value)
+                self._market_state_conflict = False
         elif event_type == "tradingStatus" and symbol:
             self._trading_status[symbol] = str(event.get("status", event.get("tradingStatus", "UNKNOWN"))).upper()
         elif event_type == "tradability" and symbol:

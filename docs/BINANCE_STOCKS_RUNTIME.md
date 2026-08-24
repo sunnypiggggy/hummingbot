@@ -40,17 +40,19 @@ GOOG、MU、NVDA 等部署前仓位属于外部库存，不导入、不认领、
 
 | 限制 | 行为 |
 |---|---|
-| 单次订单/开仓 | 名义金额不超过 200 USDC |
-| 单标的敞口 | 默认不超过 200 USDC，并且不得超过该 ticker 的白名单限额 |
-| 管理敞口 | 管理持仓 MTM + 未成交 BUY + 费用预留不超过 2000 USDC |
+| 单次订单/开仓 | 运行限额默认 500 USDC |
+| 单标的敞口 | 运行限额默认 1000 USDC，并且不得超过该 ticker 的白名单限额 |
+| 管理敞口 | 管理持仓 MTM + 未成交 BUY 本金不超过 2000 USDC |
 | 日内净亏损 | Binance `tradingDate` 内达到 200 USDC 后只阻止新增 BUY |
 | SELL | 只能使用本容器账本可用份额；不允许做空 |
 | 费用 | 仅 USDC；不使用 BNB |
 
 默认白名单为 `AAPL/TSLA/SPY/QQQ`。`exchangeInfo` 中的其他直接美股/ETF仍可查询，需先经
 `/stocks/whitelist/{symbol}` 显式启用后才允许新增 BUY。删除或禁用白名单只阻止新增 BUY，
-不会删除账本，也不会阻止已有管理仓位的保护性退出。运行时限额只能向下收紧，不能超过
-环境变量定义的硬上限。日亏损门不会阻止撤单、SELL、止损、时间退出或追踪止盈。
+不会删除账本，也不会阻止已有管理仓位的保护性退出。不存在独立硬上限：
+`operator_limits`是唯一运行限额来源，修改后无需重启；最终可设置范围取决于可信PAPER权益
+（未来LIVE为Funding USDC与本容器管理持仓MTM）。费用不占用本金/持仓限额，只参与资金
+充足性检查。日亏损门不会阻止撤单、SELL、止损、时间退出或追踪止盈。
 
 ## 4. Executor 请求
 
@@ -116,6 +118,10 @@ PositionExecutor 仅允许 BUY 开多，且 `stop_loss`、`time_limit` 必填。
 ## 5. REST 范围
 
 ### 闭市异步激活
+
+市场阶段优先解析官方Calendar转换事件的`to`字段。该流只在阶段转换时推送，因此运行时
+持久化最后可信阶段；冷启动和事件间隙由`exchange_calendars`的XNYS日历恢复，覆盖纽约
+时区、DST、节假日和早收市。官方状态与XNYS冲突时仅阻止激活并告警，队列与冻结条件不丢失。
 
 专用创建接口支持 `activation_policy`：
 
@@ -207,7 +213,7 @@ Executor 生命周期，订单只进入本地 PostgreSQL 撮合器；Binance pla
 
 配置独立只读/交易资格 Key 后设 `BINANCE_STOCKS_RUNTIME_MODE=SHADOW`，授权仍为 false。
 Shadow 读取真实行情、Funding USDC、订单及成交，Executor 创建返回
-`SHADOW_VALIDATED_NO_ORDER`。验收外部活动识别、市场时段、动态规则、200/2000/200 门和通知，
+`SHADOW_VALIDATED_NO_ORDER`。验收外部活动识别、市场时段、动态规则、500/1000/2000/200门和通知，
 不得出现本前缀新经济订单。
 
 ### 实盘（另行人工授权）
@@ -231,5 +237,5 @@ C:\Users\sunny\anaconda3\envs\hummingbot\python.exe -m pytest -q -p no:cacheprov
 docker compose --profile stocks config
 ```
 
-必须验收：重复经济订单、外部库存 SELL、做空、超 200 单笔、超 2000 敞口、日亏损后
+必须验收：重复经济订单、外部库存 SELL、做空、超运行单笔限额、超2000敞口、日亏损后
 新增 BUY 均为 0；部分成交和退出订单的累计数量/费用重启前后一致。

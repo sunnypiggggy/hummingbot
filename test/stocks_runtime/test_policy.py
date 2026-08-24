@@ -2,7 +2,7 @@ from decimal import Decimal
 from unittest import IsolatedAsyncioTestCase
 
 from stocks_runtime.ledger import ACTIVE_INTENT_STATES, LedgerLimits
-from stocks_runtime.policy import StocksExecutorPolicy
+from stocks_runtime.policy import PolicyViolation, StocksExecutorPolicy
 
 
 class FakeLedger:
@@ -10,6 +10,16 @@ class FakeLedger:
 
     def __init__(self):
         self.reservations = []
+        self.usage = {
+            "positions_mtm": Decimal("0"),
+            "pending_buy_principal": Decimal("100"),
+            "fee_reserve": Decimal("0"),
+            "principal_and_mtm": Decimal("100"),
+            "by_symbol": {"AAPL": Decimal("0")},
+            "positions_by_symbol": {"AAPL": Decimal("0")},
+            "quote_total": Decimal("2000"),
+            "quote_available": Decimal("1900"),
+        }
 
     async def managed_pnl(self, _):
         return Decimal("0")
@@ -34,6 +44,9 @@ class FakeLedger:
 
     async def managed_exposure(self, _):
         return Decimal("100")
+
+    async def capital_usage(self, _prices, exclude_executor_id=None):
+        return self.usage
 
     async def managed_symbol_exposure(self, _symbol, _price):
         return Decimal("0")
@@ -129,6 +142,32 @@ class StocksExecutorPolicyTests(IsolatedAsyncioTestCase):
         self.assertTrue(result["preflight_only"])
         self.assertEqual([], self.ledger.reservations)
 
+    async def test_fee_reserve_does_not_consume_symbol_principal_limit(self):
+        self.ledger.limits = LedgerLimits(
+            max_order_notional=Decimal("500"), max_symbol_exposure=Decimal("200"),
+            max_managed_exposure=Decimal("2000"), daily_loss_limit=Decimal("200"),
+        )
+        self.ledger.usage.update({
+            "principal_and_mtm": Decimal("100"), "pending_buy_principal": Decimal("100"),
+            "fee_reserve": Decimal("0.35"), "by_symbol": {"AAPL": Decimal("100")},
+        })
+        result = await self.policy.preview({
+            "id": "order-aapl-fees-01", "type": "order_executor",
+            "connector_name": "binance_stocks", "trading_pair": "AAPL-USDC",
+            "side": "BUY", "amount": "0.5", "price": "200", "execution_strategy": "LIMIT",
+        }, "stocks_managed", "telegram-management-bot")
+        self.assertTrue(result["allowed"])
+        self.assertEqual("0.35", result["fee_reserve"])
+
+    async def test_three_hundred_usdc_is_allowed_by_new_runtime_limit(self):
+        self.ledger.usage.update({"principal_and_mtm": Decimal("0"), "by_symbol": {"AAPL": Decimal("0")}})
+        result = await self.policy.preview({
+            "id": "order-aapl-300-01", "type": "order_executor",
+            "connector_name": "binance_stocks", "trading_pair": "AAPL-USDC",
+            "side": "BUY", "amount": "1.5", "price": "200", "execution_strategy": "LIMIT",
+        }, "stocks_managed", "telegram-management-bot")
+        self.assertTrue(result["allowed"])
+
     async def test_buy_requires_enabled_operator_whitelist(self):
         self.policy.update_market({"AAPL", "TSLA"}, {"AAPL": Decimal("200"), "TSLA": Decimal("100")})
         with self.assertRaisesRegex(Exception, "whitelist"):
@@ -182,6 +221,7 @@ class StocksExecutorPolicyTests(IsolatedAsyncioTestCase):
         })
         with self.assertRaisesRegex(ValueError, "exchangeInfo"):
             await self.policy.validate_and_reserve(base, "stocks_managed", None)
-        base.update({"id": "position-aapl-04", "trading_pair": "AAPL-USDC", "amount": "2"})
-        with self.assertRaisesRegex(Exception, "200"):
+        base.update({"id": "position-aapl-04", "trading_pair": "AAPL-USDC", "amount": "3"})
+        with self.assertRaises(PolicyViolation) as raised:
             await self.policy.validate_and_reserve(base, "stocks_managed", None)
+        self.assertEqual("500", raised.exception.context["limit"])

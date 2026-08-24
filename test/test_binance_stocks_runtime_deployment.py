@@ -17,6 +17,11 @@ class BinanceStocksRuntimeDeploymentTests(TestCase):
         self.assertEqual(["binance_stocks_credentials"], service["secrets"])
         self.assertEqual("hummingbot_stocks", service["environment"]["BINANCE_STOCKS_DATABASE_NAME"])
         self.assertNotIn("BINANCE_STOCKS_LIVE_AUTHORIZED", service["environment"])
+        for name in (
+            "BINANCE_STOCKS_MAX_ORDER_USDC", "BINANCE_STOCKS_MAX_SYMBOL_USDC",
+            "BINANCE_STOCKS_MAX_EXPOSURE_USDC", "BINANCE_STOCKS_DAILY_LOSS_USDC",
+        ):
+            self.assertNotIn(name, service["environment"])
 
     def test_image_defaults_are_fail_closed(self):
         dockerfile = (ROOT / "Dockerfile.binance-stocks-runtime").read_text(encoding="utf-8")
@@ -32,3 +37,6 @@ class BinanceStocksRuntimeDeploymentTests(TestCase):
         self.assertIn('whitelist_pairs = [f"{symbol}-USDC"', source)
         self.assertIn("trading_pairs=whitelist_pairs", source)
         self.assertNotIn("trading_pairs=[]", source)
+        data_source = (ROOT / "hummingbot" / "connector" / "exchange" / "binance_stocks" /
+                       "binance_stocks_api_order_book_data_source.py").read_text(encoding="utf-8")
+        self.assertNotIn("@price", data_source)

@@ -63,6 +63,9 @@ disclaimer_confirmed: false
 - `{SYMBOL}@tradingStatus`
 - `{SYMBOL}@tradability`
 
+官方`calendar`是转换事件，新阶段位于`to`字段而不是`phase`。Connector保留旧字段兼容，
+生产状态以`to`为准；启动时从持久化阶段或XNYS日历恢复，不订阅全市场`price`流。
+
 一条新 quote 会整体替换旧 Bid/Ask。交易时段内 quote 超过 10 秒未更新时禁止下单。`MARKET_CLOSED` 是正常业务状态，不标记为基础设施故障，但任何订单仍会被本地阻止。
 
 ticker 订阅发生增删时会断开并重建 URL 型 combined stream；不存在动态 SUBSCRIBE RPC。

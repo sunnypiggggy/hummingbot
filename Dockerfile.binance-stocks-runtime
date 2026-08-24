@@ -3,6 +3,9 @@ FROM ${HUMMINGBOT_API_BASE}
 
 USER root
 
+# XNYS owns holidays, DST and early closes for cold-start market-state recovery.
+RUN /opt/conda/envs/hummingbot-api/bin/pip install --no-cache-dir exchange-calendars==4.13.2
+
 # Install the independently versioned connector and the two constrained
 # executor implementations into the API image's Hummingbot environment.
 COPY hummingbot/connector/exchange/binance_stocks/ \

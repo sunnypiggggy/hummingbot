@@ -1386,11 +1386,24 @@ class TradingManagementBot:
         else:
             preview = self.stocks.preview_position(request)
             request_type = "position"
+        notional = Decimal(request["amount"]) * price
+        if not bool(preview.get("allowed", False)):
+            violation = preview.get("violation") or {}
+            return (
+                "⚠️ Stock 预检未通过\n"
+                f"原因：{violation.get('code', '业务条件不满足')}\n"
+                f"说明：{violation.get('message', '-')}\n"
+                f"请求本金：{notional.quantize(Decimal('0.01'))} USDC\n"
+                f"当前占用：{violation.get('current', '-')} USDC\n"
+                f"当前可用额度：{violation.get('available', '-')} USDC\n"
+                "向导已保留，可修改金额或运行限额后重新预检。",
+                [[("修改金额", f"w:{session['session_id']}:input:amount"), ("修改限额", "s:limits_input")],
+                 [("取消", f"w:{session['session_id']}:cancel:-")]],
+            )
         session = self.store.update_session(
             session["session_id"], step="confirm",
             payload={"request": request, "request_type": request_type},
         )
-        notional = Decimal(request["amount"]) * price
         loss = notional * Decimal(str(request.get("stop_loss", "0")))
         side = str(session["payload"].get("side", "BUY"))
         quote_context, latest_quote = self._stock_quote_context(session["payload"]["symbol"], side)
@@ -1404,6 +1417,10 @@ class TradingManagementBot:
             f"参考价格：{price} USDC",
             f"预计金额：{notional.quantize(Decimal('0.01'))} USDC",
             f"预计费用预留：{preview.get('fee_reserve', '-')} USDC",
+            f"当前总本金占用：{preview.get('current_total_principal', '-')} USDC",
+            f"当前单股本金占用：{preview.get('current_symbol_principal', '-')} USDC",
+            f"当前费用预留：{preview.get('current_fee_reserve', '-')} USDC",
+            f"可用现金：{preview.get('available_cash', '-')} USDC",
             (
                 "执行范围：PAPER（本地持久化撮合）" if runtime_mode == "PAPER"
                 else "执行范围：LIVE（仍需Runtime与Telegram双重实盘授权）"
@@ -1539,12 +1556,18 @@ class TradingManagementBot:
 
     def _stock_limits(self) -> str:
         value = self.stocks.limits()
-        active, hard = value.get("active", {}), value.get("hard_ceiling", {})
+        active, usage = value.get("active", {}), value.get("usage", {})
         return (
             "📏 Stock 交易限制\n\n"
-            f"单笔：{active.get('max_order_notional')} / 硬上限 {hard.get('max_order_notional')} USDC\n"
-            f"单股票：{active.get('max_symbol_exposure')} / 硬上限 {hard.get('max_symbol_exposure')} USDC\n"
-            f"总持仓：{active.get('max_managed_exposure')} / 硬上限 {hard.get('max_managed_exposure')} USDC"
+            f"单笔本金：{active.get('max_order_notional')} USDC\n"
+            f"单股票本金：{active.get('max_symbol_exposure')} USDC\n"
+            f"总持仓本金/MTM：{active.get('max_managed_exposure')} USDC\n"
+            f"日亏损：{active.get('daily_loss_limit')} USDC\n\n"
+            f"当前本金/MTM占用：{usage.get('principal_and_mtm', '-')} USDC\n"
+            f"排队及未成交BUY本金：{usage.get('pending_buy_principal', '-')} USDC\n"
+            f"费用预留：{usage.get('fee_reserve', '-')} USDC\n"
+            f"可用现金：{usage.get('available_cash', '-')} USDC\n"
+            "运行限额保存在PostgreSQL；最终可设置范围取决于可信账户资金。"
         )
 
     def _stock_executors_menu(self, user_id: int, chat_id: int, message_id: int) -> tuple[str, list]:
@@ -1734,19 +1757,20 @@ class TradingManagementBot:
         if flow == "whitelist_input":
             parts = text.upper().split()
             if len(parts) not in {1, 2}:
-                raise ValueError("请输入：股票代码 [单股票上限]，例如 AAPL 200")
-            limit = str(_d(parts[1] if len(parts) == 2 else "200"))
+                raise ValueError("请输入：股票代码 [单股票上限]，例如 AAPL 1000")
+            limit = str(_d(parts[1] if len(parts) == 2 else "1000"))
             session = self.store.update_session(sid, step="confirm", payload={"symbol": parts[0], "limit": limit})
             return f"确认添加/更新 {parts[0]}，单股票上限 {limit} USDC？", [[("确认", f"x:{sid}:wl_confirm"), ("取消", "m:stock")]]
         if flow == "limits_input":
             parts = [part.strip() for part in text.replace("，", ",").split(",")]
-            if len(parts) != 3:
-                raise ValueError("请输入：单笔,单股票,总持仓，例如 200,200,2000")
+            if len(parts) not in {3, 4}:
+                raise ValueError("请输入：单笔,单股票,总持仓[,日亏损]，例如 500,1000,2000,200")
             values = [str(_d(part)) for part in parts]
             if not (Decimal(values[0]) <= Decimal(values[1]) <= Decimal(values[2])):
                 raise ValueError("必须满足：单笔 ≤ 单股票 ≤ 总持仓")
             self.store.update_session(sid, step="confirm", payload={"limits": values})
-            return f"确认更新限额为 {values[0]} / {values[1]} / {values[2]} USDC？", [[("确认", f"x:{sid}:limits_confirm"), ("取消", "m:stock")]]
+            daily = values[3] if len(values) == 4 else "维持当前值"
+            return f"确认更新限额为 {values[0]} / {values[1]} / {values[2]}，日亏损={daily} USDC？", [[("确认", f"x:{sid}:limits_confirm"), ("取消", "m:stock")]]
         if flow == "model_reject" and step == "reason":
             if len(text) < 3:
                 raise ValueError("拒绝原因至少3个字符")
@@ -1789,8 +1813,9 @@ class TradingManagementBot:
         if action == "limits_confirm":
             if not self.settings.mutations_enabled:
                 return "🔒 只读观察模式，限额未修改。", self._back("m:stock")
-            order, symbol, total = session["payload"]["limits"]
-            result = self.stocks.put_limits(order, symbol, total)
+            values = session["payload"]["limits"]
+            order, symbol, total = values[:3]
+            result = self.stocks.put_limits(order, symbol, total, values[3] if len(values) == 4 else None)
             self.store.delete_session(sid)
             return f"✅ 限额已更新\n{_safe_text(result)}", self._back("m:stock")
         if action == "reject_confirm":
@@ -1974,11 +1999,11 @@ class TradingManagementBot:
             elif data == "s:wl_input":
                 session = self.store.create_session(user_id, chat_id, "whitelist_input", message_id)
                 self.store.update_session(session["session_id"], step="input")
-                text, rows = "请输入：股票代码 [单股票上限]\n例如：AAPL 200", [[("取消", "m:stock")]]
+                text, rows = "请输入：股票代码 [单股票上限]\n例如：AAPL 1000", [[("取消", "m:stock")]]
             elif data == "s:limits_input":
                 session = self.store.create_session(user_id, chat_id, "limits_input", message_id)
                 self.store.update_session(session["session_id"], step="input")
-                text, rows = "请输入：单笔,单股票,总持仓\n例如：200,200,2000", [[("取消", "m:stock")]]
+                text, rows = "请输入：单笔,单股票,总持仓[,日亏损]\n例如：500,1000,2000,200", [[("取消", "m:stock")]]
             elif data.startswith("s:wl_toggle:"):
                 text, rows = "ℹ️ 白名单停用功能已移除，请直接删除。", self._back("s:whitelist")
             elif data.startswith("s:wl_delete:"):

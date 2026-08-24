@@ -110,12 +110,15 @@ class StocksClient(JsonClient):
     def limits(self) -> dict:
         return self.request("GET", "/stocks/limits")
 
-    def put_limits(self, order: str, symbol: str, total: str) -> dict:
-        return self.request("PUT", "/stocks/limits", {
+    def put_limits(self, order: str, symbol: str, total: str, daily_loss: Optional[str] = None) -> dict:
+        payload = {
             "max_order_notional": order,
             "max_symbol_exposure": symbol,
             "max_managed_exposure": total,
-        })
+        }
+        if daily_loss is not None:
+            payload["daily_loss_limit"] = daily_loss
+        return self.request("PUT", "/stocks/limits", payload)
 
     def quote(self, symbol: str) -> dict:
         value = self.request("GET", f"/stocks/quotes/{symbol}")

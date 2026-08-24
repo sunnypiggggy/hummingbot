@@ -64,8 +64,8 @@ class StocksRuntimeSettings:
             disclaimer_confirmed=os.getenv("BINANCE_STOCKS_DISCLAIMER_CONFIRMED", "false").lower() == "true",
             live_authorized=live_authorized,
             order_prefix=os.getenv("BINANCE_STOCKS_ORDER_PREFIX", "x-HBSTK"),
-            max_order_notional=Decimal(os.getenv("BINANCE_STOCKS_MAX_ORDER_USDC", "200")),
-            max_symbol_exposure=Decimal(os.getenv("BINANCE_STOCKS_MAX_SYMBOL_USDC", "200")),
+            max_order_notional=Decimal(os.getenv("BINANCE_STOCKS_MAX_ORDER_USDC", "500")),
+            max_symbol_exposure=Decimal(os.getenv("BINANCE_STOCKS_MAX_SYMBOL_USDC", "1000")),
             max_managed_exposure=Decimal(os.getenv("BINANCE_STOCKS_MAX_EXPOSURE_USDC", "2000")),
             daily_loss_limit=Decimal(os.getenv("BINANCE_STOCKS_DAILY_LOSS_USDC", "200")),
             database_url=dedicated_database_url(

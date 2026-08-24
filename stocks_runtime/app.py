@@ -36,6 +36,7 @@ from stocks_runtime.binance_client import BinanceStocksReadClient  # noqa: E402
 from stocks_runtime.auth import auth_user  # noqa: E402
 from stocks_runtime.async_orders import AsyncStocksOrderScheduler  # noqa: E402
 from stocks_runtime.ledger import LedgerLimits, PostgresManagedLedger  # noqa: E402
+from stocks_runtime.market_calendar import phases_conflict, xnys_market_state  # noqa: E402
 from stocks_runtime.executor_config import normalize_executor_config  # noqa: E402
 from stocks_runtime.policy import StocksExecutorPolicy  # noqa: E402
 from stocks_runtime.paper_broker import PostgresPaperBroker  # noqa: E402
@@ -112,11 +113,12 @@ async def _refresh_runtime(app, stop: asyncio.Event) -> None:
             if app.state.stocks_settings.mode == "PAPER":
                 await app.state.stocks_paper_broker.reconcile_managed_fills()
                 account = await app.state.stocks_paper_broker.account()
-                total = Decimal(account["cash_balance"])
+                total = Decimal(account["equity"])
                 available = Decimal(account["available_cash"])
             else:
                 total, available = await client.funding_usdc()
             ledger.set_quote_balances(total, available)
+            await _synchronize_market_state(app)
             symbols = _direct_symbols(app.state.stocks_market_info)
             refresh = await refresh_whitelist_quotes(
                 client=client,
@@ -128,7 +130,10 @@ async def _refresh_runtime(app, stop: asyncio.Event) -> None:
             prices = refresh.prices
             app.state.stocks_price_symbols = list(refresh.symbols)
             app.state.stocks_price_errors = dict(refresh.errors)
-            trading_date = _trading_date(app.state.stocks_market_info)
+            connector = getattr(app.state, "stocks_connector", None)
+            trading_date = (
+                connector.market_state_metadata.get("trading_date") if connector is not None else None
+            ) or _trading_date(app.state.stocks_market_info)
             policy.update_market(symbols, prices, trading_date)
             if client.api_key and app.state.stocks_settings.mode != "PAPER":
                 await _detect_external_activity(app)
@@ -140,6 +145,62 @@ async def _refresh_runtime(app, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=5)
         except asyncio.TimeoutError:
             pass
+
+
+async def _synchronize_market_state(app, *, bootstrap: bool = False) -> None:
+    connector = getattr(app.state, "stocks_connector", None)
+    if connector is None:
+        return
+    local = xnys_market_state()
+    now_ts = local.observed_at.timestamp()
+    metadata = connector.market_state_metadata
+    if bootstrap:
+        stored = await app.state.stocks_ledger.load_market_state()
+        if stored and stored.get("market_valid_until") and stored["market_valid_until"].timestamp() > now_ts:
+            connector.restore_market_state(
+                stored["market_phase"], source=stored["market_phase_source"],
+                event_timestamp=stored["market_event_at"].timestamp() if stored.get("market_event_at") else now_ts,
+                valid_until=stored["market_valid_until"].timestamp(),
+                trading_date=stored.get("market_trading_date"),
+                conflict=bool(stored.get("market_state_conflict")),
+            )
+            metadata = connector.market_state_metadata
+        else:
+            connector.restore_market_state(
+                local.phase, source=local.source, event_timestamp=now_ts,
+                valid_until=local.valid_until.timestamp(), trading_date=local.trading_date,
+            )
+            metadata = connector.market_state_metadata
+    elif metadata["source"] == "BINANCE" and metadata["event_timestamp"] > getattr(
+        app.state, "stocks_last_market_event_timestamp", 0
+    ):
+        conflict = phases_conflict(metadata["phase"], local.phase)
+        connector.restore_market_state(
+            metadata["phase"], source="BINANCE", event_timestamp=metadata["event_timestamp"],
+            valid_until=local.valid_until.timestamp(),
+            trading_date=metadata.get("trading_date") or local.trading_date, conflict=conflict,
+        )
+        metadata = connector.market_state_metadata
+    elif metadata["valid_until"] <= now_ts:
+        connector.restore_market_state(
+            local.phase, source=local.source, event_timestamp=now_ts,
+            valid_until=local.valid_until.timestamp(), trading_date=local.trading_date,
+        )
+        metadata = connector.market_state_metadata
+    app.state.stocks_last_market_event_timestamp = metadata["event_timestamp"]
+    event_at = datetime.fromtimestamp(metadata["event_timestamp"] or now_ts, tz=timezone.utc)
+    valid_until = datetime.fromtimestamp(metadata["valid_until"] or local.valid_until.timestamp(), tz=timezone.utc)
+    await app.state.stocks_ledger.save_market_state(
+        phase=metadata["phase"], source=metadata["source"], event_at=event_at,
+        valid_until=valid_until, trading_date=metadata.get("trading_date") or local.trading_date,
+        conflict=bool(metadata["conflict"]),
+    )
+    broker = getattr(app.state, "stocks_paper_broker", None)
+    if broker is not None:
+        broker.update_market_state(
+            metadata["phase"], getattr(connector, "_trading_status", {}),
+            getattr(connector, "_tradability", {}), metadata.get("trading_date") or local.trading_date,
+        )
 
 
 async def _detect_external_activity(app) -> None:
@@ -430,9 +491,6 @@ async def stocks_lifespan(runtime_app):
             if symbol.strip().upper() in direct_symbols
         }
         whitelist_pairs = [f"{symbol}-USDC" for symbol in sorted(default_whitelist)]
-        if broker is not None:
-            broker.update_market_state("UNKNOWN", trading_date=_trading_date(market_info))
-
         if paper_mode and credentials:
             from hummingbot.connector.exchange.binance_stocks.binance_stocks_position_provider import (
                 ManagedLedgerEquityPositionProvider,
@@ -473,6 +531,8 @@ async def stocks_lifespan(runtime_app):
                 )
                 connector._position_provider = ManagedLedgerEquityPositionProvider(ledger)
         runtime_app.state.stocks_connector = connector
+        runtime_app.state.stocks_last_market_event_timestamp = 0.0
+        await _synchronize_market_state(runtime_app, bootstrap=True)
         await ledger.ensure_whitelist(default_whitelist)
         runtime_app.state.stocks_policy.update_market(direct_symbols, {}, _trading_date(market_info))
         _install_executor_policy(runtime_app)

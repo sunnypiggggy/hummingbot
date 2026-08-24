@@ -29,6 +29,7 @@ FILES = (
     "scripts/audit_binance_stocks_runtime_deployment.py",
     "scripts/check_binance_stocks_runtime.py",
     "scripts/install_binance_stocks_runtime.py",
+    "scripts/migrate_binance_stocks_limits_v3.sql",
     "scripts/run_binance_stocks_paper_scenario.py",
     "scripts/smoke_binance_stocks_paper_api.py",
     "scripts/smoke_binance_stocks_async_queue.py",

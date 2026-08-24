@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional
@@ -79,11 +80,16 @@ class AsyncStocksOrderScheduler:
         if connector is None:
             return "UNKNOWN", None, False, "connector_unavailable"
         phase = str(getattr(connector, "market_phase", "UNKNOWN") or "UNKNOWN").upper()
+        metadata = getattr(connector, "market_state_metadata", {})
         trading_date = getattr(getattr(self.app.state, "stocks_paper_broker", None), "trading_date", None)
         trading_date = trading_date or self.policy.trading_date
         quote_fresh = connector.latest_quote(symbol) is not None
         if phase == "UNKNOWN":
             return phase, trading_date, quote_fresh, "market_state_unknown"
+        if metadata and float(metadata.get("valid_until") or 0) <= time.time():
+            return phase, trading_date, quote_fresh, "market_state_reconciliation_pending"
+        if metadata.get("conflict"):
+            return phase, trading_date, quote_fresh, "binance_xnys_market_state_conflict"
         return phase, trading_date, quote_fresh, ""
 
     async def enqueue(
@@ -190,6 +196,8 @@ class AsyncStocksOrderScheduler:
 
     def _connector_preflight(self, config: Dict[str, Any], symbol: str) -> None:
         connector = self.app.state.stocks_connector
+        if not bool(getattr(connector, "ready", False)):
+            raise PermissionError("Binance Stocks connector is not ready")
         side = trade_side_name(config.get("side"))
         status = str(getattr(connector, "_trading_status", {}).get(symbol, "UNKNOWN")).upper()
         if status not in {"TRADING", "ACTIVE", "NORMAL"}:
@@ -223,6 +231,12 @@ class AsyncStocksOrderScheduler:
         config = dict(row["executor_config"])
         symbol = str(config["trading_pair"]).rsplit("-", 1)[0]
         phase, trading_date, quote_fresh, reason = self._market_context(symbol)
+        if reason == "binance_xnys_market_state_conflict":
+            await self.ledger.transition_schedule(
+                schedule_id, "WAITING_PREFLIGHT", expected=set(SCHEDULED_INTENT_STATES),
+                reason=reason, target_trading_date=trading_date, next_attempt_seconds=30,
+            )
+            return
         if not session_eligible(str(row["target_session"]), phase):
             await self.ledger.transition_schedule(
                 schedule_id, "WAITING_SESSION", expected=set(SCHEDULED_INTENT_STATES),

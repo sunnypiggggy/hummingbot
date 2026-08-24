@@ -275,6 +275,7 @@ class FakeStocks:
         self.created = []
         self.market_phase = "MARKET_OPEN"
         self.schedules = {}
+        self.preview_allowed = True
 
     def health(self):
         return {
@@ -299,6 +300,11 @@ class FakeStocks:
         return {"allowed": True, "fee_reserve": "0.35", "executor_id": config["id"]}
 
     def preview_order(self, payload):
+        if not self.preview_allowed:
+            return {"allowed": False, "violation": {
+                "code": "超过单股票本金限额", "message": "AAPL本金占用超过运行限额",
+                "requested": "300", "current": "900", "available": "100",
+            }}
         return {"allowed": True, "fee_reserve": "0.35", "executor_id": payload["id"],
                 "execution_scope": "paper", "binance_economic_request": False}
 
@@ -510,6 +516,23 @@ class TelegramFlowTests(TestCase):
             session = bot.store.get_session(sid)
             result, _ = bot._stock_order_step(session, "confirm", "-")
             self.assertIn("Paper下单开关已关闭", result)
+            bot.store.close()
+
+    def test_stock_business_preflight_failure_keeps_wizard_and_offers_edits(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True)
+            bot.stocks.preview_allowed = False
+            _, rows = bot._new_stock_session("stock_order", 7, 7, 11)
+            sid = rows[0][0][1].split(":")[1]
+            bot._stock_order_step(bot.store.get_session(sid), "symbol", "AAPL")
+            bot._stock_order_step(bot.store.get_session(sid), "side", "BUY")
+            bot._stock_order_step(bot.store.get_session(sid), "otype", "MARKET")
+            text, buttons = bot._stock_order_step(bot.store.get_session(sid), "amount", "300")
+            self.assertIn("预检未通过", text)
+            self.assertIn("当前占用：900", text)
+            self.assertEqual("修改金额", buttons[0][0][0])
+            self.assertIsNotNone(bot.store.get_session(sid))
+            self.assertEqual([], bot.stocks.created)
             bot.store.close()
 
     def test_stock_paper_trading_is_independent_from_global_mutation_switch(self):

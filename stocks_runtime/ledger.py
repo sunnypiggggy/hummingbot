@@ -44,10 +44,10 @@ def _decode_jsonb_fields(row: Any, *fields: str) -> Optional[Dict[str, Any]]:
 
 @dataclass(frozen=True)
 class LedgerLimits:
-    max_order_notional: Decimal = Decimal("200")
+    max_order_notional: Decimal = Decimal("500")
     max_managed_exposure: Decimal = Decimal("2000")
     daily_loss_limit: Decimal = Decimal("200")
-    max_symbol_exposure: Decimal = Decimal("200")
+    max_symbol_exposure: Decimal = Decimal("1000")
 
 
 class LedgerConflict(RuntimeError):
@@ -55,6 +55,12 @@ class LedgerConflict(RuntimeError):
 
 
 class LedgerLimitExceeded(RuntimeError):
+    pass
+
+
+class LedgerUnavailable(RuntimeError):
+    """The limit decision depends on account data that is not currently trustworthy."""
+
     pass
 
 
@@ -86,7 +92,9 @@ class PostgresManagedLedger:
             self.LEADER_LOCK_ID = int(leader_lock_id)
             self.TX_LOCK_ID = self.LEADER_LOCK_ID + 1
         self.database_url = database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
-        self.hard_limits = limits
+        # These values seed a new database once.  They are not ceilings: after
+        # initialization PostgreSQL operator_limits is the sole runtime source.
+        self.bootstrap_limits = limits
         self.limits = limits
         self.order_prefix = order_prefix
         self.freshness_seconds = freshness_seconds
@@ -172,6 +180,12 @@ class PostgresManagedLedger:
                     external_activity_latched BOOLEAN NOT NULL DEFAULT FALSE,
                     live_authorized BOOLEAN NOT NULL DEFAULT FALSE,
                     session_start_pnl NUMERIC NOT NULL DEFAULT 0,
+                    market_phase TEXT,
+                    market_phase_source TEXT,
+                    market_event_at TIMESTAMPTZ,
+                    market_valid_until TIMESTAMPTZ,
+                    market_trading_date TEXT,
+                    market_state_conflict BOOLEAN NOT NULL DEFAULT FALSE,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
@@ -183,6 +197,17 @@ class PostgresManagedLedger:
                 f"ALTER TABLE {self.SCHEMA}.runtime_state "
                 "ADD COLUMN IF NOT EXISTS session_start_pnl NUMERIC NOT NULL DEFAULT 0"
             )
+            for definition in (
+                "market_phase TEXT",
+                "market_phase_source TEXT",
+                "market_event_at TIMESTAMPTZ",
+                "market_valid_until TIMESTAMPTZ",
+                "market_trading_date TEXT",
+                "market_state_conflict BOOLEAN NOT NULL DEFAULT FALSE",
+            ):
+                await connection.execute(
+                    f"ALTER TABLE {self.SCHEMA}.runtime_state ADD COLUMN IF NOT EXISTS {definition}"
+                )
             await connection.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.SCHEMA}.audit_events (
@@ -201,19 +226,25 @@ class PostgresManagedLedger:
                     max_order_notional NUMERIC NOT NULL,
                     max_symbol_exposure NUMERIC NOT NULL,
                     max_managed_exposure NUMERIC NOT NULL,
+                    daily_loss_limit NUMERIC NOT NULL DEFAULT 200,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
             )
             await connection.execute(
+                f"ALTER TABLE {self.SCHEMA}.operator_limits "
+                "ADD COLUMN IF NOT EXISTS daily_loss_limit NUMERIC NOT NULL DEFAULT 200"
+            )
+            await connection.execute(
                 f"""
                 INSERT INTO {self.SCHEMA}.operator_limits
-                  (singleton,max_order_notional,max_symbol_exposure,max_managed_exposure)
-                VALUES(TRUE,$1,$2,$3) ON CONFLICT DO NOTHING
+                  (singleton,max_order_notional,max_symbol_exposure,max_managed_exposure,daily_loss_limit)
+                VALUES(TRUE,$1,$2,$3,$4) ON CONFLICT DO NOTHING
                 """,
-                self.hard_limits.max_order_notional,
-                self.hard_limits.max_symbol_exposure,
-                self.hard_limits.max_managed_exposure,
+                self.bootstrap_limits.max_order_notional,
+                self.bootstrap_limits.max_symbol_exposure,
+                self.bootstrap_limits.max_managed_exposure,
+                self.bootstrap_limits.daily_loss_limit,
             )
             await connection.execute(
                 f"""
@@ -318,7 +349,7 @@ class PostgresManagedLedger:
                         VALUES($1,TRUE,$2) ON CONFLICT DO NOTHING
                         """,
                         symbol.upper(),
-                        self.hard_limits.max_symbol_exposure,
+                        self.bootstrap_limits.max_symbol_exposure,
                     )
 
     async def whitelist_rows(self) -> list[Dict[str, Any]]:
@@ -341,10 +372,9 @@ class PostgresManagedLedger:
     async def upsert_whitelist(self, symbol: str, enabled: bool, max_position_notional: Decimal) -> Dict[str, Any]:
         symbol = symbol.upper()
         limit = Decimal(max_position_notional)
-        if limit <= 0 or limit > self.hard_limits.max_symbol_exposure:
-            raise LedgerLimitExceeded(
-                f"symbol limit must be within (0, {self.hard_limits.max_symbol_exposure}] USDC"
-            )
+        capacity = await self.maximum_settable_capital()
+        if limit <= 0 or limit > capacity:
+            raise LedgerLimitExceeded(f"symbol limit must be within (0, {capacity}] USDC")
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 f"""
@@ -370,47 +400,56 @@ class PostgresManagedLedger:
     async def active_limits(self) -> LedgerLimits:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                f"SELECT max_order_notional,max_symbol_exposure,max_managed_exposure "
+                f"SELECT max_order_notional,max_symbol_exposure,max_managed_exposure,daily_loss_limit "
                 f"FROM {self.SCHEMA}.operator_limits WHERE singleton=TRUE"
             )
         if not row:
-            return self.hard_limits
+            return self.bootstrap_limits
         limits = LedgerLimits(
             max_order_notional=Decimal(row["max_order_notional"]),
             max_managed_exposure=Decimal(row["max_managed_exposure"]),
-            daily_loss_limit=self.hard_limits.daily_loss_limit,
+            daily_loss_limit=Decimal(row["daily_loss_limit"]),
             max_symbol_exposure=Decimal(row["max_symbol_exposure"]),
         )
         self.limits = limits
         return limits
 
     async def update_limits(
-        self, max_order_notional: Decimal, max_symbol_exposure: Decimal, max_managed_exposure: Decimal
+        self, max_order_notional: Decimal, max_symbol_exposure: Decimal, max_managed_exposure: Decimal,
+        daily_loss_limit: Optional[Decimal] = None,
     ) -> LedgerLimits:
         order = Decimal(max_order_notional)
         symbol = Decimal(max_symbol_exposure)
         total = Decimal(max_managed_exposure)
         if not (Decimal("0") < order <= symbol <= total):
             raise LedgerLimitExceeded("limits must satisfy 0 < order <= symbol <= total")
-        if order > self.hard_limits.max_order_notional:
-            raise LedgerLimitExceeded(f"order limit exceeds hard ceiling {self.hard_limits.max_order_notional}")
-        if symbol > self.hard_limits.max_symbol_exposure:
-            raise LedgerLimitExceeded(f"symbol limit exceeds hard ceiling {self.hard_limits.max_symbol_exposure}")
-        if total > self.hard_limits.max_managed_exposure:
-            raise LedgerLimitExceeded(f"total limit exceeds hard ceiling {self.hard_limits.max_managed_exposure}")
+        current = await self.active_limits()
+        daily = Decimal(daily_loss_limit) if daily_loss_limit is not None else current.daily_loss_limit
+        if daily <= 0:
+            raise LedgerLimitExceeded("daily loss limit must be positive")
+        capacity = await self.maximum_settable_capital()
+        if total > capacity:
+            raise LedgerLimitExceeded(f"total limit {total} exceeds trusted account capital {capacity} USDC")
         async with self._pool.acquire() as connection:
             await connection.execute(
                 f"""
                 UPDATE {self.SCHEMA}.operator_limits SET max_order_notional=$1,
-                  max_symbol_exposure=$2,max_managed_exposure=$3,updated_at=now()
+                  max_symbol_exposure=$2,max_managed_exposure=$3,daily_loss_limit=$4,updated_at=now()
                 WHERE singleton=TRUE
                 """,
                 order,
                 symbol,
-                total,
+                total, daily,
             )
-        self.limits = LedgerLimits(order, total, self.hard_limits.daily_loss_limit, symbol)
+        self.limits = LedgerLimits(order, total, daily, symbol)
         return self.limits
+
+    async def maximum_settable_capital(self) -> Decimal:
+        if time.time() - self._quote_updated_at > self.freshness_seconds:
+            raise LedgerUnavailable("trusted account capital is stale")
+        if self._quote_total <= 0:
+            raise LedgerUnavailable("trusted account capital is unavailable")
+        return self._quote_total
 
     async def managed_symbol_exposure(
         self, symbol: str, price: Decimal, exclude_executor_id: Optional[str] = None
@@ -422,10 +461,14 @@ class PostgresManagedLedger:
             )
             pending = await connection.fetchval(
                 f"""
-                SELECT COALESCE(SUM(estimated_notional + fee_reserve),0)
-                FROM {self.SCHEMA}.executor_intents
-                WHERE symbol=$1 AND side='BUY' AND status = ANY($2::text[])
-                  AND ($3::text IS NULL OR executor_id<>$3)
+                SELECT COALESCE(SUM(GREATEST(0,i.estimated_notional-COALESCE(o.filled_quote,0))),0)
+                FROM {self.SCHEMA}.executor_intents i
+                LEFT JOIN (
+                  SELECT executor_id,SUM(cumulative_quote) AS filled_quote
+                  FROM {self.SCHEMA}.managed_orders WHERE side='BUY' GROUP BY executor_id
+                ) o ON o.executor_id=i.executor_id
+                WHERE i.symbol=$1 AND i.side='BUY' AND i.status = ANY($2::text[])
+                  AND ($3::text IS NULL OR i.executor_id<>$3)
                 """,
                 symbol,
                 list(ACTIVE_INTENT_STATES),
@@ -485,6 +528,9 @@ class PostgresManagedLedger:
         config: Dict[str, Any],
         source_owner: Optional[str] = None,
         schedule: Optional[Dict[str, Any]] = None,
+        positions_mtm: Decimal = Decimal("0"),
+        symbol_position_mtm: Decimal = Decimal("0"),
+        max_symbol_limit: Optional[Decimal] = None,
     ) -> Dict[str, Any]:
         side = side.upper()
         estimated_notional = Decimal(estimated_notional)
@@ -513,20 +559,65 @@ class PostgresManagedLedger:
                 )
                 if side == "BUY" and bool(state["external_activity_latched"]):
                     raise LedgerLimitExceeded("external equity activity is latched; new BUY is blocked")
-                exposure = Decimal(
+                pending_principal = Decimal(
                     await connection.fetchval(
                         f"""
-                        SELECT COALESCE(SUM(estimated_notional + fee_reserve), 0)
-                        FROM {self.SCHEMA}.executor_intents
-                        WHERE side='BUY' AND status = ANY($1::text[])
+                        SELECT COALESCE(SUM(GREATEST(0,i.estimated_notional-COALESCE(o.filled_quote,0))),0)
+                        FROM {self.SCHEMA}.executor_intents i
+                        LEFT JOIN (
+                          SELECT executor_id,SUM(cumulative_quote) AS filled_quote
+                          FROM {self.SCHEMA}.managed_orders WHERE side='BUY' GROUP BY executor_id
+                        ) o ON o.executor_id=i.executor_id
+                        WHERE i.side='BUY' AND i.status = ANY($1::text[])
                         """,
                         list(ACTIVE_INTENT_STATES),
                     )
                 )
-                if side == "BUY" and exposure + estimated_notional + fee_reserve > limits.max_managed_exposure:
+                pending_fees = Decimal(
+                    await connection.fetchval(
+                        f"""
+                        SELECT COALESCE(SUM(GREATEST(0,i.fee_reserve-COALESCE(o.filled_fee,0))),0)
+                        FROM {self.SCHEMA}.executor_intents i
+                        LEFT JOIN (
+                          SELECT executor_id,SUM(cumulative_fee) AS filled_fee
+                          FROM {self.SCHEMA}.managed_orders WHERE side='BUY' GROUP BY executor_id
+                        ) o ON o.executor_id=i.executor_id
+                        WHERE i.side='BUY' AND i.status=ANY($1::text[])
+                        """,
+                        list(ACTIVE_INTENT_STATES),
+                    ) or 0
+                )
+                symbol_pending = Decimal(
+                    await connection.fetchval(
+                        f"""
+                        SELECT COALESCE(SUM(GREATEST(0,i.estimated_notional-COALESCE(o.filled_quote,0))),0)
+                        FROM {self.SCHEMA}.executor_intents i
+                        LEFT JOIN (
+                          SELECT executor_id,SUM(cumulative_quote) AS filled_quote
+                          FROM {self.SCHEMA}.managed_orders WHERE side='BUY' GROUP BY executor_id
+                        ) o ON o.executor_id=i.executor_id
+                        WHERE i.side='BUY' AND i.symbol=$1 AND i.status=ANY($2::text[])
+                        """,
+                        symbol, list(ACTIVE_INTENT_STATES),
+                    ) or 0
+                )
+                if side == "BUY" and Decimal(positions_mtm) + pending_principal + estimated_notional > limits.max_managed_exposure:
                     raise LedgerLimitExceeded(
                         f"managed exposure would exceed {limits.max_managed_exposure} USDC"
                     )
+                effective_symbol_limit = min(
+                    limits.max_symbol_exposure,
+                    Decimal(max_symbol_limit) if max_symbol_limit is not None else limits.max_symbol_exposure,
+                )
+                if side == "BUY" and Decimal(symbol_position_mtm) + symbol_pending + estimated_notional > effective_symbol_limit:
+                    raise LedgerLimitExceeded(
+                        f"managed {symbol} exposure would exceed {effective_symbol_limit} USDC"
+                    )
+                if side == "BUY" and (
+                    Decimal(positions_mtm) + pending_principal + estimated_notional
+                    + pending_fees + fee_reserve > self._quote_total
+                ):
+                    raise LedgerLimitExceeded("paper equity is insufficient for principal and fee reserves")
                 if side == "SELL":
                     owner = source_owner or "unassigned"
                     available = await connection.fetchval(
@@ -610,6 +701,31 @@ class PostgresManagedLedger:
                 bool(authorized),
             )
 
+    async def save_market_state(
+        self, *, phase: str, source: str, event_at: datetime, valid_until: datetime,
+        trading_date: Optional[str], conflict: bool = False,
+    ) -> None:
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                f"""
+                UPDATE {self.SCHEMA}.runtime_state SET market_phase=$1,market_phase_source=$2,
+                  market_event_at=$3,market_valid_until=$4,market_trading_date=$5,
+                  market_state_conflict=$6,updated_at=now() WHERE singleton=TRUE
+                """,
+                phase, source, event_at, valid_until, trading_date, bool(conflict),
+            )
+
+    async def load_market_state(self) -> Optional[Dict[str, Any]]:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                f"SELECT market_phase,market_phase_source,market_event_at,market_valid_until,"
+                f"market_trading_date,market_state_conflict FROM {self.SCHEMA}.runtime_state "
+                "WHERE singleton=TRUE"
+            )
+        if not row or not row["market_phase"]:
+            return None
+        return dict(row)
+
     async def set_trading_date(self, trading_date: str, current_pnl: Decimal) -> None:
         """Reset only the daily loss baseline when Binance tradingDate changes."""
         async with self._pool.acquire() as connection:
@@ -667,7 +783,7 @@ class PostgresManagedLedger:
             pending = await connection.fetchval(
                 f"""
                 SELECT COALESCE(SUM(
-                  GREATEST(0, i.estimated_notional - COALESCE(o.filled_quote, 0)) + i.fee_reserve
+                  GREATEST(0, i.estimated_notional - COALESCE(o.filled_quote, 0))
                 ), 0)
                 FROM {self.SCHEMA}.executor_intents i
                 LEFT JOIN (
@@ -685,6 +801,59 @@ class PostgresManagedLedger:
             Decimal("0"),
         )
         return mtm + Decimal(pending or 0)
+
+    async def capital_usage(
+        self, prices: Dict[str, Decimal], exclude_executor_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Return principal/MTM and fees separately for limits and funding checks."""
+        async with self._pool.acquire() as connection:
+            lots = await connection.fetch(
+                f"SELECT symbol,SUM(total_base) AS total FROM {self.SCHEMA}.inventory_lots "
+                "GROUP BY symbol HAVING SUM(total_base)>0"
+            )
+            pending = await connection.fetch(
+                f"""
+                SELECT i.symbol,
+                       COALESCE(SUM(GREATEST(0,i.estimated_notional-COALESCE(o.filled_quote,0))),0) AS principal,
+                       COALESCE(SUM(GREATEST(0,i.fee_reserve-COALESCE(o.filled_fee,0))),0) AS fees
+                FROM {self.SCHEMA}.executor_intents i
+                LEFT JOIN (
+                  SELECT executor_id,SUM(cumulative_quote) AS filled_quote,SUM(cumulative_fee) AS filled_fee
+                  FROM {self.SCHEMA}.managed_orders WHERE side='BUY' GROUP BY executor_id
+                ) o ON o.executor_id=i.executor_id
+                WHERE i.side='BUY' AND i.status=ANY($1::text[])
+                  AND ($2::text IS NULL OR i.executor_id<>$2)
+                GROUP BY i.symbol
+                """,
+                list(ACTIVE_INTENT_STATES), exclude_executor_id,
+            )
+        by_symbol: Dict[str, Decimal] = {}
+        positions_by_symbol: Dict[str, Decimal] = {}
+        positions = Decimal("0")
+        for row in lots:
+            symbol = str(row["symbol"])
+            value = Decimal(row["total"]) * Decimal(prices.get(symbol, 0))
+            positions += value
+            by_symbol[symbol] = by_symbol.get(symbol, Decimal("0")) + value
+            positions_by_symbol[symbol] = value
+        pending_principal = Decimal("0")
+        fee_reserve = Decimal("0")
+        for row in pending:
+            symbol = str(row["symbol"])
+            principal = Decimal(row["principal"] or 0)
+            pending_principal += principal
+            fee_reserve += Decimal(row["fees"] or 0)
+            by_symbol[symbol] = by_symbol.get(symbol, Decimal("0")) + principal
+        return {
+            "positions_mtm": positions,
+            "pending_buy_principal": pending_principal,
+            "fee_reserve": fee_reserve,
+            "principal_and_mtm": positions + pending_principal,
+            "by_symbol": by_symbol,
+            "positions_by_symbol": positions_by_symbol,
+            "quote_total": self._quote_total,
+            "quote_available": self._quote_available,
+        }
 
     async def release_intent(self, executor_id: str, status: str) -> None:
         """Release unfilled SELL reservation exactly once when an executor terminates."""

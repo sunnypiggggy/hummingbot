@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional
@@ -9,7 +10,11 @@ from pydantic import BaseModel, Field, model_validator
 
 from stocks_runtime.auth import auth_user
 from stocks_runtime.async_orders import activation_target, session_eligible
-from stocks_runtime.executor_config import build_order_executor_config, build_position_executor_config
+from stocks_runtime.executor_config import (
+    build_order_executor_config, build_position_executor_config, normalize_executor_config,
+)
+from stocks_runtime.ledger import LedgerConflict, LedgerLimitExceeded, LedgerUnavailable
+from stocks_runtime.policy import PolicyViolation
 
 
 router = APIRouter(prefix="/stocks", tags=["Binance Stocks Runtime"], dependencies=[Depends(auth_user)])
@@ -18,13 +23,14 @@ router = APIRouter(prefix="/stocks", tags=["Binance Stocks Runtime"], dependenci
 class WhitelistUpdate(BaseModel):
     symbol: str = Field(min_length=1, max_length=15)
     enabled: bool = True
-    max_position_notional: Decimal = Field(default=Decimal("200"), gt=0)
+    max_position_notional: Decimal = Field(default=Decimal("1000"), gt=0)
 
 
 class LimitsUpdate(BaseModel):
     max_order_notional: Decimal = Field(gt=0)
     max_symbol_exposure: Decimal = Field(gt=0)
     max_managed_exposure: Decimal = Field(gt=0)
+    daily_loss_limit: Optional[Decimal] = Field(default=None, gt=0)
 
 
 class ExecutorRequest(BaseModel):
@@ -132,13 +138,20 @@ async def health(request: Request) -> Dict[str, Any]:
     ledger = request.app.state.stocks_ledger
     connector = getattr(request.app.state, "stocks_connector", None)
     settings = request.app.state.stocks_settings
+    ledger_fresh = await ledger.is_fresh()
+    connector_ready = bool(connector and connector.ready)
+    market_phase = connector.market_phase if connector else "UNKNOWN"
+    market_metadata = connector.market_state_metadata if connector else {}
     payload = {
-        "status": "healthy" if await ledger.is_fresh() else "degraded",
+        "status": "healthy" if ledger_fresh and connector_ready and market_phase != "UNKNOWN" else "degraded",
         "runtime_mode": settings.mode,
         "live_authorized": settings.mode == "LIVE" and settings.live_authorized,
         "disclaimer_confirmed": settings.disclaimer_confirmed,
-        "connector_ready": bool(connector and connector.ready),
-        "market_phase": connector.market_phase if connector else "PUBLIC_DATA_ONLY",
+        "connector_ready": connector_ready,
+        "market_phase": market_phase,
+        "market_phase_source": market_metadata.get("source", "UNKNOWN"),
+        "market_state_conflict": bool(market_metadata.get("conflict")),
+        "market_trading_date": market_metadata.get("trading_date"),
         "position_source": "paper_ledger" if settings.mode == "PAPER" else "managed_ledger_non_authoritative",
         "external_positions_unknown": settings.mode != "PAPER",
         "economic_requests_enabled": settings.mode == "LIVE" and settings.live_authorized,
@@ -155,7 +168,7 @@ async def health(request: Request) -> Dict[str, Any]:
             "economic_http_request_count": getattr(connector, "economic_http_request_count", 0),
             "economic_requests_enabled": False,
         })
-        if account["recovery_required"] or not connector:
+        if account["recovery_required"] or not connector or market_metadata.get("conflict"):
             payload["status"] = "degraded"
     return payload
 
@@ -181,8 +194,10 @@ async def put_whitelist(symbol: str, payload: WhitelistUpdate, request: Request)
         row = await request.app.state.stocks_ledger.upsert_whitelist(
             symbol, payload.enabled, payload.max_position_notional
         )
-    except Exception as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LedgerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LedgerLimitExceeded as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"updated": True, "item": row}
 
 
@@ -198,19 +213,30 @@ async def delete_whitelist(symbol: str, request: Request) -> Dict[str, Any]:
 
 @router.get("/limits")
 async def limits(request: Request) -> Dict[str, Any]:
-    active = await request.app.state.stocks_ledger.active_limits()
-    hard = request.app.state.stocks_ledger.hard_limits
+    ledger = request.app.state.stocks_ledger
+    active = await ledger.active_limits()
+    usage = await ledger.capital_usage(request.app.state.stocks_policy.prices)
+    try:
+        maximum = await ledger.maximum_settable_capital()
+    except LedgerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "active": {
             "max_order_notional": str(active.max_order_notional),
             "max_symbol_exposure": str(active.max_symbol_exposure),
             "max_managed_exposure": str(active.max_managed_exposure),
+            "daily_loss_limit": str(active.daily_loss_limit),
         },
-        "hard_ceiling": {
-            "max_order_notional": str(hard.max_order_notional),
-            "max_symbol_exposure": str(hard.max_symbol_exposure),
-            "max_managed_exposure": str(hard.max_managed_exposure),
+        "usage": {
+            "positions_mtm": str(usage["positions_mtm"]),
+            "pending_buy_principal": str(usage["pending_buy_principal"]),
+            "principal_and_mtm": str(usage["principal_and_mtm"]),
+            "fee_reserve": str(usage["fee_reserve"]),
+            "by_symbol": {key: str(value) for key, value in usage["by_symbol"].items()},
+            "available_cash": str(usage["quote_available"]),
+            "paper_equity": str(usage["quote_total"]),
         },
+        "maximum_settable": {"capital": str(maximum)},
     }
 
 
@@ -221,15 +247,19 @@ async def put_limits(payload: LimitsUpdate, request: Request) -> Dict[str, Any]:
             payload.max_order_notional,
             payload.max_symbol_exposure,
             payload.max_managed_exposure,
+            payload.daily_loss_limit,
         )
-    except Exception as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LedgerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LedgerLimitExceeded as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
         "updated": True,
         "active": {
             "max_order_notional": str(active.max_order_notional),
             "max_symbol_exposure": str(active.max_symbol_exposure),
             "max_managed_exposure": str(active.max_managed_exposure),
+            "daily_loss_limit": str(active.daily_loss_limit),
         },
     }
 
@@ -333,10 +363,26 @@ async def _preview_managed_executor(
         result = await request.app.state.stocks_policy.preview(
             executor_config, "stocks_managed", controller_id
         )
+    except PolicyViolation as exc:
+        return {
+            "allowed": False,
+            "violation": exc.payload(),
+            "execution_scope": "paper" if request.app.state.stocks_settings.mode == "PAPER" else "live",
+            "binance_economic_request": False if request.app.state.stocks_settings.mode == "PAPER" else None,
+        }
+    except LedgerLimitExceeded as exc:
+        return {
+            "allowed": False,
+            "violation": {"code": "业务风控不通过", "message": str(exc)},
+            "execution_scope": "paper" if request.app.state.stocks_settings.mode == "PAPER" else "live",
+            "binance_economic_request": False if request.app.state.stocks_settings.mode == "PAPER" else None,
+        }
     except (ValueError, InvalidOperation) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
+    except LedgerConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     paper = request.app.state.stocks_settings.mode == "PAPER"
     result.update({
         "execution_scope": "paper" if paper else "live",
@@ -361,6 +407,13 @@ async def _create_managed_executor(
     executor_id = str(executor_config.get("id", ""))
     existing = await request.app.state.stocks_ledger.executor_record(executor_id)
     if existing is not None:
+        stored_config = existing.get("config", {})
+        if isinstance(stored_config, str):
+            stored_config = json.loads(stored_config)
+        if stored_config != normalize_executor_config(executor_config):
+            raise HTTPException(
+                status_code=409, detail=f"executor id {executor_id} already exists with different config"
+            )
         scheduled = await request.app.state.stocks_ledger.scheduled_by_executor(executor_id)
         if scheduled is not None:
             return {
@@ -372,10 +425,12 @@ async def _create_managed_executor(
         created = await request.app.state.executor_service.create_executor(
             executor_config, "stocks_managed", controller_id
         )
-    except (ValueError, InvalidOperation) as exc:
+    except (ValueError, InvalidOperation, LedgerLimitExceeded) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
+    except LedgerConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"idempotent_replay": False, "disposition": "CREATED", "executor": created}
 
 
@@ -407,14 +462,14 @@ async def _create_or_queue(
                     connector.process_quote_event(raw_quote)
                     quote = connector.latest_quote(symbol)
             except Exception as exc:
-                raise HTTPException(status_code=409, detail=f"fresh {symbol} quote is unavailable: {exc}") from exc
+                raise HTTPException(status_code=503, detail=f"fresh {symbol} quote is unavailable: {exc}") from exc
         if quote is None:
-            raise HTTPException(status_code=409, detail=f"fresh {symbol} quote is unavailable")
+            raise HTTPException(status_code=503, detail=f"fresh {symbol} quote is unavailable")
         ask = Decimal(str(quote[1]))
         pair = str(executor_config["trading_pair"])
         amount = connector.quantize_order_amount(pair, Decimal(quote_budget) / ask)
         if amount <= 0 or amount * ask > Decimal(quote_budget):
-            raise HTTPException(status_code=409, detail="fixed quote budget cannot produce a valid quantity")
+            raise HTTPException(status_code=422, detail="fixed quote budget cannot produce a valid quantity")
         executor_config = dict(executor_config)
         executor_config["amount"] = str(amount)
     return await _create_managed_executor(executor_config, controller_id, request)
@@ -432,10 +487,19 @@ async def create_order_executor(payload: OrderExecutorRequest, request: Request)
         price=payload.price,
         source_owner=payload.source_owner,
     )
-    result = await _create_or_queue(
-        executor_config=config, payload=payload, controller_id=payload.controller_id,
-        activation_policy=payload.activation_policy, quote_budget=payload.quote_budget, request=request,
-    )
+    try:
+        result = await _create_or_queue(
+            executor_config=config, payload=payload, controller_id=payload.controller_id,
+            activation_policy=payload.activation_policy, quote_budget=payload.quote_budget, request=request,
+        )
+    except LedgerConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (LedgerLimitExceeded, ValueError, InvalidOperation) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     result["execution_scope"] = "paper" if request.app.state.stocks_settings.mode == "PAPER" else "live"
     result["binance_economic_request"] = False if request.app.state.stocks_settings.mode == "PAPER" else None
     return result
@@ -470,10 +534,19 @@ async def create_position_executor(payload: PositionExecutorRequest, request: Re
         trailing_activation=payload.trailing_activation,
         trailing_delta=payload.trailing_delta,
     )
-    result = await _create_or_queue(
-        executor_config=config, payload=payload, controller_id=payload.controller_id,
-        activation_policy=payload.activation_policy, quote_budget=payload.quote_budget, request=request,
-    )
+    try:
+        result = await _create_or_queue(
+            executor_config=config, payload=payload, controller_id=payload.controller_id,
+            activation_policy=payload.activation_policy, quote_budget=payload.quote_budget, request=request,
+        )
+    except LedgerConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (LedgerLimitExceeded, ValueError, InvalidOperation) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     result["execution_scope"] = "paper" if request.app.state.stocks_settings.mode == "PAPER" else "live"
     result["binance_economic_request"] = False if request.app.state.stocks_settings.mode == "PAPER" else None
     return result

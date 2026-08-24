@@ -11,6 +11,7 @@ from stocks_runtime.ledger import _decode_jsonb_fields
 
 class FakeConnector:
     def __init__(self):
+        self.ready = True
         self.market_phase = "MARKET_CLOSED"
         self.quote = (Decimal("99"), Decimal("100"))
         self._trading_status = {"AAPL": "TRADING"}
