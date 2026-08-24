@@ -660,7 +660,7 @@ class PostgresPaperBroker:
                 f"ORDER BY sequence DESC LIMIT ${len(args)}",
                 *args,
             )
-        return [_decode_checkpoint_row(row) for row in rows]
+        return [_jsonable(row) for row in rows]
 
     async def trades(self, symbol: Optional[str] = None, limit: int = 500):
         args: list[Any] = [self._run_id]
@@ -963,7 +963,7 @@ class PostgresPaperBroker:
                 "WHERE run_id=$1 AND status NOT IN('TERMINATED','COMPLETED') ORDER BY updated_at",
                 self._run_id,
             )
-        return [_jsonable(row) for row in rows]
+        return [_decode_checkpoint_row(row) for row in rows]
 
     async def mark_recovery_required(self, reason: str) -> None:
         async with self.ledger._pool.acquire() as connection:

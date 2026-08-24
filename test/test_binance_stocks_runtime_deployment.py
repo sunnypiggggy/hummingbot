@@ -29,6 +29,13 @@ class BinanceStocksRuntimeDeploymentTests(TestCase):
         self.assertIn("BINANCE_STOCKS_LIVE_AUTHORIZED=false", dockerfile)
         self.assertNotIn("order/place", dockerfile)
 
+    def test_paper_restart_decodes_checkpoint_jsonb_fields(self):
+        source = (ROOT / "stocks_runtime" / "paper_broker.py").read_text(encoding="utf-8")
+        active_checkpoint_body = source.split("async def active_checkpoints", 1)[1].split(
+            "async def mark_recovery_required", 1
+        )[0]
+        self.assertIn("_decode_checkpoint_row(row)", active_checkpoint_body)
+
     def test_paper_secret_is_empty(self):
         self.assertEqual("{}", (ROOT / "config/binance_stocks_credentials.paper.json").read_text().strip())
 
