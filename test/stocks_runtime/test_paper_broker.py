@@ -54,6 +54,7 @@ class PaperBrokerPureTests(TestCase):
         self.assertEqual("0.25", reconciled["entry_filled_backup"])
         self.assertEqual("100", reconciled["entry_quote_backup"])
         self.assertEqual("0.35", reconciled["fees_quote_backup"])
+        self.assertTrue(reconciled["recovered_entry_frozen"])
 
     def test_quote_parses_bbo_sizes_and_has_stable_event_id(self):
         payload = {

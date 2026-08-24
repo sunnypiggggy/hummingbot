@@ -65,6 +65,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
         self._exit_quote_backup = Decimal("0")
         self._fees_quote_backup = Decimal("0")
         self._external_entry_frozen = False
+        self._recovered_entry_frozen = False
 
     @property
     def end_time(self) -> Optional[float]:
@@ -124,7 +125,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
         self.control_time_limit()
 
     def control_open_order(self):
-        if not self._external_entry_frozen:
+        if not self._external_entry_frozen and not self._recovered_entry_frozen:
             super().control_open_order()
 
     def freeze_entry_due_external_activity(self):
@@ -245,6 +246,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
                 "market_phase": connector.market_phase,
                 "external_positions_unknown": True,
                 "external_entry_frozen": self._external_entry_frozen,
+                "recovered_entry_frozen": self._recovered_entry_frozen,
             }
         )
         return info
@@ -271,6 +273,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
                 str(self._trailing_stop_trigger_pct) if self._trailing_stop_trigger_pct is not None else None
             ),
             "external_entry_frozen": self._external_entry_frozen,
+            "recovered_entry_frozen": self._recovered_entry_frozen,
             "current_retries": self._current_retries,
         }
 
@@ -298,6 +301,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
         trailing = state.get("trailing_stop_trigger_pct")
         self._trailing_stop_trigger_pct = Decimal(str(trailing)) if trailing is not None else None
         self._external_entry_frozen = bool(state.get("external_entry_frozen", False))
+        self._recovered_entry_frozen = bool(state.get("recovered_entry_frozen", False))
         self._current_retries = int(state.get("current_retries", 0))
         status = str(state.get("status", "RUNNING"))
         self._status = RunnableStatus[status] if status in RunnableStatus.__members__ else RunnableStatus.RUNNING

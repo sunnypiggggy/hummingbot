@@ -63,15 +63,16 @@ def reconcile_checkpoint_terminal_orders(
         if str(row.get("status", "UNKNOWN")).upper() in PAPER_OPEN_STATES:
             continue
         if str(order_id) not in processed:
-            result[base_field] = str(
-                _decimal(result.get(base_field)) + _decimal(row.get("filled_base"))
-            )
+            filled_base = _decimal(row.get("filled_base"))
+            result[base_field] = str(_decimal(result.get(base_field)) + filled_base)
             result[quote_field] = str(
                 _decimal(result.get(quote_field)) + _decimal(row.get("filled_quote"))
             )
             result["fees_quote_backup"] = str(
                 _decimal(result.get("fees_quote_backup")) + _decimal(row.get("cumulative_fee"))
             )
+            if id_field == "open_order_id" and filled_base > 0:
+                result["recovered_entry_frozen"] = True
             processed.add(str(order_id))
         result[id_field] = None
     return result
