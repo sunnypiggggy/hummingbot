@@ -46,9 +46,13 @@ RTH_OPEN_PHASES = {"MARKET_OPEN"}
 ORDER_STATE = {
     "NEW": OrderState.OPEN,
     "ACCEPTED": OrderState.OPEN,
+    # The local PAPER venue uses the normalized lifecycle vocabulary while
+    # Binance orderReport uses NEW/ACCEPTED. Both represent the same state.
+    "OPEN": OrderState.OPEN,
     "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
     "FILLED": OrderState.FILLED,
     "CANCELED": OrderState.CANCELED,
+    "CANCELLED": OrderState.CANCELED,
     "EXPIRED": OrderState.FAILED,
     "REJECTED": OrderState.FAILED,
 }

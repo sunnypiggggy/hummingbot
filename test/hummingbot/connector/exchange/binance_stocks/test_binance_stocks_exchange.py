@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 from bidict import bidict
 
 from hummingbot.client.settings import AllConnectorSettings
+from hummingbot.connector.exchange.binance_stocks import binance_stocks_constants as CONSTANTS
 from hummingbot.connector.exchange.binance_stocks.binance_stocks_exchange import BinanceStocksExchange
 from hummingbot.connector.exchange.binance_stocks.binance_stocks_position_provider import (
     EquityAccountSnapshot,
@@ -311,6 +312,10 @@ class BinanceStocksExchangeTests(IsolatedAsyncioTestCase):
         self.assertEqual("USDC", small_buy.flat_fees[0].token)
         self.assertIsInstance(large_sell, DeductedFromReturnsTradeFee)
         self.assertEqual(Decimal("0.001"), large_sell.percent)
+
+    def test_normalized_paper_open_and_cancelled_states_are_supported(self):
+        self.assertEqual("OPEN", CONSTANTS.ORDER_STATE["OPEN"].name)
+        self.assertEqual("CANCELED", CONSTANTS.ORDER_STATE["CANCELLED"].name)
 
     async def test_exchange_info_parses_direct_fractional_equity_and_skips_tokenized(self):
         exchange = configured_exchange(trading_required=False)
