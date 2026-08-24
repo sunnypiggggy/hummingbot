@@ -49,6 +49,15 @@ set_env BINANCE_STOCKS_MAX_SYMBOL_USDC 1000
 set_env BINANCE_STOCKS_MAX_EXPOSURE_USDC 2000
 set_env BINANCE_STOCKS_DAILY_LOSS_USDC 200
 
+# Docker Compose variable interpolation reads .env (not service env_file).
+# This path contains no credential material; it selects the existing OCI secret.
+touch "$ROOT/.env"
+if grep -q '^BINANCE_STOCKS_CREDENTIALS_PATH=' "$ROOT/.env"; then
+  sed -i 's|^BINANCE_STOCKS_CREDENTIALS_PATH=.*|BINANCE_STOCKS_CREDENTIALS_PATH=/home/ubuntu/secrets/binance_stocks_credentials.json|' "$ROOT/.env"
+else
+  printf '%s\n' 'BINANCE_STOCKS_CREDENTIALS_PATH=/home/ubuntu/secrets/binance_stocks_credentials.json' >> "$ROOT/.env"
+fi
+
 docker exec -i "$POSTGRES_CONTAINER" sh -lc \
   'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d hummingbot_stocks' \
   < "$ROOT/scripts/migrate_binance_stocks_limits_v3.sql"

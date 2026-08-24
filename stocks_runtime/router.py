@@ -148,6 +148,7 @@ async def health(request: Request) -> Dict[str, Any]:
         "live_authorized": settings.mode == "LIVE" and settings.live_authorized,
         "disclaimer_confirmed": settings.disclaimer_confirmed,
         "connector_ready": connector_ready,
+        "connector_status": dict(connector.status_dict) if connector else {},
         "market_phase": market_phase,
         "market_phase_source": market_metadata.get("source", "UNKNOWN"),
         "market_state_conflict": bool(market_metadata.get("conflict")),
