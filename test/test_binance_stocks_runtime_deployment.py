@@ -35,6 +35,12 @@ class BinanceStocksRuntimeDeploymentTests(TestCase):
             "async def mark_recovery_required", 1
         )[0]
         self.assertIn("_decode_checkpoint_row(row)", active_checkpoint_body)
+        app_source = (ROOT / "stocks_runtime" / "app.py").read_text(encoding="utf-8")
+        restore_body = app_source.split("async def _restore_paper_executors", 1)[1].split(
+            "@asynccontextmanager", 1
+        )[0]
+        self.assertIn("_start_restored_executor(executor)", restore_body)
+        self.assertNotIn("\n            executor.start()", restore_body)
 
     def test_paper_secret_is_empty(self):
         self.assertEqual("{}", (ROOT / "config/binance_stocks_credentials.paper.json").read_text().strip())

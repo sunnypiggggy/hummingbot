@@ -31,6 +31,7 @@ from hummingbot.strategy_v2.executors.binance_stocks_position_executor import ( 
 )
 from hummingbot.strategy_v2.executors.order_executor.data_types import OrderExecutorConfig  # noqa: E402
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig  # noqa: E402
+from hummingbot.strategy_v2.models.base import RunnableStatus  # noqa: E402
 
 from stocks_runtime.binance_client import BinanceStocksReadClient  # noqa: E402
 from stocks_runtime.auth import auth_user  # noqa: E402
@@ -76,6 +77,17 @@ def _start_whitelist_order_book_tracker(connector) -> None:
     if not tracker_running:
         tracker.start()
         logger.info("Started whitelist-only Binance Stocks BBO tracker for %s", trading_pairs)
+
+
+def _start_restored_executor(executor) -> None:
+    """Resume a checkpoint through RunnableBase.start without losing its phase."""
+    resume_status = executor.status
+    executor._status = RunnableStatus.NOT_STARTED
+    executor.start()
+    # start() schedules the loop for the next event-loop turn, so restoring a
+    # risk exit phase here cannot race a RUNNING control iteration.
+    if resume_status == RunnableStatus.SHUTTING_DOWN:
+        executor._status = RunnableStatus.SHUTTING_DOWN
 
 
 def _items(payload: Any) -> list[Dict[str, Any]]:
@@ -412,7 +424,7 @@ async def _restore_paper_executors(app) -> int:
             service._active_executors[executor_id] = executor
             service._executor_metadata[executor_id] = metadata
             token = current_executor_id.set(executor_id)
-            executor.start()
+            _start_restored_executor(executor)
             current_executor_id.reset(token)
             restored += 1
         except Exception as exc:
