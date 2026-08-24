@@ -619,13 +619,20 @@ class BinanceStocksExchange(ExchangePyBase):
                 tick_size = self._decimal(
                     entry.get("priceIncrement", entry.get("tickSize", price_filter.get("tickSize", "0.01")))
                 )
-                fractional = bool(entry.get("fractional", entry.get("fractionalTrading", False)))
+                # Current Stocks exchangeInfo calls this field `fractionable`.
+                # Keep the earlier catalog aliases for captured fixtures and
+                # backwards-compatible deployments.
+                fractional = bool(entry.get(
+                    "fractionable", entry.get("fractional", entry.get("fractionalTrading", False))
+                ))
                 raw_step = entry.get("quantityIncrement", entry.get("stepSize", lot_filter.get("stepSize")))
                 if raw_step is None and fractional:
                     raise ValueError("fractional ticker is missing quantity increment")
                 step_size = self._decimal(raw_step if raw_step is not None else "1")
                 minimum_quantity = self._decimal(entry.get("minQuantity", lot_filter.get("minQty", step_size)))
-                minimum_notional = self._decimal(entry.get("minOrderValue", notional_filter.get("minNotional", "0")))
+                minimum_notional = self._decimal(entry.get(
+                    "minNotional", entry.get("minOrderValue", notional_filter.get("minNotional", "0"))
+                ))
                 self._fractional_supported[symbol] = fractional
                 rules.append(
                     TradingRule(

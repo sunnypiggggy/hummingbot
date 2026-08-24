@@ -338,3 +338,22 @@ class BinanceStocksExchangeTests(IsolatedAsyncioTestCase):
         self.assertEqual(Decimal("0.0001"), rules[0].min_base_amount_increment)
         self.assertEqual(Decimal("5"), rules[0].min_notional_size)
         self.assertEqual("BUY_SELL", exchange._tradability["AAPL"])
+
+    async def test_exchange_info_parses_current_fractionable_and_top_level_min_notional(self):
+        exchange = configured_exchange(trading_required=False)
+        response = {
+            "data": {
+                "symbols": [{
+                    "symbol": "AAPL",
+                    "tradability": "BUY_SELL",
+                    "fractionable": True,
+                    "stepSize": "0.000000001",
+                    "minNotional": "5.00000000",
+                }]
+            }
+        }
+        rules = await exchange._format_trading_rules(response)
+        self.assertEqual(1, len(rules))
+        self.assertTrue(exchange._fractional_supported["AAPL"])
+        self.assertEqual(Decimal("0.000000001"), rules[0].min_base_amount_increment)
+        self.assertEqual(Decimal("5.00000000"), rules[0].min_notional_size)

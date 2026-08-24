@@ -99,6 +99,12 @@ def _direct_symbols(market_info: Any) -> set[str]:
 
 def _ensure_master_account_scaffold() -> None:
     """Create only non-secret API config files in the isolated credential volume."""
+    # ExchangePyBase's failure path persists the global client config. The API
+    # image does not ship Hummingbot Client's conf directory, so create only the
+    # parent directory here; config_helpers remains responsible for the file.
+    from hummingbot.client.config.config_helpers import CLIENT_CONFIG_PATH
+
+    CLIENT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     root = Path("/hummingbot-api/bots/credentials/master_account")
     connectors = root / "connectors"
     connectors.mkdir(parents=True, exist_ok=True)

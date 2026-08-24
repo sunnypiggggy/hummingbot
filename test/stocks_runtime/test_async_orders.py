@@ -174,6 +174,16 @@ class AsyncStocksOrderSchedulerTests(IsolatedAsyncioTestCase):
         self.assertEqual("ACTIVE", ledger.row["status"])
         self.assertEqual(1, len(created))
 
+    async def test_terminal_zero_order_executor_history_does_not_block_explicit_requeue(self):
+        scheduler, connector, _, ledger, created = self.make_scheduler(row(order_type="LIMIT"))
+        connector.market_phase = "MARKET_OPEN"
+        scheduler.app.state.executor_service.runtime[ledger.row["executor_id"]] = {
+            "status": "TERMINATED", "is_active": False, "close_type": "FAILED",
+        }
+        await scheduler.tick()
+        self.assertEqual("ACTIVE", ledger.row["status"])
+        self.assertEqual(1, len(created))
+
     def test_asyncpg_json_text_row_is_normalized_before_scheduler_consumes_it(self):
         value = row(order_type="MARKET", budget=Decimal("100"))
         value["executor_config"] = json.dumps(value["executor_config"])

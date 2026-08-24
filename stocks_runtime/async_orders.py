@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 LIMIT_PHASES = {"PRE_MARKET", "MARKET_OPEN", "POST_MARKET", "AFTER_HOURS"}
 MARKET_PHASES = {"MARKET_OPEN"}
 TERMINAL_STATES = {"CANCELED", "EXPIRED", "REJECTED", "FAILED"}
+TERMINAL_EXECUTOR_STATES = {"TERMINATED", "FAILED", "COMPLETED", "CANCELED", "CANCELLED", "STOPPED"}
 
 
 def schedule_id_for(executor_id: str) -> str:
@@ -52,6 +53,14 @@ def _hard_rejection(exc: Exception) -> bool:
         "position snapshot", "fractional", "minimum", "notional",
     )
     return any(token in text for token in hard)
+
+
+def _runtime_executor_is_active(runtime: Optional[Dict[str, Any]]) -> bool:
+    if not runtime:
+        return False
+    if "is_active" in runtime:
+        return bool(runtime["is_active"])
+    return str(runtime.get("status", "UNKNOWN")).upper() not in TERMINAL_EXECUTOR_STATES
 
 
 class AsyncStocksOrderScheduler:
@@ -286,7 +295,10 @@ class AsyncStocksOrderScheduler:
         executor_id = str(row["executor_id"])
         existing_runtime = await self.app.state.executor_service.get_executor(executor_id)
         record = await self.ledger.executor_record(executor_id)
-        if existing_runtime or (record and record.get("orders")):
+        # A previously failed, zero-fill Executor may be explicitly re-queued
+        # with the same stable ID after its pre-order cause is fixed. A terminal
+        # history row is audit evidence, not an active economic order.
+        if _runtime_executor_is_active(existing_runtime) or (record and record.get("orders")):
             await self.ledger.transition_schedule(
                 schedule_id, "ACTIVE", expected={"ACTIVATING"}, reason="executor_recovered",
                 resulting_executor_id=executor_id,
