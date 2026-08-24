@@ -551,6 +551,38 @@ class TelegramFlowTests(TestCase):
             self.assertEqual(1, subscriptions[0]["last_version"])
             bot.store.close()
 
+    def test_stock_schedule_notification_only_fires_on_status_transition(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True)
+            schedule_id = "sch-no-spam"
+            bot.stocks.schedules[schedule_id] = {
+                "schedule_id": schedule_id,
+                "status": "WAITING_SESSION",
+                "version": 2,
+                "request_payload": {"symbol": "AAPL", "side": "BUY"},
+                "last_block_reason": "waiting_for_market_open",
+            }
+            bot.store.subscribe_stock_schedule(schedule_id, 7, 7)
+            bot.store.mark_stock_schedule_notified(schedule_id, "QUEUED", 1)
+
+            bot._notify_stock_schedules()
+            self.assertEqual(1, len(bot.telegram.sent))
+            self.assertIn("等待交易时段", bot.telegram.sent[0][1])
+
+            # Repeated scheduler heartbeats may advance the internal version,
+            # but do not constitute a new Telegram lifecycle event.
+            bot.stocks.schedules[schedule_id]["version"] = 99
+            bot.stocks.schedules[schedule_id]["last_block_reason"] = "still_closed"
+            bot._notify_stock_schedules()
+            self.assertEqual(1, len(bot.telegram.sent))
+
+            bot.stocks.schedules[schedule_id]["status"] = "WAITING_PREFLIGHT"
+            bot.stocks.schedules[schedule_id]["version"] = 100
+            bot._notify_stock_schedules()
+            self.assertEqual(2, len(bot.telegram.sent))
+            self.assertIn("等待开市预检", bot.telegram.sent[1][1])
+            bot.store.close()
+
     def test_position_limit_wizard_uses_live_quote_and_price_based_risk_preview(self):
         with tempfile.TemporaryDirectory() as raw:
             bot = self._bot(Path(raw), paper_enabled=True)
@@ -681,6 +713,19 @@ class TelegramFlowTests(TestCase):
             self.assertNotIn("Not enough budget", text)
             self.assertNotIn("交易阻塞：", text)
             bot.store.close()
+
+    def test_bot_menu_labels_rolling_history_separately_from_current_errors(self):
+        old = {
+            "status": "running",
+            "error_logs": [
+                {"timestamp": time.time() - 3600, "msg": "old error"}
+                for _ in range(7)
+            ],
+        }
+        line = TradingManagementBot._bot_line("grid-live-fdusd-400", old)
+        self.assertIn("近15分钟无错误", line)
+        self.assertIn("滚动历史7条", line)
+        self.assertNotIn("当前错误", line)
 
     def test_risk_status_uses_final_per_robot_permissions(self):
         with tempfile.TemporaryDirectory() as raw:

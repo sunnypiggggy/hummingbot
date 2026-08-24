@@ -798,6 +798,40 @@ class PostgresManagedLedger:
                 )
                 if row is None or (expected is not None and str(row["status"]) not in expected):
                     return None
+                # Closed-market and transient-preflight retries are scheduling
+                # heartbeats, not lifecycle transitions. Keep polling due time
+                # (and the preflight backoff counter) current without creating
+                # a new externally observable version every few seconds.
+                same_wait_state = (
+                    status in {"WAITING_SESSION", "WAITING_PREFLIGHT"}
+                    and str(row["status"]) == status
+                    and (reason is None or str(row["last_block_reason"] or "") == str(reason))
+                    and (
+                        target_trading_date is None
+                        or str(row["target_trading_date"] or "") == str(target_trading_date)
+                    )
+                    and executor_config is None
+                    and requested_shares is None
+                    and estimated_notional is None
+                    and resulting_executor_id is None
+                )
+                if same_wait_state:
+                    await connection.execute(
+                        f"""
+                        UPDATE {self.SCHEMA}.scheduled_executors SET
+                          next_attempt_at=now()+($2::double precision*interval '1 second'),
+                          attempt_count=attempt_count+CASE WHEN $3='WAITING_PREFLIGHT' THEN 1 ELSE 0 END
+                        WHERE schedule_id=$1
+                        """,
+                        schedule_id, float(next_attempt_seconds), status,
+                    )
+                    return _decode_jsonb_fields(
+                        await connection.fetchrow(
+                            f"SELECT * FROM {self.SCHEMA}.scheduled_executors WHERE schedule_id=$1", schedule_id
+                        ),
+                        "request_payload",
+                        "executor_config",
+                    )
                 terminal = status in {"CANCELED", "EXPIRED", "REJECTED", "FAILED"}
                 activated = status == "ACTIVE"
                 config_json = None

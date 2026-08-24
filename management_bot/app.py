@@ -206,15 +206,47 @@ class TradingManagementBot:
         return value if isinstance(value, dict) else {}
 
     @staticmethod
-    def _bot_line(name: str, raw: dict) -> str:
+    def _recent_bot_errors(raw: dict, *, now: Optional[float] = None) -> tuple[dict[str, int], int]:
+        """Return recent error classes and the rolling-history size.
+
+        Hummingbot exposes ``error_logs`` as rolling history. A traceback is
+        one incident even when variable details differ, so the first line is
+        the stable operator-facing class shared by every status page.
+        """
+        values = raw.get("error_logs", []) if isinstance(raw, dict) else []
+        if not isinstance(values, list):
+            return {}, 0
+        cutoff = (time.time() if now is None else float(now)) - 900
+        recent: dict[str, int] = {}
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            timestamp = float(value.get("timestamp", 0) or 0)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            if timestamp < cutoff:
+                continue
+            raw_message = str(value.get("msg", "未知运行错误"))
+            message = next((line.strip() for line in raw_message.splitlines() if line.strip()), "未知运行错误")
+            recent[message] = recent.get(message, 0) + 1
+        return recent, len(values)
+
+    @classmethod
+    def _bot_line(cls, name: str, raw: dict) -> str:
         status = str(raw.get("status", "unknown")).lower()
         chinese = {
             "running": "运行中", "stopped": "已停止", "starting": "启动中",
             "stopping": "停止中", "error": "错误",
         }.get(status, "状态未知")
-        errors = raw.get("error_logs", [])
-        count = len(errors) if isinstance(errors, list) else 0
-        return f"• {name}：{chinese}" + (f"，错误{count}条" if count else "")
+        recent, history_count = cls._recent_bot_errors(raw)
+        recent_count = sum(recent.values())
+        if recent_count:
+            suffix = f"，当前错误{len(recent)}类/{recent_count}次"
+        elif history_count:
+            suffix = f"，近15分钟无错误（滚动历史{history_count}条）"
+        else:
+            suffix = "，近15分钟无错误"
+        return f"• {name}：{chinese}{suffix}"
 
     def _overview(self) -> str:
         lines = ["📊 系统总览", f"模式：{self.mode_label}", ""]
@@ -480,20 +512,21 @@ class TradingManagementBot:
 
         # Hummingbot's error_logs is a rolling history, not a current alarm list.
         # Only recent unique errors are shown and repeated per-second messages are collapsed.
-        cutoff = time.time() - 900
         recent: dict[tuple[str, str], int] = {}
+        history: list[str] = []
         try:
             for name, raw in self._api_bots().items():
-                values = raw.get("error_logs", []) if isinstance(raw, dict) else []
-                if isinstance(values, list):
-                    for value in values:
-                        if not isinstance(value, dict) or float(value.get("timestamp", 0) or 0) < cutoff:
-                            continue
-                        msg = str(value.get("msg", "未知运行错误"))
-                        if name in budget_warning_bots and "Not enough budget" in msg:
-                            continue
-                        key = (name, msg)
-                        recent[key] = recent.get(key, 0) + 1
+                grouped, history_count = self._recent_bot_errors(raw)
+                recent_count = sum(grouped.values())
+                for message, count in grouped.items():
+                    if name in budget_warning_bots and "Not enough budget" in message:
+                        continue
+                    recent[(name, message)] = count
+                if history_count > recent_count:
+                    history.append(
+                        f"{name}：滚动历史{history_count}条，近15分钟{recent_count}条；"
+                        "历史记录不计入当前异常。"
+                    )
         except Exception as exc:
             blockers.append(f"Hummingbot API不可用：{_safe_text(exc)}")
         for (name, message), count in recent.items():
@@ -516,6 +549,9 @@ class TradingManagementBot:
             lines.extend(f"• {item}" for item in warnings)
         elif not blockers:
             lines.append("当前也没有需要处理的运行提醒。")
+        if history:
+            lines.extend(("", "历史记录说明："))
+            lines.extend(f"• {item}" for item in history)
         return "\n".join(lines)
 
     @staticmethod
@@ -1018,7 +1054,10 @@ class TradingManagementBot:
                         schedule_id, final_status, version, str(item.get("resulting_executor_id"))
                     )
                     continue
-            if version <= int(subscription.get("last_version") or 0) and status == subscription.get("last_status"):
+            # Scheduler retry cadence is not a user-visible lifecycle event.
+            # Notify only when the semantic status changes; version may advance
+            # while the same closed-market preflight is retried.
+            if status == subscription.get("last_status"):
                 continue
             payload = item.get("request_payload") or {}
             text = (
@@ -1493,12 +1532,8 @@ class TradingManagementBot:
         rows: list[list[tuple[str, str]]] = []
         for item in items[:20]:
             symbol = str(item.get("symbol"))
-            enabled = bool(item.get("enabled"))
-            lines.append(f"• {symbol}：{'启用' if enabled else '停用'}；上限 {item.get('max_position_notional')} USDC")
-            rows.append([
-                (f"{'停用' if enabled else '启用'} {symbol}", f"s:wl_toggle:{symbol}:{int(not enabled)}"),
-                (f"删除 {symbol}", f"s:wl_delete:{symbol}"),
-            ])
+            lines.append(f"• {symbol}：白名单内；上限 {item.get('max_position_notional')} USDC")
+            rows.append([(f"删除 {symbol}", f"s:wl_delete:{symbol}")])
         rows.append([("➕ 添加/修改", "s:wl_input"), ("⬅️ 返回", "m:stock")])
         return "\n".join(lines), rows
 
@@ -1732,14 +1767,8 @@ class TradingManagementBot:
         if not session:
             return "向导已过期，请重新开始。", self._back()
         if action == "wl_toggle_confirm":
-            if not self.settings.mutations_enabled:
-                return "🔒 只读观察模式，白名单未修改。", self._back("s:whitelist")
-            payload = session["payload"]
-            result = self.stocks.put_whitelist(
-                payload["symbol"], bool(payload["enabled"]), payload["limit"]
-            )
             self.store.delete_session(sid)
-            return f"✅ {payload['symbol']} 已{'启用' if payload['enabled'] else '停用'}\n{_safe_text(result)}", self._back("s:whitelist")
+            return "ℹ️ 白名单停用功能已移除，请在列表中直接删除。", self._back("s:whitelist")
         if action == "wl_delete_confirm":
             if not self.settings.mutations_enabled:
                 return "🔒 只读观察模式，白名单未删除。", self._back("s:whitelist")
@@ -1951,21 +1980,7 @@ class TradingManagementBot:
                 self.store.update_session(session["session_id"], step="input")
                 text, rows = "请输入：单笔,单股票,总持仓\n例如：200,200,2000", [[("取消", "m:stock")]]
             elif data.startswith("s:wl_toggle:"):
-                _, _, symbol, enabled = data.split(":", 3)
-                row = next((item for item in self.stocks.whitelist() if item.get("symbol") == symbol), None)
-                if not row:
-                    raise ValueError("白名单项目不存在")
-                session = self.store.create_session(user_id, chat_id, "whitelist_toggle", message_id)
-                self.store.update_session(session["session_id"], step="confirm", payload={
-                    "symbol": symbol,
-                    "enabled": bool(int(enabled)),
-                    "limit": str(row["max_position_notional"]),
-                })
-                target = "启用" if int(enabled) else "停用（已有仓位不会自动卖出）"
-                text, rows = (
-                    f"确认{target} {symbol}？",
-                    [[("确认", f"x:{session['session_id']}:wl_toggle_confirm"), ("取消", "s:whitelist")]],
-                )
+                text, rows = "ℹ️ 白名单停用功能已移除，请直接删除。", self._back("s:whitelist")
             elif data.startswith("s:wl_delete:"):
                 symbol = data.split(":", 2)[2]
                 row = next((item for item in self.stocks.whitelist() if item.get("symbol") == symbol), None)

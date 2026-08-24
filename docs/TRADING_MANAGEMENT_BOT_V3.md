@@ -123,8 +123,14 @@ Stock Runtime提供以下受控接口：
 - `POST /stocks/executors/{executor_id}/reduce`
 - `POST /stocks/executors/{executor_id}/close`
 
-白名单只约束新增BUY。停用或移除股票不会自动卖出已有仓位，SELL、减仓和
-平仓仍由归属账本校验后执行。
+白名单只约束新增BUY。管理Bot不再提供“停用”状态：不再允许新增该股票时，
+直接从白名单删除。删除不会自动卖出已有仓位，SELL、减仓和平仓仍由归属账本
+校验后执行。
+
+异步订单通知只在 `QUEUED`、`WAITING_SESSION`、`WAITING_PREFLIGHT`、
+`ACTIVATING`、`ACTIVE`、`CANCELED`、`EXPIRED`、`REJECTED`、`FAILED`
+等业务状态实际转换时发送。
+闭市轮询、临时预检重试和下一次尝试时间刷新不会重复通知。
 
 活动限额保存于Stock Postgres：单笔金额、单股票持仓和Stock总持仓。
 环境变量是不可突破的硬上限；运行时必须满足：
