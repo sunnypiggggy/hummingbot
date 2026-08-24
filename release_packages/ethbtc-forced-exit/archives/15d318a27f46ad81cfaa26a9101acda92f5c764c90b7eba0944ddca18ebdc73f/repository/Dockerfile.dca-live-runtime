@@ -1,0 +1,6 @@
+FROM hummingbot/hummingbot:latest
+
+USER root
+COPY controllers/market_making/dman_maker_v3_macro.py /home/hummingbot/controllers/market_making/dman_maker_v3_macro.py
+COPY hummingbot/strategy_v2/executors/dca_executor/data_types.py /home/hummingbot/hummingbot/strategy_v2/executors/dca_executor/data_types.py
+COPY hummingbot/strategy_v2/executors/dca_executor/dca_executor.py /home/hummingbot/hummingbot/strategy_v2/executors/dca_executor/dca_executor.py

@@ -1,0 +1,62 @@
+{
+  "schema": "ethbtc-grid-telegram-hotfix-deployment-v1",
+  "git_commit": "df1af9f9e",
+  "deployed_at": "2026-08-24T11:17:19Z",
+  "files": {
+    "docker-compose.yml": "bff8984336a47502e6434fc6e55c2a503a88a0c89c4951f684e93398225a7c64",
+    "telegram-notify.env": "7475ed738e9d8840e45444fada5c1f0c03f57523d35839821f92d799ba57a505",
+    "live_guard/telegram_notifications.py": "5972fa49c63ddfc454b07b9b75993b43261da9e0ca0bc140be653438520e9af6",
+    "scripts/grid_live_common.py": "636ea4fed2384aa2f8450a1fc212bbf9aac62ed1e41a3b5ab80e81b0a013bd2b",
+    "scripts/walk_forward_portfolio_grid_live.py": "2cc768ceebb88aa6ff164a40129bca1230ee997d38deb65a4cf278b78de68ca3",
+    "api-files/bots/scripts/grid_live_common.py": "636ea4fed2384aa2f8450a1fc212bbf9aac62ed1e41a3b5ab80e81b0a013bd2b",
+    "api-files/bots/scripts/walk_forward_portfolio_grid_live.py": "2cc768ceebb88aa6ff164a40129bca1230ee997d38deb65a4cf278b78de68ca3"
+  },
+  "containers": {
+    "grid-live-fdusd-400": {
+      "image_id": "sha256:5d421e5372d8305df45c4ba78d611d2e8f03ed16979d993693201cb5921f327b",
+      "started_at": "2026-08-24T11:17:19.454326604Z",
+      "status": "running",
+      "restart_count": 0
+    },
+    "grid-live-fdusd-scheduler": {
+      "image_id": "sha256:d6bc11306dc6ce9664ddeba4c3bc107bf0400e07c35e10e594658218fd0ff7a6",
+      "started_at": "2026-08-24T11:16:54.197180571Z",
+      "status": "running",
+      "restart_count": 0
+    },
+    "dca-live-report": {
+      "image_id": "sha256:a3f325501dd2617a4891eeab714235d8d7079f4e55cd3f197125f8e5d01d2c68",
+      "started_at": "2026-08-24T11:13:51.340956041Z",
+      "status": "running",
+      "restart_count": 0
+    },
+    "dca-live-btcusdt-200": {
+      "image_id": "sha256:075c71b912cadd0b3768e0d37d9976ad8050c5dc295c6411e7d7c9c7e8ce2b6d",
+      "started_at": "2026-08-20T04:04:42.88714066Z",
+      "status": "running",
+      "restart_count": 0
+    },
+    "dca-live-ethusdt-200": {
+      "image_id": "sha256:075c71b912cadd0b3768e0d37d9976ad8050c5dc295c6411e7d7c9c7e8ce2b6d",
+      "started_at": "2026-08-20T04:05:36.014610093Z",
+      "status": "running",
+      "restart_count": 0
+    }
+  },
+  "verification": {
+    "tests_passed": 104,
+    "grid_btc_normal": true,
+    "grid_eth_normal": true,
+    "dca_btc_normal": true,
+    "dca_eth_normal": true,
+    "post_deploy_real_error_count": 0,
+    "telegram_sqlite_max_mib": 128,
+    "telegram_sqlite_bytes": 9861768,
+    "pending_notifications": 0
+  },
+  "backup": {
+    "database": "backups/389efd336/telegram_outbox.sqlite",
+    "database_bytes": 247250944,
+    "repository": "backups/389efd336/repository"
+  }
+}
