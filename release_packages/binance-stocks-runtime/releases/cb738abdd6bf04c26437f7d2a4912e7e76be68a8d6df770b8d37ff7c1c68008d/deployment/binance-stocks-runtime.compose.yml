@@ -1,0 +1,38 @@
+services:
+  binance-stocks-runtime:
+    profiles:
+      - stocks
+    container_name: binance-stocks-runtime
+    build:
+      context: .
+      dockerfile: Dockerfile.binance-stocks-runtime
+    image: hummingbot/binance-stocks-runtime:local
+    restart: unless-stopped
+    env_file:
+      - .env.control
+    environment:
+      BINANCE_STOCKS_CREDENTIALS_FILE: /run/secrets/binance_stocks_credentials
+      BINANCE_STOCKS_ACCOUNT: stocks_managed
+      BINANCE_STOCKS_DATABASE_NAME: hummingbot_stocks
+      BINANCE_STOCKS_ORDER_PREFIX: x-HBSTK
+      BINANCE_STOCKS_MAX_ORDER_USDC: "200"
+      BINANCE_STOCKS_MAX_SYMBOL_USDC: "200"
+      BINANCE_STOCKS_MAX_EXPOSURE_USDC: "2000"
+      BINANCE_STOCKS_DAILY_LOSS_USDC: "200"
+      BINANCE_STOCKS_PAPER_INITIAL_USDC: "2000"
+      BINANCE_STOCKS_PAPER_FILL_LATENCY_MS: "1000"
+      BINANCE_STOCKS_PAPER_MARKET_TIMEOUT_SECONDS: "5"
+      BINANCE_STOCKS_PAPER_QUOTE_MAX_AGE_SECONDS: "10"
+      BINANCE_STOCKS_PAPER_EQUITY_SNAPSHOT_SECONDS: "60"
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - ./api-files/stocks-runtime/bots:/hummingbot-api/bots
+      - ./api-files/stocks-runtime/logs:/hummingbot-api/logs
+    secrets:
+      - binance_stocks_credentials
+    depends_on:
+      - postgres
+    networks:
+      - hummingbot-control
+

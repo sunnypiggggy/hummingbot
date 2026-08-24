@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+COPY management_bot/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY management_bot/ /app/management_bot/
+
+RUN groupadd --gid 10001 management-bot \
+    && useradd --system --uid 10001 --gid 10001 --create-home management-bot \
+    && mkdir -p /state /contracts /approvals/weekly /approvals/evidence /approvals/decisions \
+    && chown -R management-bot:management-bot /state /approvals/decisions
+
+USER management-bot
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import json,time; d=json.load(open('/state/health.json')); assert time.time()-float(d['generated_at'])<90" || exit 1
+
+CMD ["python", "-m", "management_bot.app"]
