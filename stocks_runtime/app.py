@@ -368,7 +368,9 @@ async def _restore_paper_executors(app) -> int:
     service = app.state.executor_service
     broker = app.state.stocks_paper_broker
     restored = 0
-    for checkpoint in await broker.active_checkpoints():
+    failed = 0
+    checkpoints = await broker.active_checkpoints()
+    for checkpoint in checkpoints:
         executor_id = str(checkpoint["executor_id"])
         if executor_id in service._active_executors:
             continue
@@ -403,11 +405,14 @@ async def _restore_paper_executors(app) -> int:
             current_executor_id.reset(token)
             restored += 1
         except Exception as exc:
+            failed += 1
             logger.error("Paper executor recovery failed for %s: %s", executor_id, exc, exc_info=True)
             await broker.mark_recovery_required(f"executor_recovery_failed:{executor_id}:{exc}")
             for order in await broker.orders(open_only=True):
                 if str(order.get("executor_id")) == executor_id:
                     await broker.cancel_order(str(order["client_order_id"]), "CANCELED")
+    if checkpoints and failed == 0:
+        await broker.clear_executor_recovery_error()
     return restored
 
 

@@ -2,7 +2,7 @@ import time
 from decimal import Decimal
 from unittest import TestCase
 
-from stocks_runtime.paper_broker import PaperQuote, PostgresPaperBroker, _checkpoint_json
+from stocks_runtime.paper_broker import PaperQuote, PostgresPaperBroker, _checkpoint_json, _decode_checkpoint_row
 
 
 class _Ledger:
@@ -10,6 +10,18 @@ class _Ledger:
 
 
 class PaperBrokerPureTests(TestCase):
+    def test_checkpoint_jsonb_text_is_decoded_for_restart_recovery(self):
+        row = {
+            "executor_id": "paper-executor-1",
+            "config": '{"id":"paper-executor-1"}',
+            "metadata": '{"account_name":"stocks_managed"}',
+            "state": '{"phase":"OPEN"}',
+        }
+        decoded = _decode_checkpoint_row(row)
+        self.assertEqual("paper-executor-1", decoded["config"]["id"])
+        self.assertEqual("stocks_managed", decoded["metadata"]["account_name"])
+        self.assertEqual("OPEN", decoded["state"]["phase"])
+
     def test_quote_parses_bbo_sizes_and_has_stable_event_id(self):
         payload = {
             "s": "AAPL",

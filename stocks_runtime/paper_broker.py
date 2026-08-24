@@ -28,6 +28,15 @@ def _jsonable(row: Any) -> Dict[str, Any]:
     return {key: value for key, value in dict(row).items()}
 
 
+def _decode_checkpoint_row(row: Any) -> Dict[str, Any]:
+    result = _jsonable(row)
+    for field in ("config", "metadata", "state"):
+        value = result.get(field)
+        if isinstance(value, str):
+            result[field] = json.loads(value)
+    return result
+
+
 def _checkpoint_json(value: Any) -> str:
     """Serialize runtime state to PostgreSQL's strict JSON representation."""
     def clean(item: Any) -> Any:
@@ -651,7 +660,7 @@ class PostgresPaperBroker:
                 f"ORDER BY sequence DESC LIMIT ${len(args)}",
                 *args,
             )
-        return [_jsonable(row) for row in rows]
+        return [_decode_checkpoint_row(row) for row in rows]
 
     async def trades(self, symbol: Optional[str] = None, limit: int = 500):
         args: list[Any] = [self._run_id]
@@ -962,6 +971,14 @@ class PostgresPaperBroker:
                 f"UPDATE {self.schema}.paper_state SET recovery_required=TRUE,recovery_reason=$1,updated_at=now() "
                 "WHERE singleton=TRUE",
                 reason[:1000],
+            )
+
+    async def clear_executor_recovery_error(self) -> None:
+        """Clear only the recoverable Executor checkpoint decoding latch."""
+        async with self.ledger._pool.acquire() as connection:
+            await connection.execute(
+                f"UPDATE {self.schema}.paper_state SET recovery_required=FALSE,recovery_reason=NULL,updated_at=now() "
+                "WHERE singleton=TRUE AND recovery_reason LIKE 'executor_recovery_failed:%'"
             )
 
     async def reset(self, confirmation: str, active_executor_count: int) -> Dict[str, Any]:
