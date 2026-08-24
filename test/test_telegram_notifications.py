@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -376,6 +377,71 @@ def test_outbox_ingestion_and_restart_are_idempotent():
         assert restarted.ingest(source) == 0
         assert restarted.health()["pending"] == 1
         restarted.close()
+
+
+def test_outbox_maintenance_downsamples_history_and_never_deletes_pending(tmp_path):
+    now = 2_000_000_000.0
+    outbox = TelegramOutbox(
+        tmp_path / "outbox.sqlite", channel_id="channel",
+        max_bytes=8 * 1024 * 1024, profit_retention_days=370,
+        profit_high_resolution_days=8, sent_retention_days=90,
+        maintenance_seconds=3600,
+    )
+    old = now - 10 * 86400
+    for offset in (0, 60, 120, 180):
+        outbox.connection.execute(
+            "INSERT INTO profit_snapshot VALUES (?,?,?,?,?,?,?)",
+            ("grid", "BTC-FDUSD", old + offset, 1, 201, 0, "x" * 2000),
+        )
+    outbox.enqueue(event_id="pending", kind="message", text="must survive")
+    outbox.enqueue(event_id="old-sent", kind="message", text="old audit")
+    outbox.connection.execute(
+        "UPDATE outbox SET status='sent',sent_at=? WHERE event_id='old-sent'",
+        (now - 100 * 86400,),
+    )
+    outbox.connection.commit()
+
+    report = outbox.maintain(force=True, now=now)
+
+    assert outbox.connection.execute(
+        "SELECT COUNT(*) FROM profit_snapshot"
+    ).fetchone()[0] == 1
+    assert outbox.connection.execute(
+        "SELECT LENGTH(payload_json) FROM profit_snapshot"
+    ).fetchone()[0] < 512
+    assert outbox.connection.execute(
+        "SELECT status FROM outbox WHERE event_id='pending'"
+    ).fetchone()[0] == "pending"
+    assert outbox.connection.execute(
+        "SELECT COUNT(*) FROM outbox WHERE event_id='old-sent'"
+    ).fetchone()[0] == 0
+    assert report["deleted_downsampled_snapshots"] == 3
+    outbox.close()
+
+
+def test_outbox_size_limit_compacts_legacy_payloads_and_is_exposed_in_health(tmp_path):
+    path = tmp_path / "outbox.sqlite"
+    outbox = TelegramOutbox(
+        path, max_bytes=8 * 1024 * 1024,
+        profit_high_resolution_days=1, maintenance_seconds=60,
+    )
+    now = time.time()
+    payload = "z" * 8192
+    for index in range(1_500):
+        outbox.connection.execute(
+            "INSERT INTO profit_snapshot VALUES (?,?,?,?,?,?,?)",
+            ("grid", "ETH-FDUSD", now - index * 60, 1, 201, 0, payload),
+        )
+    outbox.connection.commit()
+
+    report = outbox.maintain(force=True, now=now)
+    health = outbox.health()
+
+    assert report["compacted_payloads"] == 1_500
+    assert health["database"]["max_bytes"] == 8 * 1024 * 1024
+    assert health["database"]["within_limit"] is True
+    assert health["database"]["size_bytes"] <= 8 * 1024 * 1024
+    outbox.close()
 
 
 class FakeResponse:

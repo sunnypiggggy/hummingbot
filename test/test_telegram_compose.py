@@ -58,6 +58,10 @@ def test_report_notification_settings_are_persistent_and_secret_free():
     assert values["TELEGRAM_NOTIFY_ENABLED"] == "true"
     assert values["TELEGRAM_PROFIT_REPORT_ENABLED"] == "true"
     assert values["TELEGRAM_NOTIFY_CHANNEL_ID"].startswith("-100")
+    assert values["TELEGRAM_SQLITE_MAX_MIB"] == "128"
+    assert values["TELEGRAM_PROFIT_RETENTION_DAYS"] == "370"
+    assert values["TELEGRAM_PROFIT_HIGH_RES_DAYS"] == "8"
+    assert values["TELEGRAM_SENT_RETENTION_DAYS"] == "90"
     assert all("TOKEN" not in key for key in values)
 
 

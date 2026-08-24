@@ -21,6 +21,13 @@ Token 仍只能通过 Docker secret 注入。
 - `TELEGRAM_NOTIFY_BOT_TOKEN_FILE`：Docker secret 文件，默认
   `/run/secrets/telegram_notify_bot_token`。
 - `TELEGRAM_NOTIFY_CHANNEL_ID`：唯一允许的目标频道 ID。
+- `TELEGRAM_SQLITE_MAX_MIB`：Telegram outbox/收益快照数据库目标上限，默认
+  `128` MiB。待发送和重试中的消息永不因容量清理。
+- `TELEGRAM_PROFIT_RETENTION_DAYS=370`：收益历史总保留期。
+- `TELEGRAM_PROFIT_HIGH_RES_DAYS=8`：近8天保留分钟级快照，更早数据按小时
+  降采样；超过容量上限时更早数据按天压缩。
+- `TELEGRAM_SENT_RETENTION_DAYS=90`：已成功发送消息的审计保留期；待发送消息
+  不受此配置影响。
 - `TELEGRAM_PROFIT_REPORT_ENABLED`：四小时收益报告开关，默认 `true`。
 - `TELEGRAM_ALERT_<MECHANISM>_ENABLED`：七类机制各自通知开关，默认 `true`。
 

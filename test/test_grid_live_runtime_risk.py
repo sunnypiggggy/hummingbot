@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee
-from hummingbot.core.event.events import BuyOrderCompletedEvent, SellOrderCompletedEvent
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    MarketOrderFailureEvent,
+    SellOrderCompletedEvent,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -388,6 +392,29 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             row["event"] == "grid_completed_order_pair_unresolved"
             for row in strategy.runtime_events
         ))
+
+    def test_limit_maker_rejection_immediately_refreshes_only_owned_pair(self):
+        strategy = self.strategy()
+        order_id = "btc-maker-crossed-book"
+        strategy.buy_order_ids.add(order_id)
+        strategy.ledgers["BTC-FDUSD"].open_order_ids.add(order_id)
+
+        strategy.did_fail_order(MarketOrderFailureEvent(
+            timestamp=1_000.0,
+            order_id=order_id,
+            order_type=OrderType.LIMIT_MAKER,
+            error_message="Order would immediately match and take.",
+            error_type="-2010",
+        ))
+
+        btc = strategy.order_build_status["BTC-FDUSD"]
+        eth = strategy.order_build_status["ETH-FDUSD"]
+        self.assertEqual("REFRESH_REQUESTED", btc["state"])
+        self.assertEqual("limit_maker_would_take", btc["reason"])
+        self.assertEqual(order_id, btc["last_failed_order_id"])
+        self.assertEqual("UNKNOWN", eth["state"])
+        self.assertNotIn(order_id, strategy.buy_order_ids)
+        self.assertNotIn(order_id, strategy.ledgers["BTC-FDUSD"].open_order_ids)
 
     def test_unexpected_gap_waits_fifteen_seconds_before_requesting_refresh(self):
         strategy = self.strategy()

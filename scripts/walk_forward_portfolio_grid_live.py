@@ -2099,7 +2099,34 @@ class LivePortfolioGrid(StrategyV2Base):
         self._forget_order(event.order_id)
 
     def did_fail_order(self, event: MarketOrderFailureEvent):
+        # Failure events do not expose a trading_pair. Resolve ownership before
+        # forgetting the order and immediately rebuild only the affected pair.
+        # This removes the old 15-second liveness wait (which could stretch to a
+        # full strategy cycle) after a LIMIT_MAKER post-only rejection.
+        ordinary = self._is_ordinary_grid_order(event.order_id)
+        pair = self._owned_order_pair(event.order_id) if ordinary else None
+        if pair is not None:
+            error_message = str(getattr(event, "error_message", "") or "")
+            reason = (
+                "limit_maker_would_take"
+                if "immediately match and take" in error_message.lower()
+                else "ordinary_grid_order_failed"
+            )
+            status = self._order_status(pair)
+            status.update({
+                "last_failed_order_id": str(event.order_id),
+                "last_failed_order_at": float(self.current_timestamp),
+                "last_failed_order_reason": reason,
+            })
+            self._request_pair_order_refresh(pair, reason=reason)
         self._forget_order(event.order_id)
+
+    def _owned_order_pair(self, order_id: str) -> str | None:
+        pairs = [
+            pair for pair, ledger in self.ledgers.items()
+            if str(order_id) in ledger.open_order_ids
+        ]
+        return pairs[0] if len(pairs) == 1 else None
 
     def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
         if self._is_ordinary_grid_order(event.order_id):
@@ -2143,12 +2170,9 @@ class LivePortfolioGrid(StrategyV2Base):
         is the authoritative ownership record, then accept either event shape.
         """
         order_id = str(event.order_id)
-        owned_pairs = [
-            pair for pair, ledger in self.ledgers.items()
-            if order_id in ledger.open_order_ids
-        ]
-        if len(owned_pairs) == 1:
-            return owned_pairs[0]
+        owned_pair = self._owned_order_pair(order_id)
+        if owned_pair is not None:
+            return owned_pair
 
         event_pair = str(getattr(event, "trading_pair", "") or "")
         if event_pair in self.config.trading_pairs:

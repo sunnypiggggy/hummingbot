@@ -42,6 +42,16 @@ class PairParameterRuntimeTest(unittest.TestCase):
         self.assertTrue(all(price * amount >= Decimal("10") for price, amount in orders))
         self.assertLessEqual(sum(amount for _, amount in orders), Decimal("0.05069"))
 
+    def test_sell_levels_collapsed_by_cost_floor_merge_without_overselling(self):
+        orders = clip_quantized_sell_levels(
+            [Decimal("1990"), Decimal("2000"), Decimal("2010")],
+            Decimal("0.03"), Decimal("5"),
+            lambda _level: Decimal("2050.00"),
+            self.quantizer(Decimal("0.0001")),
+        )
+        self.assertEqual([(Decimal("2050.00"), Decimal("0.03"))], orders)
+        self.assertEqual(Decimal("0.03"), sum(amount for _, amount in orders))
+
     def test_btc_exact_minimum_budget_rounds_buy_up_and_clips_farthest(self):
         # Production incident: 13 lower levels, 100 FDUSD budget, a 10 FDUSD
         # floor and BTC's 0.00001 amount step at roughly 71,532 FDUSD.

@@ -884,12 +884,44 @@ class TelegramChannelClient:
 
 
 class TelegramOutbox:
-    def __init__(self, path: Path, *, channel_id: str = "") -> None:
+    def __init__(
+        self, path: Path, *, channel_id: str = "",
+        max_bytes: int | None = None,
+        profit_retention_days: int | None = None,
+        profit_high_resolution_days: int | None = None,
+        sent_retention_days: int | None = None,
+        maintenance_seconds: int | None = None,
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.channel_id = str(channel_id)
+        self.max_bytes = max(8 * 1024 * 1024, int(
+            max_bytes if max_bytes is not None else
+            float(os.getenv("TELEGRAM_SQLITE_MAX_MIB", "128")) * 1024 * 1024
+        ))
+        self.profit_retention_days = max(8, int(
+            profit_retention_days if profit_retention_days is not None else
+            os.getenv("TELEGRAM_PROFIT_RETENTION_DAYS", "370")
+        ))
+        self.profit_high_resolution_days = max(1, min(
+            self.profit_retention_days,
+            int(profit_high_resolution_days if profit_high_resolution_days is not None else
+                os.getenv("TELEGRAM_PROFIT_HIGH_RES_DAYS", "8")),
+        ))
+        self.sent_retention_days = max(1, int(
+            sent_retention_days if sent_retention_days is not None else
+            os.getenv("TELEGRAM_SENT_RETENTION_DAYS", "90")
+        ))
+        self.maintenance_seconds = max(60, int(
+            maintenance_seconds if maintenance_seconds is not None else
+            os.getenv("TELEGRAM_SQLITE_MAINTENANCE_SECONDS", "3600")
+        ))
+        self._last_maintenance = 0.0
+        self._last_maintenance_report: dict[str, Any] = {}
         self.connection = sqlite3.connect(path, timeout=30)
         self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA wal_autocheckpoint=1000")
+        self.connection.execute("PRAGMA journal_size_limit=8388608")
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS outbox (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -929,6 +961,125 @@ class TelegramOutbox:
           ON profit_snapshot(strategy,pair,observed_at);
         """)
         self.connection.commit()
+        self.maintain(force=True)
+
+    @staticmethod
+    def _snapshot_payload(report: Mapping[str, Any]) -> str:
+        """Persist only fields needed to audit one MTM point.
+
+        The previous implementation stored the complete mobile-card input on
+        every minute, including gate tables and warning text.  Historical chart
+        generation reads the indexed scalar columns, so retaining the complete
+        report multiplied the database size without adding recoverability.
+        """
+        profit = report.get("profit", {})
+        return json.dumps({
+            "schema": "telegram-profit-snapshot-v2",
+            "strategy": str(report.get("strategy") or ""),
+            "pair": str(report.get("pair") or ""),
+            "quote_asset": str(report.get("quote_asset") or ""),
+            "generated_at_bjt": report.get("generated_at_bjt"),
+            "all_time_mtm_quote": profit.get("all_time_mtm_quote"),
+        }, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    def _database_size_bytes(self) -> int:
+        return sum(
+            candidate.stat().st_size
+            for candidate in (
+                self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm"),
+            )
+            if candidate.exists()
+        )
+
+    def _downsample_profit(self, cutoff: float, bucket_seconds: int) -> int:
+        cursor = self.connection.execute("""
+            DELETE FROM profit_snapshot WHERE rowid IN (
+              SELECT rowid FROM (
+                SELECT rowid, ROW_NUMBER() OVER (
+                  PARTITION BY strategy,pair,CAST(observed_at / ? AS INTEGER)
+                  ORDER BY observed_at DESC
+                ) AS rank_in_bucket
+                FROM profit_snapshot WHERE observed_at < ?
+              ) WHERE rank_in_bucket > 1
+            )
+        """, (int(bucket_seconds), float(cutoff)))
+        return max(0, int(cursor.rowcount))
+
+    def maintain(self, *, force: bool = False, now: float | None = None) -> dict[str, Any]:
+        """Bound the SQLite store without ever deleting pending notifications."""
+        now = time.time() if now is None else float(now)
+        before = self._database_size_bytes()
+        if (
+            not force and before <= self.max_bytes
+            and now - self._last_maintenance < self.maintenance_seconds
+        ):
+            return dict(self._last_maintenance_report)
+        deleted_sent = self.connection.execute(
+            "DELETE FROM outbox WHERE status IN ('sent','superseded') "
+            "AND COALESCE(sent_at,created_at)<?",
+            (now - self.sent_retention_days * 86400,),
+        ).rowcount
+        deleted_expired = self.connection.execute(
+            "DELETE FROM profit_snapshot WHERE observed_at<?",
+            (now - self.profit_retention_days * 86400,),
+        ).rowcount
+        # Existing databases may contain full card payloads. Scalar columns are
+        # authoritative; replace oversized legacy JSON with a schema marker.
+        compacted_payloads = self.connection.execute(
+            "UPDATE profit_snapshot SET payload_json=? WHERE LENGTH(payload_json)>512",
+            ('{"schema":"telegram-profit-snapshot-compacted-v2"}',),
+        ).rowcount
+        deleted_downsampled = self._downsample_profit(
+            now - self.profit_high_resolution_days * 86400, 3600,
+        )
+        self.connection.commit()
+        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        changed = any(int(value or 0) > 0 for value in (
+            deleted_sent, deleted_expired, compacted_payloads, deleted_downsampled,
+        ))
+        if before > self.max_bytes or (changed and force):
+            try:
+                self.connection.execute("VACUUM")
+            except sqlite3.OperationalError:
+                # A read-only dashboard may briefly hold a lock. The deletion
+                # is already committed; the next hourly maintenance retries
+                # physical compaction without affecting notifications.
+                pass
+        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        regular_size = self._database_size_bytes()
+        # If the hourly archive still exceeds the configured cap, retain daily
+        # points outside the high-resolution window and shorten only *sent*
+        # delivery audit. Pending/retrying messages are never candidates.
+        emergency = regular_size > self.max_bytes
+        if emergency:
+            deleted_downsampled += self._downsample_profit(
+                now - self.profit_high_resolution_days * 86400, 86400,
+            )
+            deleted_sent += self.connection.execute(
+                "DELETE FROM outbox WHERE status IN ('sent','superseded') "
+                "AND COALESCE(sent_at,created_at)<?",
+                (now - 7 * 86400,),
+            ).rowcount
+            self.connection.commit()
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            try:
+                self.connection.execute("VACUUM")
+            except sqlite3.OperationalError:
+                pass
+        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        after = self._database_size_bytes()
+        self._last_maintenance = now
+        self._last_maintenance_report = {
+            "database_size_bytes": after,
+            "max_bytes": self.max_bytes,
+            "within_limit": after <= self.max_bytes,
+            "deleted_sent": max(0, int(deleted_sent or 0)),
+            "deleted_expired_snapshots": max(0, int(deleted_expired or 0)),
+            "deleted_downsampled_snapshots": max(0, int(deleted_downsampled or 0)),
+            "compacted_payloads": max(0, int(compacted_payloads or 0)),
+            "emergency_compaction": emergency,
+        }
+        return dict(self._last_maintenance_report)
 
     def enqueue(self, *, event_id: str, kind: str, text: str,
                 file_path: Path | None = None, file_sha256: str = "") -> bool:
@@ -952,6 +1103,7 @@ class TelegramOutbox:
              file_sha256 or None, time.time(), time.time()),
         )
         self.connection.commit()
+        self.maintain()
         return cursor.rowcount == 1
 
     def close(self) -> None:
@@ -1085,6 +1237,12 @@ class TelegramOutbox:
             "retrying": int(retrying),
             "max_attempts": int(max_attempts),
             "last_error": sanitize_runtime_error(last_error or "") if retrying else None,
+            "database": {
+                "size_bytes": self._database_size_bytes(),
+                "max_bytes": self.max_bytes,
+                "within_limit": self._database_size_bytes() <= self.max_bytes,
+                "maintenance": dict(self._last_maintenance_report),
+            },
         }
 
     def event_delivery(self, event_id: str) -> dict[str, Any]:
@@ -1115,12 +1273,10 @@ class TelegramOutbox:
             (str(report["strategy"]), str(report["pair"]), float(observed_at),
              profit.get("all_time_mtm_quote"), report.get("equity"),
              report.get("drawdown_pct"),
-             json.dumps(dict(report), ensure_ascii=False, default=str)),
-        )
-        self.connection.execute(
-            "DELETE FROM profit_snapshot WHERE observed_at<?", (time.time() - 370 * 86400,),
+             self._snapshot_payload(report)),
         )
         self.connection.commit()
+        self.maintain(now=float(observed_at))
 
     def profit_history(self, strategy: str, pair: str, *, days: int = 7) -> list[dict[str, Any]]:
         rows = self.connection.execute(

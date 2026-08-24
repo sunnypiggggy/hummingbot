@@ -265,10 +265,20 @@ def clip_quantized_sell_levels(
             Decimal(str(quantize_amount(sell_budget / Decimal(len(candidates))))),
             Decimal("0"),
         )
-        built = [(Decimal(str(price_for_level(level))), amount) for level in candidates]
+        # A cost floor or exchange tick may collapse multiple logical levels to
+        # the same executable price.  Submitting those as separate orders is
+        # both noisy and unsafe: Binance can reject the generation as duplicate
+        # prices after part of the batch was already accepted.  Merge them into
+        # one price level before validation; the total owned quantity is
+        # unchanged and remains downward-quantized.
+        quantities_by_price: dict[Decimal, Decimal] = {}
+        for level in candidates:
+            price = Decimal(str(price_for_level(level)))
+            quantities_by_price[price] = quantities_by_price.get(price, Decimal("0")) + amount
+        built = sorted(quantities_by_price.items())
         if (
             amount > 0
-            and amount * Decimal(len(built)) <= sell_budget
+            and sum((quantity for _, quantity in built), Decimal("0")) <= sell_budget
             and all(price * quantity >= minimum_order_quote for price, quantity in built)
         ):
             return built
