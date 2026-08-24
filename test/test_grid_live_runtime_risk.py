@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee
+from hummingbot.core.event.events import BuyOrderCompletedEvent, SellOrderCompletedEvent
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -333,6 +334,60 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             prices, [Order(eth_old, "ETH-FDUSD")],
         ))
         self.assertEqual(1, len(rebuilt))
+
+    def test_real_completed_events_resolve_pair_and_request_targeted_refresh(self):
+        strategy = self.strategy()
+        cases = (
+            (
+                "buy-completed", "BTC-FDUSD", strategy.buy_order_ids,
+                BuyOrderCompletedEvent(
+                    1_000.0, "buy-completed", "BTC", "FDUSD",
+                    Decimal("0.00015"), Decimal("11.5"),
+                    OrderType.LIMIT_MAKER,
+                ),
+            ),
+            (
+                "sell-completed", "ETH-FDUSD", strategy.sell_order_ids,
+                SellOrderCompletedEvent(
+                    1_000.0, "sell-completed", "ETH", "FDUSD",
+                    Decimal("0.005"), Decimal("12.5"),
+                    OrderType.LIMIT_MAKER,
+                ),
+            ),
+        )
+        for order_id, pair, side_ids, event in cases:
+            with self.subTest(pair=pair):
+                self.assertFalse(hasattr(event, "trading_pair"))
+                side_ids.add(order_id)
+                strategy.ledgers[pair].open_order_ids.add(order_id)
+                if isinstance(event, BuyOrderCompletedEvent):
+                    strategy.did_complete_buy_order(event)
+                else:
+                    strategy.did_complete_sell_order(event)
+                status = strategy.order_build_status[pair]
+                self.assertEqual("REFRESH_REQUESTED", status["state"])
+                self.assertEqual("expected_fill_refresh", status["reason"])
+                self.assertIn(order_id, status["completed_order_ids"])
+                self.assertNotIn(order_id, side_ids)
+
+    def test_completed_event_pair_falls_back_to_base_and_quote_assets(self):
+        strategy = self.strategy()
+        order_id = "buy-without-ledger-entry"
+        strategy.buy_order_ids.add(order_id)
+        event = BuyOrderCompletedEvent(
+            1_000.0, order_id, "BTC", "FDUSD",
+            Decimal("0.00015"), Decimal("11.5"), OrderType.LIMIT_MAKER,
+        )
+
+        strategy.did_complete_buy_order(event)
+
+        status = strategy.order_build_status["BTC-FDUSD"]
+        self.assertEqual("REFRESH_REQUESTED", status["state"])
+        self.assertIn(order_id, status["completed_order_ids"])
+        self.assertFalse(any(
+            row["event"] == "grid_completed_order_pair_unresolved"
+            for row in strategy.runtime_events
+        ))
 
     def test_unexpected_gap_waits_fifteen_seconds_before_requesting_refresh(self):
         strategy = self.strategy()

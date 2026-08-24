@@ -2103,19 +2103,61 @@ class LivePortfolioGrid(StrategyV2Base):
 
     def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
         if self._is_ordinary_grid_order(event.order_id):
-            self._request_pair_order_refresh(
-                event.trading_pair, reason="expected_fill_refresh",
-                completed_order_id=event.order_id,
-            )
+            pair = self._completed_order_pair(event)
+            if pair is not None:
+                self._request_pair_order_refresh(
+                    pair, reason="expected_fill_refresh",
+                    completed_order_id=event.order_id,
+                )
+            else:
+                self._record_runtime_event(
+                    "grid_completed_order_pair_unresolved",
+                    order_id=str(event.order_id), side="BUY",
+                    reason="completed_order_pair_could_not_be_resolved",
+                )
         self._forget_order(event.order_id)
 
     def did_complete_sell_order(self, event: SellOrderCompletedEvent):
         if self._is_ordinary_grid_order(event.order_id):
-            self._request_pair_order_refresh(
-                event.trading_pair, reason="expected_fill_refresh",
-                completed_order_id=event.order_id,
-            )
+            pair = self._completed_order_pair(event)
+            if pair is not None:
+                self._request_pair_order_refresh(
+                    pair, reason="expected_fill_refresh",
+                    completed_order_id=event.order_id,
+                )
+            else:
+                self._record_runtime_event(
+                    "grid_completed_order_pair_unresolved",
+                    order_id=str(event.order_id), side="SELL",
+                    reason="completed_order_pair_could_not_be_resolved",
+                )
         self._forget_order(event.order_id)
+
+    def _completed_order_pair(
+        self, event: BuyOrderCompletedEvent | SellOrderCompletedEvent,
+    ) -> str | None:
+        """Resolve a completed order without assuming a trading_pair field.
+
+        Hummingbot completion events expose base_asset and quote_asset, while
+        fill events expose trading_pair. Prefer the strategy ledger because it
+        is the authoritative ownership record, then accept either event shape.
+        """
+        order_id = str(event.order_id)
+        owned_pairs = [
+            pair for pair, ledger in self.ledgers.items()
+            if order_id in ledger.open_order_ids
+        ]
+        if len(owned_pairs) == 1:
+            return owned_pairs[0]
+
+        event_pair = str(getattr(event, "trading_pair", "") or "")
+        if event_pair in self.config.trading_pairs:
+            return event_pair
+
+        base_asset = str(getattr(event, "base_asset", "") or "")
+        quote_asset = str(getattr(event, "quote_asset", "") or "")
+        derived_pair = f"{base_asset}-{quote_asset}" if base_asset and quote_asset else ""
+        return derived_pair if derived_pair in self.config.trading_pairs else None
 
     def _is_ordinary_grid_order(self, order_id: str) -> bool:
         special = (
