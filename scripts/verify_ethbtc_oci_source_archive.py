@@ -140,6 +140,11 @@ def verify(root: Path, source_root: Path | None = None) -> dict:
         "TELEGRAM_NOTIFY_ENABLED",
         "TELEGRAM_PROFIT_REPORT_ENABLED",
         "TELEGRAM_NOTIFY_CHANNEL_ID",
+        "TELEGRAM_SQLITE_MAX_MIB",
+        "TELEGRAM_PROFIT_RETENTION_DAYS",
+        "TELEGRAM_PROFIT_HIGH_RES_DAYS",
+        "TELEGRAM_SENT_RETENTION_DAYS",
+        "TELEGRAM_SQLITE_MAINTENANCE_SECONDS",
     }
     if set(notification_settings) != allowed_notification_keys:
         raise ValueError("telegram-notify.env contains an unexpected or sensitive key")

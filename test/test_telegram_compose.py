@@ -65,6 +65,19 @@ def test_report_notification_settings_are_persistent_and_secret_free():
     assert all("TOKEN" not in key for key in values)
 
 
+def test_source_archive_verifier_allows_every_non_secret_notification_setting():
+    verifier = (ROOT / "scripts/verify_ethbtc_oci_source_archive.py").read_text(
+        encoding="utf-8"
+    )
+    values = {
+        line.split("=", 1)[0]
+        for line in (ROOT / "telegram-notify.env").read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    }
+    for key in values:
+        assert f'"{key}"' in verifier
+
+
 def test_all_seven_notification_switches_default_enabled():
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     environment = compose["services"]["dca-live-report"]["environment"]
