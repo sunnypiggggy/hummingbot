@@ -307,6 +307,7 @@ async def managed_positions(request: Request) -> Dict[str, Any]:
             "external_positions_unknown": False,
             "account_scope": "paper",
             "items": account["positions"],
+            "lots": await request.app.state.stocks_ledger.managed_position_rows(),
         }
     return {
         "position_source": "managed_ledger_non_authoritative",

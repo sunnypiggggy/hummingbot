@@ -90,7 +90,8 @@ def cleanup_and_reset(client: Client) -> dict[str, Any]:
         lambda: client.request("GET", "/stocks/paper/orders?open_only=true").get("items", []),
         lambda rows: not rows, timeout=90,
     )
-    for index, lot in enumerate(client.request("GET", "/stocks/managed-positions").get("items", [])):
+    managed = client.request("GET", "/stocks/managed-positions")
+    for index, lot in enumerate(managed.get("lots", managed.get("items", []))):
         amount = Decimal(str(lot.get("available_base", lot.get("total_base", 0))))
         if amount <= 0:
             continue
