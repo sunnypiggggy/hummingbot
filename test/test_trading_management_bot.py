@@ -172,12 +172,52 @@ class OperationsReportReaderTests(TestCase):
             self.assertTrue(reader.status()["robots"][0]["trading_normal"])
             self.assertEqual(1.25, reader.profits()["robots"][0]["profit"]["all_time_mtm_quote"])
 
+    def test_compact_snapshot_uses_scalar_history_for_all_profit_windows(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            status = root / "trading_status.json"
+            status.write_text(json.dumps({
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "robots": [{"strategy": "grid", "pair": "BTC-FDUSD"}],
+            }), encoding="utf-8")
+            database = root / "outbox.sqlite"
+            now = time.time()
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE profit_snapshot(strategy TEXT,pair TEXT,observed_at REAL,"
+                "mtm_quote REAL,equity REAL,drawdown_pct REAL,payload_json TEXT)"
+            )
+            for hours, mtm in ((168, 1.0), (24, 2.0), (4, 3.0), (0, 5.0)):
+                connection.execute(
+                    "INSERT INTO profit_snapshot VALUES (?,?,?,?,?,?,?)",
+                    ("grid", "BTC-FDUSD", now - hours * 3600, mtm, 200 + mtm, 0.4,
+                     '{"schema":"telegram-profit-snapshot-v2"}'),
+                )
+            connection.commit()
+            connection.close()
+            row = OperationsReportReader(status, database, 300).profits()["robots"][0]
+            self.assertEqual(5.0, row["profit"]["all_time_mtm_quote"])
+            self.assertEqual(2.0, row["profit"]["four_hour_mtm_quote"])
+            self.assertEqual(3.0, row["profit"]["twenty_four_hour_mtm_quote"])
+            self.assertEqual(4.0, row["profit"]["seven_day_mtm_quote"])
+            self.assertTrue(all(row["window_complete"].values()))
+
 
 class FakeTelegram:
     def __init__(self):
         self.sent = []
         self.edited = []
         self.answers = []
+        self.commands = []
+        self.command_menu_chat_id = None
+
+    def set_commands(self, commands):
+        self.commands = list(commands)
+        return True
+
+    def set_commands_menu(self, chat_id):
+        self.command_menu_chat_id = chat_id
+        return True
 
     def send(self, chat_id, text, rows=None):
         self.sent.append((chat_id, text, rows))
@@ -412,6 +452,9 @@ class FakeReports:
                 "blockers": [], "gate_statuses": gates,
             })
         return {"age_seconds": 8, "robots": rows}
+
+    def current_errors(self):
+        return {"age_seconds": 2, "errors": []}
 
 
 class FakeHummingbot:
@@ -737,7 +780,7 @@ class TelegramFlowTests(TestCase):
             self.assertNotIn("交易阻塞：", text)
             bot.store.close()
 
-    def test_bot_menu_labels_rolling_history_separately_from_current_errors(self):
+    def test_bot_menu_does_not_show_rolling_error_history(self):
         old = {
             "status": "running",
             "error_logs": [
@@ -746,9 +789,36 @@ class TelegramFlowTests(TestCase):
             ],
         }
         line = TradingManagementBot._bot_line("grid-live-fdusd-400", old)
-        self.assertIn("近15分钟无错误", line)
-        self.assertIn("滚动历史7条", line)
+        self.assertEqual("• grid-live-fdusd-400：运行中", line)
+        self.assertNotIn("滚动历史", line)
         self.assertNotIn("当前错误", line)
+
+    def test_fixed_commands_map_to_the_same_inline_pages(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.reports = FakeReports()
+            bot.hummingbot = FakeHummingbot()
+            bot.system_metrics = FakeSystemMetrics()
+            bot._sync_command_menu()
+            self.assertEqual(["start", "status", "profit"], [
+                item["command"] for item in bot.telegram.commands
+            ])
+            self.assertEqual(7, bot.telegram.command_menu_chat_id)
+            for update_id, command, heading in (
+                (101, "/start", "交易系统维护管理 Bot V3"),
+                (102, "/status", "系统总览"),
+                (103, "/profit", "Grid / DCA / Stock 收益"),
+            ):
+                bot.handle_update({
+                    "update_id": update_id,
+                    "message": {"from": {"id": 7}, "chat": {
+                        "id": 7, "type": "private"}, "text": command},
+                })
+                self.assertIn(heading, bot.telegram.sent[-1][1])
+            self.assertEqual(
+                bot._command_route("m:profit")[0], bot.telegram.sent[-1][1]
+            )
+            bot.store.close()
 
     def test_risk_status_uses_final_per_robot_permissions(self):
         with tempfile.TemporaryDirectory() as raw:

@@ -32,6 +32,18 @@ class TelegramAPI:
     def delete_webhook(self, *, drop_pending_updates: bool) -> Any:
         return self._call("deleteWebhook", {"drop_pending_updates": json.dumps(drop_pending_updates)})
 
+    def set_commands(self, commands: list[dict[str, str]]) -> Any:
+        return self._call("setMyCommands", {
+            "commands": json.dumps(commands, ensure_ascii=False),
+            "scope": json.dumps({"type": "all_private_chats"}),
+        })
+
+    def set_commands_menu(self, chat_id: int) -> Any:
+        return self._call("setChatMenuButton", {
+            "chat_id": str(chat_id),
+            "menu_button": json.dumps({"type": "commands"}),
+        })
+
     def get_updates(self, offset: int, timeout: int = 25) -> list[dict]:
         value = self._call("getUpdates", {
             "offset": str(offset),

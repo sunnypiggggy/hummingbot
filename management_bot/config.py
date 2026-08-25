@@ -58,6 +58,7 @@ class Settings:
     session_ttl_seconds: int = 900
     trading_status_path: Path = Path("/reports/trading_status.json")
     profit_snapshot_db_path: Path = Path("/reports/telegram_outbox.sqlite")
+    current_runtime_errors_path: Path = Path("/reports/current_runtime_errors.json")
     operations_report_max_age_seconds: int = 300
     host_proc_stat_path: Path = Path("/host-metrics/proc/stat")
     host_proc_meminfo_path: Path = Path("/host-metrics/proc/meminfo")
@@ -113,6 +114,9 @@ class Settings:
             )),
             profit_snapshot_db_path=Path(os.getenv(
                 "PROFIT_SNAPSHOT_DB_PATH", "/reports/telegram_outbox.sqlite"
+            )),
+            current_runtime_errors_path=Path(os.getenv(
+                "CURRENT_RUNTIME_ERRORS_PATH", "/reports/current_runtime_errors.json"
             )),
             operations_report_max_age_seconds=int(os.getenv(
                 "OPERATIONS_REPORT_MAX_AGE_SECONDS", "300"

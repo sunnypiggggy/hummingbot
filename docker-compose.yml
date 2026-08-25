@@ -500,6 +500,7 @@ services:
       INVENTORY_CONTRACT_PATH: /contracts/account_inventory_status.json
       TRADING_STATUS_PATH: /reports/trading_status.json
       PROFIT_SNAPSHOT_DB_PATH: /reports/telegram_outbox.sqlite
+      CURRENT_RUNTIME_ERRORS_PATH: /reports/current_runtime_errors.json
       MANAGEMENT_PARAMETER_CATALOG_PATH: /reports/management_parameter_catalog.json
       MODEL_EVIDENCE_CATALOG_PATH: /reports/model_evidence_catalog.json
       MANAGEMENT_REPORTS_ROOT: /reports

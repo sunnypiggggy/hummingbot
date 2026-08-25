@@ -221,6 +221,29 @@ def test_four_hour_report_counts_only_recent_suppressed_grid_recoveries(tmp_path
     assert summary["last_reason"] == "recent"
 
 
+def test_management_runtime_error_snapshot_contains_only_active_episodes(tmp_path):
+    reporting = UnifiedTelegramReporting.__new__(UnifiedTelegramReporting)
+    reporting.grid_state = tmp_path / "grid"
+    reporting.dca_state = tmp_path / "dca"
+    reporting.output = tmp_path / "dca" / "telegram"
+    reporting.grid_state.mkdir()
+    reporting.dca_state.mkdir()
+    reporting.output.mkdir()
+    (reporting.grid_state / "runtime_error_state.json").write_text(json.dumps({
+        "components": {
+            "active": {"active": True, "summary": "HTTP 500", "occurrences": 2},
+            "recovered": {"active": False, "summary": "old error", "occurrences": 7},
+        }
+    }), encoding="utf-8")
+    payload = reporting._publish_current_runtime_errors(datetime.now(timezone.utc))
+    assert [row["component"] for row in payload["errors"]] == ["active"]
+    saved = json.loads((reporting.output / "current_runtime_errors.json").read_text(
+        encoding="utf-8"
+    ))
+    assert saved["errors"][0]["summary"] == "HTTP 500"
+    assert "old error" not in json.dumps(saved)
+
+
 def test_runtime_order_error_recovers_only_after_quiet_window(tmp_path):
     channel = RuntimeErrorChannel(
         event_path=tmp_path / "events.jsonl", state_path=tmp_path / "state.json",

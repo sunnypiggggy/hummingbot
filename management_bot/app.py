@@ -34,6 +34,19 @@ HOME_ROWS = [
     [("⚙️ 模型与参数", "m:models"), ("🔧 系统维护", "m:maintenance")],
 ]
 
+BOT_COMMANDS = [
+    {"command": "start", "description": "打开管理主菜单"},
+    {"command": "status", "description": "查看系统与交易状态"},
+    {"command": "profit", "description": "查看 Grid / DCA / Stock 盈亏"},
+]
+
+COMMAND_ROUTES = {
+    "/start": "m:home",
+    "/menu": "m:home",
+    "/status": "m:overview",
+    "/profit": "m:profit",
+}
+
 
 def _d(value: Any, default: str = "0") -> Decimal:
     try:
@@ -146,6 +159,7 @@ class TradingManagementBot:
             settings.trading_status_path,
             settings.profit_snapshot_db_path,
             settings.operations_report_max_age_seconds,
+            current_errors_path=settings.current_runtime_errors_path,
         )
         self.parameters = ParameterCatalogReader(
             settings.parameter_catalog_path,
@@ -168,10 +182,6 @@ class TradingManagementBot:
         )
         self.running = True
 
-    @property
-    def mode_label(self) -> str:
-        return "执行模式" if self.settings.mutations_enabled else "只读观察模式"
-
     def stop(self, *_: Any) -> None:
         self.running = False
 
@@ -181,11 +191,19 @@ class TradingManagementBot:
     def _home(self) -> tuple[str, list[list[tuple[str, str]]]]:
         return (
             "🐷 交易系统维护管理 Bot V3\n\n"
-            f"当前：{self.mode_label}\n"
             "Grid / DCA / Stock 的交易判断仍由各自风控容器负责。\n"
             "请选择功能：",
             HOME_ROWS,
         )
+
+    def _command_route(self, route: str) -> tuple[str, list[list[tuple[str, str]]]]:
+        if route == "m:home":
+            return self._home()
+        if route == "m:overview":
+            return self._overview(), [[("🔄 刷新", "m:overview"), ("🏠 主菜单", "m:home")]]
+        if route == "m:profit":
+            return self._profit(), [[("🔄 刷新", "m:profit"), ("🏠 主菜单", "m:home")]]
+        raise ValueError("未知命令页面")
 
     @staticmethod
     def _back(target: str = "m:home") -> list[list[tuple[str, str]]]:
@@ -206,50 +224,16 @@ class TradingManagementBot:
         return value if isinstance(value, dict) else {}
 
     @staticmethod
-    def _recent_bot_errors(raw: dict, *, now: Optional[float] = None) -> tuple[dict[str, int], int]:
-        """Return recent error classes and the rolling-history size.
-
-        Hummingbot exposes ``error_logs`` as rolling history. A traceback is
-        one incident even when variable details differ, so the first line is
-        the stable operator-facing class shared by every status page.
-        """
-        values = raw.get("error_logs", []) if isinstance(raw, dict) else []
-        if not isinstance(values, list):
-            return {}, 0
-        cutoff = (time.time() if now is None else float(now)) - 900
-        recent: dict[str, int] = {}
-        for value in values:
-            if not isinstance(value, dict):
-                continue
-            timestamp = float(value.get("timestamp", 0) or 0)
-            if timestamp > 10_000_000_000:
-                timestamp /= 1000
-            if timestamp < cutoff:
-                continue
-            raw_message = str(value.get("msg", "未知运行错误"))
-            message = next((line.strip() for line in raw_message.splitlines() if line.strip()), "未知运行错误")
-            recent[message] = recent.get(message, 0) + 1
-        return recent, len(values)
-
-    @classmethod
-    def _bot_line(cls, name: str, raw: dict) -> str:
+    def _bot_line(name: str, raw: dict) -> str:
         status = str(raw.get("status", "unknown")).lower()
         chinese = {
             "running": "运行中", "stopped": "已停止", "starting": "启动中",
             "stopping": "停止中", "error": "错误",
         }.get(status, "状态未知")
-        recent, history_count = cls._recent_bot_errors(raw)
-        recent_count = sum(recent.values())
-        if recent_count:
-            suffix = f"，当前错误{len(recent)}类/{recent_count}次"
-        elif history_count:
-            suffix = f"，近15分钟无错误（滚动历史{history_count}条）"
-        else:
-            suffix = "，近15分钟无错误"
-        return f"• {name}：{chinese}{suffix}"
+        return f"• {name}：{chinese}"
 
     def _overview(self) -> str:
-        lines = ["📊 系统总览", f"模式：{self.mode_label}", ""]
+        lines = ["📊 系统总览", ""]
         try:
             bots = self._api_bots()
             wanted = {v["bot_name"] for v in self.settings.bots.values()}
@@ -347,18 +331,41 @@ class TradingManagementBot:
         if snapshot is None:
             lines.append(f"\n🟦 Grid / 🟩 DCA\n• 数据不可用：{reports_error}")
         else:
-            lines.append(f"Grid/DCA数据年龄：{int(snapshot['age_seconds'])}秒")
+            lines.append(f"Grid/DCA最旧数据年龄：{int(snapshot['age_seconds'])}秒")
+            indexed = {
+                (str(row.get("strategy")), str(row.get("pair"))): row
+                for row in snapshot["robots"]
+            }
+            expected = {
+                "grid": ("BTC-FDUSD", "ETH-FDUSD"),
+                "dca": ("BTC-USDT", "ETH-USDT"),
+            }
             for strategy, title in (("grid", "🟦 Grid"), ("dca", "🟩 DCA")):
                 lines.extend(("", title))
-                rows = [row for row in snapshot["robots"] if row["strategy"] == strategy]
-                for row in rows:
-                    quote = row["pair"].split("-")[-1]
+                for pair in expected[strategy]:
+                    row = indexed.get((strategy, pair))
+                    if row is None:
+                        lines.append(f"• {pair}：数据不可用（缺少收益快照）")
+                        continue
+                    if str(row.get("data_status", "FRESH")).upper() != "FRESH":
+                        lines.append(
+                            f"• {pair}：数据不可用（快照已过期 {int(row.get('age_seconds', 0))}秒）"
+                        )
+                        continue
+                    quote = pair.split("-")[-1]
                     profit = row.get("profit", {})
+                    complete = row.get("window_complete", {})
+
+                    def window(key: str) -> str:
+                        if complete and not complete.get(key, False):
+                            return "样本不足"
+                        return amount(profit.get(key), quote)
+
                     lines.append(
-                        f"• {row['pair']}\n"
-                        f"  4h {amount(profit.get('four_hour_mtm_quote'), quote)}｜"
-                        f"24h {amount(profit.get('twenty_four_hour_mtm_quote'), quote)}\n"
-                        f"  7d {amount(profit.get('seven_day_mtm_quote'), quote)}｜"
+                        f"• {pair}\n"
+                        f"  4h {window('four_hour_mtm_quote')}｜"
+                        f"24h {window('twenty_four_hour_mtm_quote')}\n"
+                        f"  7d {window('seven_day_mtm_quote')}｜"
                         f"累计 {amount(profit.get('all_time_mtm_quote'), quote)}"
                     )
         lines.extend(("", "🧪 Stock PAPER"))
@@ -473,14 +480,12 @@ class TradingManagementBot:
         warnings: list[str] = []
         normal = 0
         total = 0
-        budget_warning_bots: set[str] = set()
         try:
             status = self.reports.status()
             for robot in status["robots"]:
                 total += 1
                 pair = str(robot.get("pair", "未知交易对"))
                 strategy = str(robot.get("strategy", "")).upper()
-                bot_name = str(robot.get("bot", pair))
                 permissions = robot.get("final_permissions", {})
                 buy = "放行" if permissions.get("buy_enabled") else "阻止"
                 sell = "放行" if permissions.get("sell_enabled") else "阻止"
@@ -496,7 +501,6 @@ class TradingManagementBot:
                     if not isinstance(gate, dict) or not gate.get("applicable", True):
                         continue
                     if gate.get("state") == "ALERT_ONLY":
-                        budget_warning_bots.add(bot_name)
                         quote = pair.split("-")[-1]
                         warnings.append(
                             f"{strategy} {pair}：可用 {quote} 低于预算提醒值；"
@@ -510,28 +514,16 @@ class TradingManagementBot:
         except Exception as exc:
             blockers.append(_safe_text(exc))
 
-        # Hummingbot's error_logs is a rolling history, not a current alarm list.
-        # Only recent unique errors are shown and repeated per-second messages are collapsed.
-        recent: dict[tuple[str, str], int] = {}
-        history: list[str] = []
         try:
-            for name, raw in self._api_bots().items():
-                grouped, history_count = self._recent_bot_errors(raw)
-                recent_count = sum(grouped.values())
-                for message, count in grouped.items():
-                    if name in budget_warning_bots and "Not enough budget" in message:
-                        continue
-                    recent[(name, message)] = count
-                if history_count > recent_count:
-                    history.append(
-                        f"{name}：滚动历史{history_count}条，近15分钟{recent_count}条；"
-                        "历史记录不计入当前异常。"
-                    )
+            active_errors = self.reports.current_errors()["errors"]
         except Exception as exc:
-            blockers.append(f"Hummingbot API不可用：{_safe_text(exc)}")
-        for (name, message), count in recent.items():
-            suffix = f"（近15分钟重复{count}次）" if count > 1 else ""
-            warnings.append(f"{name}：{_safe_text(message, 140)}{suffix}；请关注，当前权限以风控状态为准。")
+            warnings.append(f"当前运行错误状态不可用：{_safe_text(exc)}")
+        else:
+            for error in active_errors:
+                bot_name = str(error.get("bot") or error.get("source") or "未知组件")
+                summary = _safe_text(error.get("summary") or "未知运行错误", 140)
+                impact = _safe_text(error.get("trading_impact") or "当前权限以风控状态为准", 120)
+                warnings.append(f"{bot_name}：{summary}；{impact}")
 
         snapshot = self.contracts.snapshot()
         for error in snapshot["errors"]:
@@ -549,9 +541,6 @@ class TradingManagementBot:
             lines.extend(f"• {item}" for item in warnings)
         elif not blockers:
             lines.append("当前也没有需要处理的运行提醒。")
-        if history:
-            lines.extend(("", "历史记录说明："))
-            lines.extend(f"• {item}" for item in history)
         return "\n".join(lines)
 
     @staticmethod
@@ -1701,7 +1690,7 @@ class TradingManagementBot:
             return "请输入拒绝原因：", [[("取消", "m:approvals")]]
         if action == "approve2":
             if not self.settings.mutations_enabled:
-                return "🔒 当前为只读观察模式，未写入审批决定。", self._back("m:approvals")
+                return "🔒 模型审批操作当前未启用，未写入审批决定。", self._back("m:approvals")
             key = f"approval:{candidate['release_sha256']}:approve"
             claimed, existing = self.store.claim_action(key)
             if claimed:
@@ -1795,7 +1784,7 @@ class TradingManagementBot:
             return "ℹ️ 白名单停用功能已移除，请在列表中直接删除。", self._back("s:whitelist")
         if action == "wl_delete_confirm":
             if not self.settings.mutations_enabled:
-                return "🔒 只读观察模式，白名单未删除。", self._back("s:whitelist")
+                return "🔒 白名单维护当前未启用，未删除任何项目。", self._back("s:whitelist")
             symbol = session["payload"]["symbol"]
             result = self.stocks.delete_whitelist(symbol)
             self.store.delete_session(sid)
@@ -1805,14 +1794,14 @@ class TradingManagementBot:
             )
         if action == "wl_confirm":
             if not self.settings.mutations_enabled:
-                return "🔒 只读观察模式，白名单未修改。", self._back("m:stock")
+                return "🔒 白名单维护当前未启用，未修改任何项目。", self._back("m:stock")
             payload = session["payload"]
             result = self.stocks.put_whitelist(payload["symbol"], True, payload["limit"])
             self.store.delete_session(sid)
             return f"✅ 白名单已更新\n{_safe_text(result)}", self._back("s:whitelist")
         if action == "limits_confirm":
             if not self.settings.mutations_enabled:
-                return "🔒 只读观察模式，限额未修改。", self._back("m:stock")
+                return "🔒 交易限额维护当前未启用，未修改任何限额。", self._back("m:stock")
             values = session["payload"]["limits"]
             order, symbol, total = values[:3]
             result = self.stocks.put_limits(order, symbol, total, values[3] if len(values) == 4 else None)
@@ -1820,7 +1809,7 @@ class TradingManagementBot:
             return f"✅ 限额已更新\n{_safe_text(result)}", self._back("m:stock")
         if action == "reject_confirm":
             if not self.settings.mutations_enabled:
-                return "🔒 只读观察模式，未写入拒绝决定。", self._back("m:approvals")
+                return "🔒 模型审批操作当前未启用，未写入拒绝决定。", self._back("m:approvals")
             candidate = self.approvals.find(session["payload"]["candidate_id"])
             if not candidate:
                 raise ValueError("候选已不存在")
@@ -1898,7 +1887,7 @@ class TradingManagementBot:
 
     def _confirm_maintenance(self, key: str, action: str) -> tuple[str, list]:
         if not self.settings.mutations_enabled:
-            return "🔒 当前为只读观察模式，未执行机器人变更。", self._back(f"m:bot:{key}")
+            return "🔒 机器人维护操作当前未启用，未执行任何变更。", self._back(f"m:bot:{key}")
         definition = self.settings.bots[key]
         idempotency = f"bot:{definition['bot_name']}:{action}:{int(time.time()) // 30}"
         claimed, existing = self.store.claim_action(idempotency)
@@ -1937,12 +1926,8 @@ class TradingManagementBot:
                 "s:paper_positions", "s:paper_trades", "s:scheduled",
             }:
                 self.store.clear_sessions(user_id, chat_id)
-            if data == "m:home":
-                text, rows = self._home()
-            elif data == "m:overview":
-                text, rows = self._overview(), self._back()
-            elif data == "m:profit":
-                text, rows = self._profit(), self._back()
+            if data in {"m:home", "m:overview", "m:profit"}:
+                text, rows = self._command_route(data)
             elif data == "m:risk":
                 text, rows = self._risk(), self._risk_rows()
             elif data.startswith("r:"):
@@ -2093,9 +2078,11 @@ class TradingManagementBot:
             return
         text = str(message.get("text", "")).strip()
         try:
-            if text in {"/start", "/menu", "菜单"}:
+            command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+            route = "m:home" if text == "菜单" else COMMAND_ROUTES.get(command)
+            if route:
                 self.store.clear_sessions(user_id, chat_id)
-                rendered, rows = self._home()
+                rendered, rows = self._command_route(route)
             else:
                 session = self.store.active_session(user_id, chat_id)
                 if not session:
@@ -2122,9 +2109,9 @@ class TradingManagementBot:
 
     def _health(self, error: str = "") -> None:
         payload = {
-            "schema": "trading-management-bot-health-v1",
+            "schema": "trading-management-bot-health-v2",
             "generated_at": time.time(),
-            "mode": self.mode_label,
+            "mutations_enabled": self.settings.mutations_enabled,
             "admin_configured": self.settings.admin_user_id > 0,
             "last_error": error,
         }
@@ -2132,10 +2119,18 @@ class TradingManagementBot:
         temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(temporary, self.settings.health_path)
 
+    def _sync_command_menu(self) -> None:
+        self.telegram.set_commands(BOT_COMMANDS)
+        self.telegram.set_commands_menu(self.settings.admin_user_id)
+
     def run(self) -> None:
         if self.store.metadata("telegram_initialized") != "true":
             self.telegram.delete_webhook(drop_pending_updates=True)
             self.store.set_metadata("telegram_initialized", "true")
+        try:
+            self._sync_command_menu()
+        except TelegramError as exc:
+            logger.warning("Telegram command menu sync failed: %s", exc)
         offset = int(self.store.metadata("telegram_offset", "0") or 0)
         self._health()
         while self.running:

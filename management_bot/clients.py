@@ -232,10 +232,14 @@ class ContractReader:
 class OperationsReportReader:
     """Read the report service's canonical trading status and owned-MTM snapshots."""
 
-    def __init__(self, status_path: Path, profit_db_path: Path, max_age_seconds: int = 300):
+    def __init__(
+        self, status_path: Path, profit_db_path: Path, max_age_seconds: int = 300,
+        *, current_errors_path: Path | None = None,
+    ):
         self.status_path = status_path
         self.profit_db_path = profit_db_path
         self.max_age_seconds = max_age_seconds
+        self.current_errors_path = current_errors_path
 
     @staticmethod
     def _iso_timestamp(value: Any) -> float:
@@ -266,6 +270,7 @@ class OperationsReportReader:
             uri = self.profit_db_path.resolve().as_uri() + "?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=3)
             try:
+                connection.execute("BEGIN")
                 rows = connection.execute(
                     "SELECT p.strategy,p.pair,p.observed_at,p.mtm_quote,p.equity,"
                     "p.drawdown_pct,p.payload_json FROM profit_snapshot p "
@@ -274,6 +279,20 @@ class OperationsReportReader:
                     "ON p.strategy=x.strategy AND p.pair=x.pair AND p.observed_at=x.latest "
                     "ORDER BY p.strategy,p.pair"
                 ).fetchall()
+                anchors: dict[tuple[str, str, int], tuple[float, float] | None] = {}
+                for strategy, pair, observed_at, *_ in rows:
+                    latest = float(observed_at or 0)
+                    for hours in (4, 24, 168):
+                        target = latest - hours * 3600
+                        anchor = connection.execute(
+                            "SELECT observed_at,mtm_quote FROM profit_snapshot "
+                            "WHERE strategy=? AND pair=? AND observed_at<=? "
+                            "AND mtm_quote IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
+                            (strategy, pair, target),
+                        ).fetchone()
+                        anchors[(str(strategy), str(pair), hours)] = (
+                            None if anchor is None else (float(anchor[0]), float(anchor[1]))
+                        )
             finally:
                 connection.close()
         except Exception as exc:
@@ -282,6 +301,8 @@ class OperationsReportReader:
             raise ServiceError("收益快照没有机器人数据")
         result = []
         newest = 0.0
+        oldest = float("inf")
+        now = time.time()
         for strategy, pair, observed_at, mtm, equity, drawdown, payload_json in rows:
             try:
                 payload = json.loads(payload_json or "{}")
@@ -289,15 +310,60 @@ class OperationsReportReader:
                 payload = {}
             observed = float(observed_at or 0)
             newest = max(newest, observed)
+            oldest = min(oldest, observed)
+            cumulative = mtm
+            if cumulative is None and isinstance(payload, dict):
+                cumulative = payload.get("all_time_mtm_quote")
+                if cumulative is None and isinstance(payload.get("profit"), dict):
+                    cumulative = payload["profit"].get("all_time_mtm_quote")
+            profit = {"all_time_mtm_quote": cumulative}
+            complete: dict[str, bool] = {}
+            for hours, key in (
+                (4, "four_hour_mtm_quote"),
+                (24, "twenty_four_hour_mtm_quote"),
+                (168, "seven_day_mtm_quote"),
+            ):
+                anchor = anchors.get((str(strategy), str(pair), hours))
+                target = observed - hours * 3600
+                valid_anchor = bool(
+                    anchor is not None
+                    and target - anchor[0] <= self.max_age_seconds
+                )
+                complete[key] = valid_anchor
+                profit[key] = (
+                    None if cumulative is None or not valid_anchor
+                    else float(cumulative) - float(anchor[1])
+                )
+            row_age = now - observed if observed else float("inf")
             result.append({
                 "strategy": str(strategy), "pair": str(pair), "observed_at": observed,
+                "age_seconds": max(0.0, row_age),
+                "data_status": "FRESH" if row_age <= self.max_age_seconds else "STALE",
                 "mtm_quote": mtm, "equity": equity, "drawdown_pct": drawdown,
-                "profit": payload.get("profit", {}) if isinstance(payload, dict) else {},
+                "profit": profit, "window_complete": complete,
             })
-        age = time.time() - newest if newest else float("inf")
-        if age > self.max_age_seconds:
-            raise ServiceError(f"收益快照已过期（{int(age)}秒）")
+        age = now - oldest if oldest != float("inf") else float("inf")
         return {"observed_at": newest, "age_seconds": max(0.0, age), "robots": result}
+
+    def current_errors(self) -> dict:
+        if self.current_errors_path is None:
+            return {"generated_at": time.time(), "age_seconds": 0.0, "errors": []}
+        try:
+            payload = json.loads(self.current_errors_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ServiceError(f"当前异常快照不可用：{type(exc).__name__}") from exc
+        rows = payload.get("errors", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            raise ServiceError("当前异常快照格式错误")
+        generated_at = self._iso_timestamp(payload.get("generated_at"))
+        age = time.time() - generated_at if generated_at else float("inf")
+        if age > self.max_age_seconds * 2:
+            raise ServiceError(f"当前异常快照已过期（{int(age)}秒）")
+        return {
+            "generated_at": generated_at,
+            "age_seconds": max(0.0, age),
+            "errors": [row for row in rows if isinstance(row, dict) and row.get("active")],
+        }
 
 
 class ParameterCatalogReader:

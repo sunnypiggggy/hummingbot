@@ -995,6 +995,50 @@ class UnifiedTelegramReporting:
         except (OSError, ValueError, TypeError):
             return {}
 
+    def _publish_current_runtime_errors(self, now: datetime) -> dict[str, Any]:
+        errors: list[dict[str, Any]] = []
+        sources = (
+            ("grid", self.grid_state / "runtime_error_state.json",
+             "grid-live-fdusd-400", "BTC-FDUSD,ETH-FDUSD"),
+            ("dca", self.dca_state / "runtime_error_state.json",
+             "dca-live-btcusdt-200,dca-live-ethusdt-200", "BTC-USDT,ETH-USDT"),
+            ("report", self.dca_state / "report_runtime_error_state.json",
+             "dca-live-report", "BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT"),
+        )
+        for source, path, bot, pair in sources:
+            state = self._load(path)
+            components = state.get("components", {}) if isinstance(state, Mapping) else {}
+            if not isinstance(components, Mapping):
+                continue
+            for component, raw in components.items():
+                if not isinstance(raw, Mapping) or not raw.get("active"):
+                    continue
+                errors.append({
+                    "active": True,
+                    "source": source,
+                    "component": str(component),
+                    "bot": bot,
+                    "pair": pair,
+                    "summary": str(raw.get("summary") or "未知运行错误"),
+                    "severity": str(raw.get("severity") or "warning"),
+                    "first_seen_at": raw.get("first_seen_at"),
+                    "last_seen_at": raw.get("last_seen_at"),
+                    "occurrences": int(raw.get("occurrences") or 1),
+                    "trading_impact": str(raw.get("trading_impact") or ""),
+                    "action": str(raw.get("action") or "automatic_retry"),
+                })
+        payload = {
+            "schema": "management-current-runtime-errors-v1",
+            "generated_at": now.astimezone(timezone.utc).isoformat(),
+            "errors": sorted(errors, key=lambda row: (
+                str(row.get("severity")), str(row.get("source")), str(row.get("component"))
+            )),
+        }
+        temporary = self.output / "current_runtime_errors.json.tmp"
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, self.output / "current_runtime_errors.json")
+        return payload
+
     def _inventory_dust(self, asset: str) -> dict[str, Any] | None:
         status = self._load(self.inventory_status_path)
         row = status.get("assets", {}).get(asset, {})
@@ -1522,6 +1566,7 @@ class UnifiedTelegramReporting:
     def cycle(self, report: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
         robots = self.update_snapshots(report, now)
+        current_errors = self._publish_current_runtime_errors(now)
         parameter_catalog = self.management_parameters.publish(
             [item["trading_status"] for item in robots], now=now,
         )
@@ -1539,6 +1584,7 @@ class UnifiedTelegramReporting:
         return {"enabled": self.enabled, "sent": sent, **self.outbox.health(),
                 "slot": slot, "parameter_worker": worker,
                 "parameter_catalog_sha256": parameter_catalog["catalog_sha256"],
+                "active_runtime_errors": len(current_errors["errors"]),
                 "evidence_receipts_written": evidence_receipts}
 
 
