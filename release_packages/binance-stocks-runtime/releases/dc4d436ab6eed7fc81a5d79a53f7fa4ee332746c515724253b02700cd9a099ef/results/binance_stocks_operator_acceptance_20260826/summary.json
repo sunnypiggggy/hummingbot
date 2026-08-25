@@ -1,0 +1,74 @@
+{
+  "schema": "binance-stocks-operator-acceptance-summary-v1",
+  "observed_at": "2026-08-26T00:37:12+08:00",
+  "verdict": "PASS",
+  "runtime_boundary": {
+    "runtime_mode": "PAPER",
+    "live_authorized": false,
+    "economic_http_request_count": 0,
+    "connector_ready": true,
+    "market_phase": "MARKET_OPEN",
+    "market_trading_date": "2026-08-25"
+  },
+  "operator_capabilities": {
+    "global_maintenance": true,
+    "stocks_paper_create_cancel_close_reduce": true,
+    "stocks_live_trading": false
+  },
+  "configuration": {
+    "whitelist": ["AAPL", "TSLA", "SPY", "QQQ"],
+    "temporary_symbol_added_modified_quoted_deleted": "MSFT",
+    "limits": {
+      "max_order_notional": "500",
+      "max_symbol_exposure": "1000",
+      "max_managed_exposure": "2000",
+      "daily_loss_limit": "200"
+    },
+    "http_semantics": {"business_rejection": 200, "malformed_request": 422}
+  },
+  "paper_execution": {
+    "non_marketable_limit_canceled": "accept-limit-cancel-1787675768",
+    "marketable_limit_buy": "accept-limit-fill-1787675768",
+    "market_sell": "accept-market-sell-1787675768",
+    "position_executor": "accept-position-1787675768",
+    "restart_recovered_executor": "accept-restart-1787675768",
+    "fill_count": 5,
+    "fees_usdc": "1.75",
+    "turnover_usdc": "80.00290549982",
+    "net_pnl_usdc": "-1.75096866890",
+    "reconciliation_difference_usdc": "0",
+    "duplicate_economic_fills": 0,
+    "unauthorized_sells": 0
+  },
+  "isolated_scenarios": {
+    "restart_fifo_timeout": {
+      "status": "PASS",
+      "run_id_stable": true,
+      "fills": 3,
+      "position_base": "0.8",
+      "net_pnl": "-1.50",
+      "timeout_status": "CANCELED",
+      "economic_requests": 0
+    },
+    "async_queue_postgres": "PASS"
+  },
+  "final_paper_account": {
+    "paper_run_id": "80ca559ac03649d994dc30dbf7a3332e",
+    "initial_usdc": "2000",
+    "cash_usdc": "2000",
+    "equity_usdc": "2000",
+    "positions": 0,
+    "open_orders": 0,
+    "active_executors": 0,
+    "recovery_required": false,
+    "reconciliation_ok": true
+  },
+  "raw_evidence_sha256": {
+    "cleanup-reset.json": "83436dd2a0987e36e0d50d6476b00854f43abc87d90b8ec2df5cab5d74f739ab",
+    "configuration.json": "7be81254835678aaf6c7342446c85631ba1bba83b725a4fab2e6b484e1692d5b",
+    "trade-prepare.json": "d57ca3205ec572ca05d74e9b39c050de2fc41a8d581a21d92a719b7c12d058be",
+    "trade-finish.json": "a2b27a807436ea2c95a4d09f31cf709d6bb41a81503ced984807438c1a29e984"
+  },
+  "raw_evidence_oci_path": "/home/ubuntu/extra_drive/hummingbot/results/binance_stocks_operator_acceptance_20260826",
+  "telegram_sqlite_backed_up": false
+}

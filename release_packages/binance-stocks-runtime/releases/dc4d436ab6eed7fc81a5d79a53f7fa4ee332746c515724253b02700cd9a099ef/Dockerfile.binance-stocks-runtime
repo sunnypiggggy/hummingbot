@@ -1,0 +1,32 @@
+ARG HUMMINGBOT_API_BASE=hummingbot-api-orchestration:local
+FROM ${HUMMINGBOT_API_BASE}
+
+USER root
+
+# XNYS owns holidays, DST and early closes for cold-start market-state recovery.
+RUN /opt/conda/envs/hummingbot-api/bin/pip install --no-cache-dir exchange-calendars==4.13.2
+
+# Install the independently versioned connector and the two constrained
+# executor implementations into the API image's Hummingbot environment.
+COPY hummingbot/connector/exchange/binance_stocks/ \
+  /opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/exchange/binance_stocks/
+COPY hummingbot/strategy_v2/executors/binance_stocks_order_executor.py \
+  /opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/strategy_v2/executors/binance_stocks_order_executor.py
+COPY hummingbot/strategy_v2/executors/binance_stocks_position_executor.py \
+  /opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/strategy_v2/executors/binance_stocks_position_executor.py
+COPY stocks_runtime/ /hummingbot-api/stocks_runtime/
+
+ENV PYTHONPATH=/hummingbot-api \
+    BINANCE_STOCKS_RUNTIME_MODE=PAPER \
+    BINANCE_STOCKS_LIVE_AUTHORIZED=false
+
+WORKDIR /hummingbot-api
+
+HEALTHCHECK --interval=30s --timeout=8s --start-period=45s --retries=3 \
+  CMD python -c "import base64,json,os,urllib.request; u=os.getenv('STOCKS_API_USERNAME',os.getenv('USERNAME','admin')); p=os.getenv('STOCKS_API_PASSWORD',os.getenv('PASSWORD','admin')); r=urllib.request.Request('http://127.0.0.1:8000/stocks/health',headers={'Authorization':'Basic '+base64.b64encode(f'{u}:{p}'.encode()).decode()}); json.load(urllib.request.urlopen(r,timeout=5))" || exit 1
+
+# The upstream Hummingbot API image uses an ENTRYPOINT for its default
+# uvicorn command. Clear it so our database bootstrap runs as a command rather
+# than being appended as invalid uvicorn arguments.
+ENTRYPOINT []
+CMD ["/bin/bash", "-lc", "/opt/conda/envs/hummingbot-api/bin/python -m stocks_runtime.ensure_database && exec /opt/conda/envs/hummingbot-api/bin/python -m uvicorn stocks_runtime.app:app --host 0.0.0.0 --port 8000"]
