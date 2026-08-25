@@ -1057,6 +1057,10 @@ class PostgresPaperBroker:
                     "recovery_reason=NULL,updated_at=now() WHERE singleton=TRUE",
                     new_run,
                 )
+                # scheduled_executors and managed_orders both reference
+                # executor_intents.  Clear dependants first so a completed
+                # asynchronous plan cannot make an otherwise safe reset fail.
+                await connection.execute(f"DELETE FROM {self.schema}.scheduled_executors")
                 await connection.execute(f"DELETE FROM {self.schema}.managed_orders")
                 await connection.execute(f"DELETE FROM {self.schema}.executor_intents")
                 await connection.execute(f"DELETE FROM {self.schema}.inventory_lots")
