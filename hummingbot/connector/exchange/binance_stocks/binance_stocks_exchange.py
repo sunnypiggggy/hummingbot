@@ -32,6 +32,7 @@ from .binance_stocks_auth import BinanceStocksAuth
 from .binance_stocks_position_provider import (
     EquityAccountSnapshot,
     EquityPositionProvider,
+    ManagedLedgerEquityPositionProvider,
     UnavailableEquityPositionProvider,
 )
 
@@ -340,8 +341,10 @@ class BinanceStocksExchange(ExchangePyBase):
         **kwargs,
     ) -> Tuple[str, float]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        self._assert_order_can_be_placed(symbol, amount, trade_type, order_type, price)
         executor_id = self._runtime_executor_id()
+        self._assert_order_can_be_placed(
+            symbol, amount, trade_type, order_type, price, managed_executor_id=executor_id,
+        )
         if hasattr(self._position_provider, "register_order"):
             await self._position_provider.register_order(
                 client_order_id=order_id,
@@ -417,6 +420,7 @@ class BinanceStocksExchange(ExchangePyBase):
         side: TradeType,
         order_type: OrderType,
         price: Decimal,
+        managed_executor_id: Optional[str] = None,
     ):
         if order_type not in self.supported_order_types():
             raise ValueError("Binance Stocks v1 supports LIMIT and MARKET only; LIMIT_MAKER is forbidden")
@@ -445,7 +449,12 @@ class BinanceStocksExchange(ExchangePyBase):
         if side is TradeType.SELL:
             available = snapshot.positions.get(symbol)
             if available is None or available.available < amount:
-                raise PermissionError(f"Authoritative available {symbol} position is insufficient")
+                trusted_reservation = bool(
+                    managed_executor_id
+                    and isinstance(self._position_provider, ManagedLedgerEquityPositionProvider)
+                )
+                if not trusted_reservation:
+                    raise PermissionError(f"Authoritative available {symbol} position is insufficient")
         else:
             effective_price = price
             if effective_price.is_nan() or effective_price <= 0:

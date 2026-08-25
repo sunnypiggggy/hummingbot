@@ -1,3 +1,4 @@
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -29,6 +30,14 @@ class BinanceStocksOrderExecutor(OrderExecutor):
             "current_retries": self._current_retries,
             "held_position_orders": list(self._held_position_orders),
         }
+
+    async def validate_sufficient_balance(self):
+        # The Stocks policy has already atomically reserved this SELL lot.
+        # Generic BudgetChecker sees the post-reservation balance and would
+        # incorrectly reject the order's own inventory.
+        if self.config.side is TradeType.SELL and getattr(self.config, "managed_source_owner", None):
+            return
+        await super().validate_sufficient_balance()
 
     def restore_paper_checkpoint(self, state):
         order_id = state.get("order_id")

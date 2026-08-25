@@ -11,6 +11,7 @@ from hummingbot.connector.exchange.binance_stocks.binance_stocks_position_provid
     EquityAccountSnapshot,
     EquityPosition,
     EquityPositionProvider,
+    ManagedLedgerEquityPositionProvider,
 )
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder
@@ -99,6 +100,24 @@ class BinanceStocksExchangeTests(IsolatedAsyncioTestCase):
 
         exchange._api_post.assert_not_awaited()
         self.assertFalse(exchange.status_dict["position_reconciliation_ready"])
+
+    async def test_managed_sell_accepts_its_own_pre_reserved_inventory(self):
+        exchange = configured_exchange(trading_required=False)
+        exchange._position_provider = ManagedLedgerEquityPositionProvider(AsyncMock())
+        exchange._position_reconciliation_ready = True
+        exchange._last_position_snapshot = EquityAccountSnapshot(
+            positions={"AAPL": EquityPosition(total=Decimal("1"), available=Decimal("0"))},
+            quote_total=Decimal("1000"), quote_available=Decimal("1000"),
+            source="managed", timestamp=exchange.current_timestamp,
+        )
+        exchange._assert_order_can_be_placed(
+            "AAPL", Decimal("0.5"), TradeType.SELL, OrderType.LIMIT, Decimal("200"),
+            managed_executor_id="position-exit-1",
+        )
+        with self.assertRaisesRegex(PermissionError, "available AAPL position is insufficient"):
+            exchange._assert_order_can_be_placed(
+                "AAPL", Decimal("0.5"), TradeType.SELL, OrderType.LIMIT, Decimal("200"),
+            )
 
     async def test_limit_order_uses_extended_day_card_and_bare_ticker(self):
         provider = StaticPositionProvider(
