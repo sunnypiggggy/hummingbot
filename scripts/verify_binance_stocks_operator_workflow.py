@@ -90,6 +90,17 @@ def cleanup_and_reset(client: Client) -> dict[str, Any]:
         lambda: client.request("GET", "/stocks/paper/orders?open_only=true").get("items", []),
         lambda rows: not rows, timeout=90,
     )
+    for index, lot in enumerate(client.request("GET", "/stocks/managed-positions").get("items", [])):
+        amount = Decimal(str(lot.get("available_base", lot.get("total_base", 0))))
+        if amount <= 0:
+            continue
+        owner = str(lot["owner_id"])
+        cleanup_id = f"accept-cleanup-{index}-{int(time.time())}"
+        client.request("POST", "/stocks/order-executors", {
+            "id": cleanup_id, "symbol": str(lot["symbol"]), "side": "SELL",
+            "amount": str(amount), "order_type": "MARKET", "source_owner": owner,
+        })
+        wait_executor_terminal(client, cleanup_id)
     positions = wait_for(
         lambda: client.request("GET", "/stocks/paper/positions").get("items", []),
         lambda rows: not any(Decimal(str(row.get("total", 0))) > 0 for row in rows), timeout=90,

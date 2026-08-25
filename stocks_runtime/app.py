@@ -156,6 +156,7 @@ async def _refresh_runtime(app, stop: asyncio.Event) -> None:
         try:
             if app.state.stocks_settings.mode == "PAPER":
                 await app.state.stocks_paper_broker.reconcile_managed_fills()
+                await _synchronize_position_inventory(app)
                 account = await app.state.stocks_paper_broker.account()
                 total = Decimal(account["equity"])
                 available = Decimal(account["available_cash"])
@@ -189,6 +190,25 @@ async def _refresh_runtime(app, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=5)
         except asyncio.TimeoutError:
             pass
+
+
+async def _synchronize_position_inventory(app, executor_id: str | None = None) -> None:
+    """Bind active PositionExecutor exit quantities to their owned ledger lots."""
+    service = app.state.executor_service
+    for current_id, executor in list(service._active_executors.items()):
+        if executor_id is not None and current_id != executor_id:
+            continue
+        synchronize = getattr(executor, "synchronize_managed_remaining", None)
+        if synchronize is None:
+            continue
+        metadata = service._executor_metadata.get(current_id, {})
+        config = metadata.get("config", {})
+        pair = str(config.get("trading_pair", ""))
+        symbol = pair.rsplit("-", 1)[0].upper()
+        if not symbol:
+            continue
+        remaining = await app.state.stocks_ledger.managed_total(current_id, symbol)
+        synchronize(remaining)
 
 
 async def _synchronize_market_state(app, *, bootstrap: bool = False) -> None:
@@ -437,6 +457,11 @@ async def _restore_paper_executors(app) -> int:
             )
             if hasattr(executor, "restore_paper_checkpoint"):
                 executor.restore_paper_checkpoint(state)
+            if hasattr(executor, "synchronize_managed_remaining"):
+                pair = str(config.get("trading_pair", ""))
+                symbol = pair.rsplit("-", 1)[0].upper()
+                remaining = await app.state.stocks_ledger.managed_total(executor_id, symbol)
+                executor.synchronize_managed_remaining(remaining)
             created_at = metadata.get("created_at")
             if isinstance(created_at, str):
                 metadata["created_at"] = datetime.fromisoformat(created_at.replace("Z", "+00:00"))

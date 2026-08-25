@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from stocks_runtime.ledger import ACTIVE_INTENT_STATES, PostgresManagedLedger
+from stocks_runtime.ledger import ACTIVE_INTENT_STATES, LedgerConflict, PostgresManagedLedger
 
 
 PAPER_OPEN_STATES = {"OPEN", "PARTIALLY_FILLED"}
@@ -521,6 +521,8 @@ class PostgresPaperBroker:
                         price = quote.bid
                     remaining = Decimal(order["requested_base"]) - Decimal(order["filled_base"])
                     quantity = min(remaining, available)
+                    if side == "SELL":
+                        quantity = await self._owned_sell_quantity(connection, order, quantity)
                     if quantity <= 0:
                         continue
                     await self._apply_fill(connection, order, quote, quantity, price)
@@ -540,6 +542,31 @@ class PostgresPaperBroker:
             Decimal(account["cash_balance"]), Decimal(account["available_cash"])
         )
         return changed
+
+    async def _owned_sell_quantity(self, connection, order, proposed: Decimal) -> Decimal:
+        """Cap a simulated SELL to inventory owned by its Executor.
+
+        A PositionExecutor does not reserve its internal exit order.  A
+        concurrent reduce Executor can therefore consume part of the lot after
+        that exit was created.  Rechecking ownership at the actual quote event
+        prevents the paper exchange from fabricating a short sale.  Direct
+        SELL intents already reserve availability, so their own reservation is
+        bounded by total_base instead.
+        """
+        owner = order["source_owner"] or order["executor_id"]
+        if not owner:
+            return Decimal("0")
+        lot = await connection.fetchrow(
+            f"SELECT total_base,available_base FROM {self.schema}.inventory_lots "
+            "WHERE owner_id=$1 AND symbol=$2 FOR UPDATE",
+            str(owner), str(order["symbol"]),
+        )
+        if lot is None:
+            return Decimal("0")
+        owned = Decimal(lot["total_base"])
+        if order["source_owner"] is None:
+            owned = min(owned, Decimal(lot["available_base"]))
+        return min(Decimal(proposed), max(Decimal("0"), owned))
 
     async def _terminal(self, connection, client_id: str, status: str) -> None:
         await connection.execute(
@@ -970,15 +997,24 @@ class PostgresPaperBroker:
                     f"paper_fill_without_managed_order:{row['client_order_id']}"
                 )
                 continue
-            await self.ledger.record_cumulative_fill(
-                client_order_id=str(row["client_order_id"]),
-                exchange_order_id=str(row["exchange_order_id"]),
-                cumulative_base=Decimal(row["filled_base"]),
-                cumulative_quote=Decimal(row["filled_quote"]),
-                cumulative_fee=Decimal(row["cumulative_fee"]),
-                status=str(row["status"]),
-            )
-            repaired += 1
+            try:
+                await self.ledger.record_cumulative_fill(
+                    client_order_id=str(row["client_order_id"]),
+                    exchange_order_id=str(row["exchange_order_id"]),
+                    cumulative_base=Decimal(row["filled_base"]),
+                    cumulative_quote=Decimal(row["filled_quote"]),
+                    cumulative_fee=Decimal(row["cumulative_fee"]),
+                    status=str(row["status"]),
+                )
+                repaired += 1
+            except LedgerConflict as exc:
+                # Preserve the account and keep the API available for an
+                # operator-owned flatten/reset.  A single corrupt historical
+                # fill must not crash startup or suppress reconciliation of
+                # later valid orders.
+                await self.mark_recovery_required(
+                    f"paper_fill_ownership_conflict:{row['client_order_id']}:{exc}"
+                )
         return repaired
 
     async def save_checkpoint(

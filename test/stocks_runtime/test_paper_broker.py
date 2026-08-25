@@ -1,6 +1,6 @@
 import time
 from decimal import Decimal
-from unittest import TestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 
 from stocks_runtime.paper_broker import (
     PaperQuote,
@@ -108,6 +108,30 @@ class PaperBrokerPureTests(TestCase):
         broker.update_market_state("MARKET_OPEN", {"AAPL": "TRADING"}, {"AAPL": "BUY"})
         self.assertTrue(broker._direction_allowed("AAPL", "BUY"))
         self.assertFalse(broker._direction_allowed("AAPL", "SELL"))
+
+
+class PaperBrokerOwnershipTests(IsolatedAsyncioTestCase):
+    async def test_internal_exit_is_capped_to_unreserved_available_inventory(self):
+        class Connection:
+            async def fetchrow(self, *_args):
+                return {"total_base": Decimal("1"), "available_base": Decimal("0.4")}
+
+        broker = PostgresPaperBroker(_Ledger())
+        quantity = await broker._owned_sell_quantity(Connection(), {
+            "source_owner": None, "executor_id": "position-1", "symbol": "AAPL",
+        }, Decimal("1"))
+        self.assertEqual(Decimal("0.4"), quantity)
+
+    async def test_reserved_child_exit_uses_its_existing_total_inventory(self):
+        class Connection:
+            async def fetchrow(self, *_args):
+                return {"total_base": Decimal("1"), "available_base": Decimal("0")}
+
+        broker = PostgresPaperBroker(_Ledger())
+        quantity = await broker._owned_sell_quantity(Connection(), {
+            "source_owner": "position-1", "executor_id": "reduce-1", "symbol": "AAPL",
+        }, Decimal("0.4"))
+        self.assertEqual(Decimal("0.4"), quantity)
 
     def test_checkpoint_json_quotes_non_finite_values_for_postgres(self):
         payload = _checkpoint_json({"price": float("nan"), "decimal": Decimal("NaN")})

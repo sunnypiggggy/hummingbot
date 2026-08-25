@@ -671,6 +671,12 @@ async def close_executor(executor_id: str, request: Request) -> Dict[str, Any]:
     await _managed_executor_or_404(request, executor_id)
     if request.app.state.stocks_settings.mode == "SHADOW":
         raise HTTPException(status_code=409, detail="SHADOW mode has no executable position")
+    runtime = request.app.state.executor_service._active_executors.get(executor_id)
+    if runtime is not None and hasattr(runtime, "synchronize_managed_remaining"):
+        record = await request.app.state.stocks_ledger.executor_record(executor_id)
+        symbol = str(record["symbol"])
+        remaining = await request.app.state.stocks_ledger.managed_total(executor_id, symbol)
+        runtime.synchronize_managed_remaining(remaining)
     return await request.app.state.executor_service.stop_executor(executor_id, keep_position=False)
 
 

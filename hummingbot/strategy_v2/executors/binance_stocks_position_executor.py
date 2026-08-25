@@ -66,6 +66,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
         self._fees_quote_backup = Decimal("0")
         self._external_entry_frozen = False
         self._recovered_entry_frozen = False
+        self._external_exit_filled = Decimal("0")
 
     @property
     def end_time(self) -> Optional[float]:
@@ -101,7 +102,16 @@ class BinanceStocksPositionExecutor(PositionExecutor):
 
     @property
     def amount_to_close(self) -> Decimal:
-        return max(Decimal("0"), self.open_filled_amount - self.close_filled_amount)
+        return max(
+            Decimal("0"),
+            self.open_filled_amount - self.close_filled_amount - self._external_exit_filled,
+        )
+
+    def synchronize_managed_remaining(self, remaining: Decimal) -> None:
+        """Account for confirmed reductions performed by child Executors."""
+        managed = max(Decimal("0"), Decimal(remaining))
+        inferred = self.open_filled_amount - self.close_filled_amount - managed
+        self._external_exit_filled = max(Decimal("0"), inferred)
 
     def get_cum_fees_quote(self) -> Decimal:
         return self._fees_quote_backup + super().get_cum_fees_quote()
@@ -274,6 +284,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
             ),
             "external_entry_frozen": self._external_entry_frozen,
             "recovered_entry_frozen": self._recovered_entry_frozen,
+            "external_exit_filled": str(self._external_exit_filled),
             "current_retries": self._current_retries,
         }
 
@@ -302,6 +313,7 @@ class BinanceStocksPositionExecutor(PositionExecutor):
         self._trailing_stop_trigger_pct = Decimal(str(trailing)) if trailing is not None else None
         self._external_entry_frozen = bool(state.get("external_entry_frozen", False))
         self._recovered_entry_frozen = bool(state.get("recovered_entry_frozen", False))
+        self._external_exit_filled = Decimal(str(state.get("external_exit_filled", "0")))
         self._current_retries = int(state.get("current_retries", 0))
         status = str(state.get("status", "RUNNING"))
         self._status = RunnableStatus[status] if status in RunnableStatus.__members__ else RunnableStatus.RUNNING

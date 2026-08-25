@@ -485,6 +485,15 @@ class PostgresManagedLedger:
             )
         return Decimal(value or 0)
 
+    async def managed_total(self, owner_id: str, symbol: str) -> Decimal:
+        async with self._pool.acquire() as connection:
+            value = await connection.fetchval(
+                f"SELECT total_base FROM {self.SCHEMA}.inventory_lots WHERE owner_id=$1 AND symbol=$2",
+                owner_id,
+                symbol,
+            )
+        return Decimal(value or 0)
+
     async def executor_record(self, executor_id: str) -> Optional[Dict[str, Any]]:
         async with self._pool.acquire() as connection:
             intent = await connection.fetchrow(
