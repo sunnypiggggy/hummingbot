@@ -714,6 +714,21 @@ class TelegramFlowTests(TestCase):
             self.assertIn("等待开市预检", bot.telegram.sent[1][1])
             bot.store.close()
 
+    def test_missing_schedule_after_paper_reset_is_retired_without_warning_loop(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True)
+            schedule_id = "sch-reset-history"
+            bot.store.subscribe_stock_schedule(schedule_id, 7, 7)
+
+            def missing(_schedule_id):
+                raise ServiceError("schedule removed by Paper reset", status_code=404)
+
+            bot.stocks.scheduled_detail = missing
+            bot._notify_stock_schedules()
+            self.assertEqual([], bot.store.stock_schedule_subscriptions())
+            self.assertEqual([], bot.telegram.sent)
+            bot.store.close()
+
     def test_position_limit_wizard_uses_live_quote_and_price_based_risk_preview(self):
         with tempfile.TemporaryDirectory() as raw:
             bot = self._bot(Path(raw), paper_enabled=True)

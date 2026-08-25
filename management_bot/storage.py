@@ -71,6 +71,12 @@ class BotStore:
         )
         self.db.commit()
 
+    def remove_stock_schedule_subscription(self, schedule_id: str) -> None:
+        self.db.execute(
+            "DELETE FROM stock_schedule_subscriptions WHERE schedule_id=?", (schedule_id,)
+        )
+        self.db.commit()
+
     def close(self) -> None:
         self.db.close()
 

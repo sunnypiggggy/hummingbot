@@ -12,7 +12,9 @@ import requests
 
 
 class ServiceError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class JsonClient:
@@ -34,7 +36,10 @@ class JsonClient:
                 detail = response.json().get("detail", response.text[:300])
             except Exception:
                 detail = response.text[:300]
-            raise ServiceError(f"{method.upper()} {path} failed ({response.status_code}): {detail}")
+            raise ServiceError(
+                f"{method.upper()} {path} failed ({response.status_code}): {detail}",
+                status_code=response.status_code,
+            )
         if not response.content:
             return {}
         return response.json()

@@ -13,7 +13,7 @@ from typing import Any, Mapping, Optional
 from management_bot.approvals import ApprovalStore
 from management_bot.clients import (
     ContractReader, HummingbotClient, OperationsReportReader, ParameterCatalogReader,
-    StocksClient,
+    ServiceError, StocksClient,
 )
 from management_bot.config import Settings
 from management_bot.storage import BotStore
@@ -1026,6 +1026,13 @@ class TradingManagementBot:
             schedule_id = str(subscription["schedule_id"])
             try:
                 item = self.stocks.scheduled_detail(schedule_id)
+            except ServiceError as exc:
+                if exc.status_code == 404:
+                    self.store.remove_stock_schedule_subscription(schedule_id)
+                    logger.info("retired missing Stocks schedule subscription id=%s", schedule_id)
+                    continue
+                logger.warning("scheduled Stocks notification refresh failed id=%s: %s", schedule_id, exc)
+                continue
             except Exception as exc:
                 logger.warning("scheduled Stocks notification refresh failed id=%s: %s", schedule_id, exc)
                 continue
@@ -1055,6 +1062,7 @@ class TradingManagementBot:
                     self.store.mark_stock_schedule_notified(
                         schedule_id, final_status, version, str(item.get("resulting_executor_id"))
                     )
+                    self.store.remove_stock_schedule_subscription(schedule_id)
                     continue
             # Scheduler retry cadence is not a user-visible lifecycle event.
             # Notify only when the semantic status changes; version may advance
@@ -1073,6 +1081,8 @@ class TradingManagementBot:
             self.store.mark_stock_schedule_notified(
                 schedule_id, status, version, str(item.get("resulting_executor_id") or "")
             )
+            if status in {"CANCELED", "EXPIRED", "REJECTED", "FAILED"}:
+                self.store.remove_stock_schedule_subscription(schedule_id)
 
     @staticmethod
     def _paper_status(summary: dict) -> str:
