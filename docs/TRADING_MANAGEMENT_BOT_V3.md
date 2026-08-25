@@ -73,6 +73,8 @@ Stock PAPER收益独立读取 Stock Runtime 的 `GET /stocks/paper/summary`：
 - 行情新鲜但市场阶段暂不可判定时显示“行情已接入，等待交易时段状态”，不误报为连接故障。
 - `STOCKS_PAPER_TELEGRAM_TRADING_ENABLED`只授权本地Paper Executor，和全局维护
   `TRADING_MANAGEMENT_MUTATIONS_ENABLED`相互独立。
+- Stock菜单必须显示配置维护、PAPER执行、LIVE授权、Connector、市场阶段和真实经济
+  请求计数的最终状态，避免用户在确认步骤才发现功能开关未启用。
 
 “当前异常”以 `trading_status.json` 的最终交易权限为权威来源，按“交易阻塞”
 和“不阻塞提醒”分组。Hummingbot `error_logs` 是滚动历史缓存，只有最近15分钟
@@ -175,5 +177,9 @@ Scheduler只消费与当前待审批release完全匹配的决定，并重新执�
 5. 观察通过后再开启变更总开关。Stock真实订单仍额外要求Stock Runtime为
    `LIVE`且已独立授权，并要求默认关闭的
    `STOCKS_LIVE_TELEGRAM_TRADING_ENABLED=true`。异步功能不能绕过这层授权。
+
+OCI生产运维可显式保持`TRADING_MANAGEMENT_MUTATIONS_ENABLED=true`，让管理员私聊中的
+白名单、限额、模型审批和机器人维护操作可用。该设置不等于授权交易：所有操作仍需
+二次确认和各自预检，Stocks LIVE仍需Runtime与Telegram两个独立实盘开关同时放行。
 
 Condor迁移记录见 `CONDOR_MIGRATION_ARCHIVE.md`。

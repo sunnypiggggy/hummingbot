@@ -934,6 +934,8 @@ class TradingManagementBot:
         return "🟩 DCA\n\n请选择机器人：", rows
 
     def _stock_menu(self) -> tuple[str, list[list[tuple[str, str]]]]:
+        health: dict[str, Any] = {}
+        mode = "UNKNOWN"
         try:
             health = self.stocks.health()
             mode = str(health.get("runtime_mode", "-")).upper()
@@ -953,9 +955,20 @@ class TradingManagementBot:
             [("🏠 主菜单", "m:home")],
         ]
         paper_switch = "已开启" if self.settings.stocks_paper_trading_enabled else "已关闭"
+        maintenance_switch = "已开放" if self.settings.mutations_enabled else "已关闭"
+        live_authorized = bool(health.get("live_authorized"))
+        economic_requests = bool(health.get("economic_requests_enabled"))
+        live_switch = "已授权" if mode == "LIVE" and live_authorized and economic_requests else "未授权"
+        connector = "正常" if health.get("connector_ready") else "未就绪"
+        market_phase = str(health.get("market_phase", "UNKNOWN"))
+        economic_count = health.get("economic_http_request_count", "-")
         return (
             f"📈 Stock 管理\n\n状态：{status}\n"
-            f"Telegram Paper下单：{paper_switch}\n"
+            f"配置维护：{maintenance_switch}\n"
+            f"PAPER创建/撤销/平仓/减仓：{paper_switch}\n"
+            f"LIVE交易：{live_switch}\n"
+            f"Connector：{connector}｜市场阶段：{market_phase}\n"
+            f"Binance真实经济请求计数：{economic_count}\n"
             "交易时段：盘前 + 正常时段 + 盘后（EXTENDED）",
             rows,
         )

@@ -313,6 +313,8 @@ class FakeParameters:
 class FakeStocks:
     def __init__(self):
         self.created = []
+        self.whitelist_changes = []
+        self.limit_changes = []
         self.market_phase = "MARKET_OPEN"
         self.schedules = {}
         self.preview_allowed = True
@@ -321,11 +323,34 @@ class FakeStocks:
         return {
             "status": "healthy", "runtime_mode": "PAPER", "connector_ready": True,
             "paper_recovery_required": False, "economic_requests_enabled": False,
-            "live_authorized": False,
+            "live_authorized": False, "market_phase": self.market_phase,
+            "economic_http_request_count": 0,
         }
 
     def whitelist(self):
         return [{"symbol": "AAPL", "enabled": True, "max_position_notional": "200"}]
+
+    def put_whitelist(self, symbol, enabled, max_position):
+        value = {"symbol": symbol, "enabled": enabled, "max_position_notional": max_position}
+        self.whitelist_changes.append(("put", value))
+        return {"updated": True, "item": value}
+
+    def delete_whitelist(self, symbol):
+        self.whitelist_changes.append(("delete", symbol))
+        return {"deleted": True}
+
+    def limits(self):
+        return {
+            "active": {"max_order_notional": "500", "max_symbol_exposure": "1000",
+                       "max_managed_exposure": "2000", "daily_loss_limit": "200"},
+            "usage": {"principal_and_mtm": "0", "pending_buy_principal": "0",
+                      "fee_reserve": "0", "available_cash": "2000"},
+        }
+
+    def put_limits(self, order, symbol, total, daily_loss=None):
+        value = (order, symbol, total, daily_loss)
+        self.limit_changes.append(value)
+        return {"updated": True, "active": value}
 
     def quote(self, _symbol):
         return {"bidPrice": "199", "askPrice": "200", "eventTime": int(time.time() * 1000)}
@@ -489,7 +514,9 @@ class FakeSystemMetrics:
 
 
 class TelegramFlowTests(TestCase):
-    def _bot(self, root: Path, *, paper_enabled: bool = False) -> TradingManagementBot:
+    def _bot(
+        self, root: Path, *, paper_enabled: bool = False, mutations_enabled: bool = False,
+    ) -> TradingManagementBot:
         token = root / "token"
         token.write_text("123456:test-token", encoding="utf-8")
         guard = root / "guard.json"
@@ -513,7 +540,7 @@ class TelegramFlowTests(TestCase):
             approval_request_root=root / "weekly",
             approval_evidence_root=root / "evidence",
             approval_decision_root=root / "decisions",
-            mutations_enabled=False,
+            mutations_enabled=mutations_enabled,
             bots={"grid": {"bot_name": "grid", "script": "grid", "conf": "grid"}},
             stocks_paper_trading_enabled=paper_enabled,
         )
@@ -521,6 +548,44 @@ class TelegramFlowTests(TestCase):
         bot.telegram = FakeTelegram()
         bot.stocks = FakeStocks()
         return bot
+
+    def test_stock_menu_surfaces_effective_operator_capabilities(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True, mutations_enabled=True)
+            text, _ = bot._stock_menu()
+            self.assertIn("配置维护：已开放", text)
+            self.assertIn("PAPER创建/撤销/平仓/减仓：已开启", text)
+            self.assertIn("LIVE交易：未授权", text)
+            self.assertIn("Connector：正常｜市场阶段：MARKET_OPEN", text)
+            self.assertIn("Binance真实经济请求计数：0", text)
+            bot.store.close()
+
+    def test_global_mutation_authorization_enables_stock_whitelist_and_limits(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True, mutations_enabled=True)
+            callback = {"from": {"id": 7}, "message": {"chat": {"id": 7}}}
+
+            whitelist = bot.store.create_session(7, 7, "whitelist_input", 11)
+            bot.store.update_session(
+                whitelist["session_id"], step="confirm", payload={"symbol": "MSFT", "limit": "1000"},
+            )
+            text, _ = bot._handle_session_action(
+                f"x:{whitelist['session_id']}:wl_confirm", callback, 10,
+            )
+            self.assertIn("白名单已更新", text)
+            self.assertEqual("MSFT", bot.stocks.whitelist_changes[-1][1]["symbol"])
+
+            limits = bot.store.create_session(7, 7, "limits_input", 12)
+            bot.store.update_session(
+                limits["session_id"], step="confirm",
+                payload={"limits": ["500", "1000", "2000", "200"]},
+            )
+            text, _ = bot._handle_session_action(
+                f"x:{limits['session_id']}:limits_confirm", callback, 11,
+            )
+            self.assertIn("限额已更新", text)
+            self.assertEqual(("500", "1000", "2000", "200"), bot.stocks.limit_changes[-1])
+            bot.store.close()
 
     def test_private_owner_only_and_duplicate_update_suppression(self):
         with tempfile.TemporaryDirectory() as raw:

@@ -124,6 +124,16 @@ def main():
         "entry_order_type": "LIMIT", "entry_price": "200", "stop_loss": "0.02",
         "take_profit": "0.03", "time_limit": 3600,
     })
+    blocked = client.request("POST", "/stocks/order-executors/preview", {
+        "id": f"blocked-preview-{suffix}", "symbol": "AAPL", "side": "BUY", "amount": "20",
+        "order_type": "LIMIT", "price": "200",
+    })
+    if blocked.get("allowed") is not False:
+        raise AssertionError(f"business preflight must return HTTP 200 with allowed=false: {blocked}")
+    client.request("POST", "/stocks/order-executors/preview", {
+        "id": f"invalid-preview-{suffix}", "symbol": "AAPL", "side": "BUY", "amount": "0.5",
+        "order_type": "LIMIT",
+    }, expected=(422,))
 
     buy_id = f"limitbuy-{suffix}"
     client.request("POST", "/stocks/order-executors", {
@@ -132,6 +142,27 @@ def main():
     })
     wait_for(client, "/stocks/paper/trades?symbol=AAPL", lambda x: len(x["items"]) >= 1)
     client.request("GET", f"/stocks/executors/{buy_id}")
+    client.request("POST", "/stocks/order-executors", {
+        "id": buy_id, "symbol": "AAPL", "side": "BUY", "amount": "0.4",
+        "order_type": "LIMIT", "price": "199",
+    }, expected=(409,))
+
+    client.request("DELETE", "/stocks/whitelist/AAPL")
+    blocked_after_delete = client.request("POST", "/stocks/order-executors/preview", {
+        "id": f"deleted-buy-{suffix}", "symbol": "AAPL", "side": "BUY", "amount": "0.1",
+        "order_type": "LIMIT", "price": "200",
+    })
+    if blocked_after_delete.get("allowed") is not False:
+        raise AssertionError(f"deleted whitelist symbol still allowed BUY: {blocked_after_delete}")
+    sell_after_delete = client.request("POST", "/stocks/order-executors/preview", {
+        "id": f"deleted-sell-{suffix}", "symbol": "AAPL", "side": "SELL", "amount": "0.1",
+        "order_type": "LIMIT", "price": "205", "source_owner": "unassigned",
+    })
+    if sell_after_delete.get("allowed") is not True:
+        raise AssertionError(f"whitelist deletion blocked an inventory exit: {sell_after_delete}")
+    client.request("PUT", "/stocks/whitelist/AAPL", {
+        "symbol": "AAPL", "enabled": True, "max_position_notional": "200",
+    })
 
     sell_id = f"limitsell-{suffix}"
     client.request("POST", "/stocks/order-executors", {
@@ -177,6 +208,9 @@ def main():
         "trading_pair": "AAPL-USDC", "side": "BUY", "amount": "0.1", "price": "100",
         "execution_strategy": "LIMIT",
     }, "controller_id": "stocks-paper-smoke"})
+    client.request("POST", "/stocks/paper/reset", {
+        "confirmation": "RESET PAPER ACCOUNT TO 2000 USDC",
+    }, expected=(409,))
     client.request("POST", f"/stocks/executors/{pending_id}/cancel")
     wait_executor_terminal(client, pending_id)
 
