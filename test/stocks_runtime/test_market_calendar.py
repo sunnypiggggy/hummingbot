@@ -1,7 +1,11 @@
 from datetime import datetime, timezone
 from unittest import TestCase
 
-from stocks_runtime.market_calendar import phases_conflict, xnys_market_state
+from stocks_runtime.market_calendar import (
+    persisted_market_state_is_current,
+    phases_conflict,
+    xnys_market_state,
+)
 
 
 class XnysMarketCalendarTests(TestCase):
@@ -26,3 +30,12 @@ class XnysMarketCalendarTests(TestCase):
     def test_overnight_and_closed_are_semantically_compatible(self):
         self.assertFalse(phases_conflict("OVERNIGHT", "MARKET_CLOSED"))
         self.assertTrue(phases_conflict("MARKET_OPEN", "PRE_MARKET"))
+
+    def test_persisted_state_must_match_current_new_york_date(self):
+        local = xnys_market_state(datetime(2026, 8, 25, 15, 0, tzinfo=timezone.utc))
+        self.assertTrue(persisted_market_state_is_current(
+            trading_date="2026-08-25", valid_until=local.valid_until, local=local,
+        ))
+        self.assertFalse(persisted_market_state_is_current(
+            trading_date="2026-08-24", valid_until=local.valid_until, local=local,
+        ))

@@ -74,3 +74,19 @@ def phases_conflict(binance_phase: str, xnys_phase: str) -> bool:
     closed = {"MARKET_CLOSED", "OVERNIGHT"}
     left, right = str(binance_phase).upper(), str(xnys_phase).upper()
     return left != right and not ({left, right} <= closed)
+
+
+def persisted_market_state_is_current(
+    *, trading_date: str | None, valid_until: datetime | None, local: MarketCalendarState
+) -> bool:
+    """Only reuse a persisted exchange phase inside the same New York date.
+
+    Binance's calendar stream is transition-only.  Its last event can remain
+    inside the nominal validity interval after a process restart, but it must
+    never carry an earlier trading date into a new session.
+    """
+    return bool(
+        str(trading_date or "") == local.trading_date
+        and valid_until is not None
+        and valid_until > local.observed_at
+    )

@@ -37,7 +37,11 @@ from stocks_runtime.binance_client import BinanceStocksReadClient  # noqa: E402
 from stocks_runtime.auth import auth_user  # noqa: E402
 from stocks_runtime.async_orders import AsyncStocksOrderScheduler  # noqa: E402
 from stocks_runtime.ledger import LedgerLimits, PostgresManagedLedger  # noqa: E402
-from stocks_runtime.market_calendar import phases_conflict, xnys_market_state  # noqa: E402
+from stocks_runtime.market_calendar import (  # noqa: E402
+    persisted_market_state_is_current,
+    phases_conflict,
+    xnys_market_state,
+)
 from stocks_runtime.executor_config import normalize_executor_config  # noqa: E402
 from stocks_runtime.policy import StocksExecutorPolicy  # noqa: E402
 from stocks_runtime.paper_broker import PostgresPaperBroker  # noqa: E402
@@ -196,7 +200,11 @@ async def _synchronize_market_state(app, *, bootstrap: bool = False) -> None:
     metadata = connector.market_state_metadata
     if bootstrap:
         stored = await app.state.stocks_ledger.load_market_state()
-        if stored and stored.get("market_valid_until") and stored["market_valid_until"].timestamp() > now_ts:
+        if stored and persisted_market_state_is_current(
+            trading_date=stored.get("market_trading_date"),
+            valid_until=stored.get("market_valid_until"),
+            local=local,
+        ):
             connector.restore_market_state(
                 stored["market_phase"], source=stored["market_phase_source"],
                 event_timestamp=stored["market_event_at"].timestamp() if stored.get("market_event_at") else now_ts,
@@ -211,6 +219,17 @@ async def _synchronize_market_state(app, *, bootstrap: bool = False) -> None:
                 valid_until=local.valid_until.timestamp(), trading_date=local.trading_date,
             )
             metadata = connector.market_state_metadata
+    elif (
+        metadata["source"] == "BINANCE" and metadata.get("trading_date")
+        and str(metadata["trading_date"]) != local.trading_date
+    ):
+        # A transition-only Binance calendar event from the previous session
+        # cannot remain authoritative after the New York trading date rolls.
+        connector.restore_market_state(
+            local.phase, source=local.source, event_timestamp=now_ts,
+            valid_until=local.valid_until.timestamp(), trading_date=local.trading_date,
+        )
+        metadata = connector.market_state_metadata
     elif metadata["source"] == "BINANCE" and metadata["event_timestamp"] > getattr(
         app.state, "stocks_last_market_event_timestamp", 0
     ):

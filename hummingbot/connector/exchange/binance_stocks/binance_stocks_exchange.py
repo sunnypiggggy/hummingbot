@@ -251,8 +251,10 @@ class BinanceStocksExchange(ExchangePyBase):
                 # asynchronous order is activated.
                 self._market_valid_until = 0.0
                 value = event.get("tradingDate", event.get("trading_date"))
-                if value:
-                    self._market_trading_date = str(value)
+                # Calendar is transition-only and may omit tradingDate.  Do
+                # not retain a previous session's date; the runtime reconciler
+                # binds this fresh transition to the current XNYS date.
+                self._market_trading_date = str(value) if value else None
                 self._market_state_conflict = False
         elif event_type == "tradingStatus" and symbol:
             self._trading_status[symbol] = str(event.get("status", event.get("tradingStatus", "UNKNOWN"))).upper()

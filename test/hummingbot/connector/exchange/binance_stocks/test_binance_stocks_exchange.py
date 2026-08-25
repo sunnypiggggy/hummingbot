@@ -71,11 +71,16 @@ class BinanceStocksDiscoveryTests(IsolatedAsyncioTestCase):
 class BinanceStocksExchangeTests(IsolatedAsyncioTestCase):
     async def test_official_calendar_to_field_updates_market_phase(self):
         exchange = configured_exchange(trading_required=False)
+        exchange.restore_market_state(
+            "PRE_MARKET", source="BINANCE", event_timestamp=1_699_999_999,
+            valid_until=1_700_100_000, trading_date="2026-08-24",
+        )
         exchange.process_market_state_event({
             "e": "calendar", "from": "PRE_MARKET", "to": "MARKET_OPEN", "ts": 1_700_000_001_000,
         })
         self.assertEqual("MARKET_OPEN", exchange.market_phase)
         self.assertEqual("BINANCE", exchange.market_state_metadata["source"])
+        self.assertIsNone(exchange.market_state_metadata["trading_date"])
 
     async def test_default_position_provider_blocks_order_before_network(self):
         exchange = configured_exchange()

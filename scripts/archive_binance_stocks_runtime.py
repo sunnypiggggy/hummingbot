@@ -33,6 +33,7 @@ FILES = (
     "scripts/migrate_binance_stocks_limits_v3.sql",
     "scripts/run_binance_stocks_paper_scenario.py",
     "scripts/smoke_binance_stocks_paper_api.py",
+    "scripts/verify_binance_stocks_operator_workflow.py",
     "scripts/smoke_binance_stocks_async_queue.py",
     "scripts/verify_binance_stocks_runtime_package.py",
     "test/test_binance_stocks_runtime_deployment.py",
