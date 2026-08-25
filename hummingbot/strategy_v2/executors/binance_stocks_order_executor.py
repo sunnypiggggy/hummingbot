@@ -35,7 +35,7 @@ class BinanceStocksOrderExecutor(OrderExecutor):
         # The Stocks policy has already atomically reserved this SELL lot.
         # Generic BudgetChecker sees the post-reservation balance and would
         # incorrectly reject the order's own inventory.
-        if self.config.side is TradeType.SELL and getattr(self.config, "managed_source_owner", None):
+        if self.config.side is TradeType.SELL:
             return
         await super().validate_sufficient_balance()
 
