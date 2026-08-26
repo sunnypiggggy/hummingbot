@@ -56,6 +56,21 @@ debug.log
 /*.egg-info
 *.whl
 
+# Generated transfer/release archives must stay outside Git.
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+
+# Binance Stocks deployment/acceptance scratch artifacts.
+/binance_stocks_operator_acceptance_*/
+/stocks-debug-*.json
+/stocks-probe-*.json
+/stocks-final-probe.json
+/tmp_stocks_probe.py
+/release_packages/binance-stocks-runtime/.staging/
+
 
 # VSCode
 .vscode/
