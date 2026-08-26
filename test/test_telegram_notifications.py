@@ -27,6 +27,7 @@ from live_guard.telegram_notifications import (
     render_mobile_profit_card,
     runtime_error_fingerprint_text,
     runtime_error_lines,
+    is_structured_grid_maker_rejection,
     sanitize_runtime_error,
     system_health_display,
     trade_mode_display,
@@ -305,6 +306,18 @@ def test_runtime_log_filter_selects_errors_and_redacts_secrets():
     assert len(found) == 2
     assert "order rejected" in found[0]
     assert "secret" not in found[0]
+
+
+def test_grid_maker_cross_rejection_is_owned_by_structured_layer_channel():
+    line = (
+        'client_order_tracker - Order x-grid has failed. HTTP 400 '
+        'Error: {"code":-2010,"msg":"Order would immediately match and take."}'
+    )
+    assert runtime_error_lines([line]) == [line]
+    assert is_structured_grid_maker_rejection(line)
+    assert not is_structured_grid_maker_rejection(
+        'Order x-grid has failed: {"code":-2010,"msg":"Account has insufficient balance"}'
+    )
 
 
 def test_correlated_event_id_is_stable_across_guard_cycles():
@@ -793,6 +806,40 @@ def test_grid_integrity_failure_uses_stable_event_id_across_contract_refreshes(t
     rows = [json.loads(line) for line in guard.notification_path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
     assert rows[0]["event_id"] == rows[1]["event_id"]
+
+
+def test_grid_log_scanner_suppresses_structured_maker_crossing_duplicate(tmp_path):
+    class DockerLogs:
+        def logs_since(self, _name, _since):
+            return [
+                'client_order_tracker - Order x-grid has failed. HTTP 400 '
+                'Error: {"code":-2010,"msg":"Order would immediately match and take."}'
+            ]
+
+    class ErrorRecorder:
+        def __init__(self):
+            self.failures = []
+            self.recoveries = []
+
+        def failure(self, *args, **kwargs):
+            self.failures.append((args, kwargs))
+
+        def recovered(self, *args, **kwargs):
+            self.recoveries.append((args, kwargs))
+
+        def recover_if_quiet(self, *args, **kwargs):
+            self.recoveries.append((args, kwargs))
+
+    guard = GridGuard.__new__(GridGuard)
+    guard.emergency_docker = DockerLogs()
+    guard.runtime_log_cursors = {"grid-live-fdusd-400": 1.0}
+    guard.runtime_log_cursor_path = tmp_path / "cursor.json"
+    guard.runtime_errors = ErrorRecorder()
+
+    guard._scan_runtime_logs()
+
+    assert guard.runtime_errors.failures == []
+    assert guard.runtime_log_cursor_path.exists()
 
 
 def test_risk_event_message_explains_cause_and_follow_up_impact_in_one_line():

@@ -220,6 +220,21 @@ def runtime_error_lines(lines: Iterable[str]) -> list[str]:
     return found
 
 
+def is_structured_grid_maker_rejection(error: BaseException | str) -> bool:
+    """Return True for Binance post-only crossings owned by Grid events.
+
+    The Grid strategy emits layer-scoped deferred/escalated/recovered events
+    with real recovery timing.  Sending the same line through the generic
+    five-minute log-silence channel would duplicate the alert and report a
+    fictitious 300-second outage.
+    """
+    value = sanitize_runtime_error(error).lower()
+    return (
+        "order would immediately match and take" in value
+        or ('"code":-2010' in value and "immediately match" in value)
+    )
+
+
 class RuntimeErrorChannel:
     """Persist and emit one alert per runtime-error episode plus one recovery.
 
@@ -648,6 +663,17 @@ def format_event(event: Mapping[str, Any]) -> str:
                 f"动作：{event.get('action') or 'automatic_retry'}",
                 "说明：同类错误持续期间不会重复刷屏；恢复后会另发一条通知。",
             ))
+        if str(details.get("runtime_event") or "").startswith("grid_maker_"):
+            lines.append(
+                f"Maker层：{details.get('side') or '-'} @ "
+                f"{details.get('original_price') or '-'}；"
+                f"重试={details.get('retry_count', 0)}"
+            )
+            if details.get("best_bid") is not None or details.get("best_ask") is not None:
+                lines.append(
+                    f"盘口：BestBid={details.get('best_bid', '-')} / "
+                    f"BestAsk={details.get('best_ask', '-')}"
+                )
         lines.extend((
             f"时间：{event.get('occurred_at')}",
             f"事件ID：{str(event.get('event_id', ''))[:20]}",
@@ -1389,6 +1415,8 @@ GATE_STATE_DISPLAY = {
     "REFRESH_REQUESTED": "成交后准备刷新",
     "CANCEL_PENDING": "正在撤销旧网格",
     "REBUILDING": "正在建立新网格",
+    "HEALTHY_DEFERRED": "正常交易，部分Maker层等待",
+    "MAKER_WAIT": "Maker挂单等待中",
     "N/A": "不适用",
 }
 GATE_REASON_DISPLAY = {
@@ -1495,6 +1523,10 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     system_health = str(status.get("system_health") or "UNKNOWN")
     trade_mode = str(status.get("trade_mode") or "UNKNOWN")
     trading_normal = status.get("trading_normal") is True
+    active_runtime = report.get("active_runtime", {})
+    order_build_state = str(
+        active_runtime.get("order_build_state") if isinstance(active_runtime, Mapping) else ""
+    ).upper()
     if system_health == "FAILED":
         status_color, status_fill = "#b91c1c", "#fef2f2"
     elif system_health == "DEGRADED":
@@ -1506,7 +1538,12 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     draw.rounded_rectangle((70, 180, 1370, 370), radius=18, fill=status_fill,
                            outline=status_color, width=3)
     permissions = status.get("final_permissions", {})
-    trade_text = "正常交易" if trading_normal else trade_mode_display(trade_mode)
+    if order_build_state == "HEALTHY_DEFERRED":
+        trade_text = "正常交易（部分Maker层等待安全盘口）"
+    elif order_build_state == "MAKER_WAIT":
+        trade_text = "Maker挂单等待中"
+    else:
+        trade_text = "正常交易" if trading_normal else trade_mode_display(trade_mode)
     draw.text((105, 205), f"系统：{system_health_display(system_health)}   交易状态：{trade_text}",
               fill=status_color, font=report_font(36, bold=True))
     draw.text(
@@ -1568,7 +1605,10 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
             f"B{order_runtime.get('actual_buy_layers', '-')}/"
             f"{order_runtime.get('expected_buy_layers', '-')} "
             f"S{order_runtime.get('actual_sell_layers', '-')}/"
-            f"{order_runtime.get('expected_sell_layers', '-')}",
+            f"{order_runtime.get('expected_sell_layers', '-')} "
+            f"延{order_runtime.get('maker_deferred_layers', 0)}/"
+            f"穿{order_runtime.get('maker_rejection_count', 0)}/"
+            f"{float(order_runtime.get('maker_longest_recovery_seconds') or 0):.1f}s",
         ))
     grid_parameters = report.get("grid_parameters")
     if isinstance(grid_parameters, Mapping) and grid_parameters:

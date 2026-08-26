@@ -70,12 +70,15 @@ try:
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
 
-RUNTIME_STATE_SCHEMA_VERSION = 11
+RUNTIME_STATE_SCHEMA_VERSION = 12
 SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS = frozenset(range(2, RUNTIME_STATE_SCHEMA_VERSION + 1))
 ORDER_REBUILD_BACKOFF_SECONDS = (5, 15, 30, 60)
 UNEXPECTED_ORDER_GAP_SECONDS = 15
 PAIR_REFRESH_WARNING_SECONDS = 30
 PAIR_REFRESH_RESTRICT_SECONDS = 60
+MAKER_LAYER_RETRY_SECONDS = (2, 5, 15)
+MAKER_LAYER_ESCALATION_SECONDS = 15
+MAKER_LAYER_TOPOLOGY_REFRESH_SECONDS = 30
 
 
 @dataclass
@@ -268,6 +271,10 @@ class LivePortfolioGrid(StrategyV2Base):
         }
         self.buy_order_ids: set[str] = set()
         self.sell_order_ids: set[str] = set()
+        # Intents are deliberately process-local.  They let an asynchronous
+        # LIMIT_MAKER rejection recover exactly one layer, while a restart
+        # continues to use the existing full exchange reconciliation path.
+        self.ordinary_order_intents: Dict[str, Dict[str, Any]] = {}
         self.last_market_success = time.time()
         self.first_cycle_failure_at: Optional[float] = None
         self.disabled_logged = False
@@ -392,6 +399,7 @@ class LivePortfolioGrid(StrategyV2Base):
             # Risk flattening always has priority over a macro pause.
             if self.pending_flatten:
                 flatten_pairs = self._flatten_target_pairs()
+                self._clear_maker_deferred_layers(flatten_pairs)
                 outstanding_grid, outstanding_flatten = self._partition_flatten_orders(
                     active, pairs=flatten_pairs,
                 )
@@ -407,6 +415,7 @@ class LivePortfolioGrid(StrategyV2Base):
             # This timer-driven Taker action is independent of the XGBoost BUY
             # gate.  It can only sell inventory above the startup baseline.
             if self.config.inventory_exit_enabled and self._process_inventory_exit_policy(prices, active):
+                self._clear_maker_deferred_layers(set(self.config.trading_pairs))
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
@@ -414,11 +423,14 @@ class LivePortfolioGrid(StrategyV2Base):
             self._poll_technical_buy_gate()
             self._poll_macro_gate()
             if self.macro_paused:
+                self._clear_maker_deferred_layers(set(self.config.trading_pairs))
                 if self._owned_active_orders(active):
                     self.cancel_owned_orders()
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
+
+            self._clear_ineligible_maker_deferred_layers()
 
             if self._advance_risk_recovery(prices, active):
                 self._persist(prices)
@@ -431,10 +443,15 @@ class LivePortfolioGrid(StrategyV2Base):
                 return
 
             if self.portfolio_tripped:
+                self._clear_maker_deferred_layers(set(self.config.trading_pairs))
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
             if self._advance_pair_order_refreshes(prices, active):
+                self._persist(prices)
+                self.first_cycle_failure_at = None
+                return
+            if self._advance_maker_deferred_layers(active):
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
@@ -870,6 +887,16 @@ class LivePortfolioGrid(StrategyV2Base):
             "refresh_warning_notified": False,
             "refresh_restricted_notified": False,
             "completed_order_ids": [],
+            "maker_deferred_layers": [],
+            "maker_rejection_count": 0,
+            "maker_topology_refresh_count": 0,
+            "maker_last_best_bid": None,
+            "maker_last_best_ask": None,
+            "maker_book_checked_at": None,
+            "maker_book_unavailable_since": None,
+            "maker_book_next_retry_at": None,
+            "maker_longest_recovery_seconds": 0.0,
+            "maker_last_recovered_at": None,
         }
 
     def _pair_amount_filters(self, pair: str) -> tuple[Decimal, Decimal]:
@@ -901,6 +928,375 @@ class LivePortfolioGrid(StrategyV2Base):
         if not price.is_finite() or price <= 0:
             raise ParameterBuildError(pair, "price quantized to a non-positive value")
         return price
+
+    def _maker_book_snapshot(self, pair: str) -> tuple[Decimal, Decimal, Decimal]:
+        """Return one internally consistent book snapshot for ordinary Maker orders."""
+        getter = getattr(self.connector, "get_price_by_type", None)
+        if not callable(getter):
+            raise ParameterBuildError(pair, "best bid/ask are unavailable")
+        try:
+            best_bid = Decimal(str(getter(pair, PriceType.BestBid)))
+            best_ask = Decimal(str(getter(pair, PriceType.BestAsk)))
+            raw_mid = getter(pair, PriceType.MidPrice)
+            mid_price = Decimal(str(raw_mid)) if raw_mid is not None else (
+                best_bid + best_ask
+            ) / Decimal("2")
+        except Exception as exc:
+            raise ParameterBuildError(pair, f"best bid/ask are unavailable: {exc}") from exc
+        if (
+            not best_bid.is_finite() or not best_ask.is_finite()
+            or not mid_price.is_finite() or best_bid <= 0 or best_ask <= 0
+            or mid_price <= 0 or best_bid >= best_ask
+        ):
+            raise ParameterBuildError(
+                pair,
+                f"invalid maker book best_bid={best_bid} best_ask={best_ask} mid={mid_price}",
+            )
+        status = self._order_status(pair)
+        status.update({
+            "maker_last_best_bid": str(best_bid),
+            "maker_last_best_ask": str(best_ask),
+            "maker_book_checked_at": float(self.current_timestamp),
+        })
+        return best_bid, best_ask, mid_price
+
+    @staticmethod
+    def _maker_price_is_safe(side: str, price: Decimal, *,
+                             best_bid: Decimal, best_ask: Decimal) -> bool:
+        return price < best_ask if side == "BUY" else price > best_bid
+
+    def _maker_layer_id(
+        self, pair: str, side: str, price: Decimal, generation: int,
+    ) -> str:
+        identity = (
+            f"{pair}|{side}|{price}|{generation}|{self.active_parameter_sha256}"
+        ).encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()[:24]
+
+    def _defer_maker_layer(
+        self, pair: str, side: str, price: Decimal, amount: Decimal, *,
+        generation: int, reason: str, first_deferred_at: float | None = None,
+        episode_id: str | None = None, already_notified: bool = False,
+    ) -> Dict[str, Any]:
+        """Persist one crossed Maker layer without disturbing sibling orders."""
+        status = self._order_status(pair)
+        layers = list(status.get("maker_deferred_layers") or [])
+        layer_id = self._maker_layer_id(pair, side, price, generation)
+        existing = next((value for value in layers if value.get("layer_id") == layer_id), None)
+        now = float(self.current_timestamp)
+        if existing is not None:
+            retry_count = int(existing.get("retry_count") or 0) + 1
+            retry_delay = MAKER_LAYER_RETRY_SECONDS[min(
+                retry_count, len(MAKER_LAYER_RETRY_SECONDS) - 1,
+            )]
+            existing.update({
+                "reason": reason,
+                "last_rejected_at": now,
+                "pending_order_id": None,
+                "retry_count": retry_count,
+                "next_retry_at": now + retry_delay,
+            })
+            status["maker_deferred_layers"] = layers
+            return existing
+        first_at = float(first_deferred_at if first_deferred_at is not None else now)
+        episode = episode_id or f"maker:{layer_id}:{first_at:.3f}"
+        layer = {
+            "layer_id": layer_id,
+            "episode_id": episode,
+            "pair": pair,
+            "side": side,
+            "original_price": str(price),
+            "amount": str(amount),
+            "parameter_sha256": self.active_parameter_sha256,
+            "refresh_generation": int(generation),
+            "first_deferred_at": first_at,
+            "last_rejected_at": now,
+            "retry_count": 0,
+            "next_retry_at": now + MAKER_LAYER_RETRY_SECONDS[0],
+            "pending_order_id": None,
+            "escalation_notified": False,
+            "reason": reason,
+        }
+        layers.append(layer)
+        status["maker_deferred_layers"] = layers
+        status["maker_rejection_count"] = int(status.get("maker_rejection_count", 0)) + 1
+        if not already_notified:
+            self._record_runtime_event(
+                "grid_maker_layer_deferred", pair=pair, side=side,
+                original_price=str(price), amount=str(amount), reason=reason,
+                episode_id=episode, layer_id=layer_id,
+                refresh_generation=generation,
+                best_bid=status.get("maker_last_best_bid"),
+                best_ask=status.get("maker_last_best_ask"),
+            )
+        return layer
+
+    def _submit_ordinary_grid_order(
+        self, pair: str, side: str, price: Decimal, amount: Decimal, *,
+        generation: int, deferred_layer: Mapping[str, Any] | None = None,
+    ) -> str:
+        submit = self.buy if side == "BUY" else self.sell
+        order_id = str(submit(
+            self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, price,
+        ))
+        ledger = self.ledgers[pair]
+        ledger.open_order_ids.add(order_id)
+        (self.buy_order_ids if side == "BUY" else self.sell_order_ids).add(order_id)
+        if not hasattr(self, "ordinary_order_intents"):
+            self.ordinary_order_intents = {}
+        self.ordinary_order_intents[order_id] = {
+            "pair": pair,
+            "side": side,
+            "original_price": str(price),
+            "amount": str(amount),
+            "parameter_sha256": self.active_parameter_sha256,
+            "refresh_generation": int(generation),
+            "first_deferred_at": (
+                deferred_layer.get("first_deferred_at") if deferred_layer else None
+            ),
+            "episode_id": deferred_layer.get("episode_id") if deferred_layer else None,
+            "already_notified": bool(deferred_layer),
+        }
+        return order_id
+
+    def _complete_deferred_layer(
+        self, pair: str, layer: Mapping[str, Any], *, reason: str,
+    ) -> None:
+        status = self._order_status(pair)
+        layer_id = str(layer.get("layer_id"))
+        status["maker_deferred_layers"] = [
+            value for value in status.get("maker_deferred_layers", [])
+            if str(value.get("layer_id")) != layer_id
+        ]
+        duration = max(
+            0.0, float(self.current_timestamp) - float(layer.get("first_deferred_at") or self.current_timestamp),
+        )
+        status["maker_longest_recovery_seconds"] = max(
+            float(status.get("maker_longest_recovery_seconds") or 0), duration,
+        )
+        status["maker_last_recovered_at"] = float(self.current_timestamp)
+        side_key = (
+            "expected_buy_layers" if str(layer.get("side")) == "BUY"
+            else "expected_sell_layers"
+        )
+        actual_key = (
+            "actual_buy_layers" if str(layer.get("side")) == "BUY"
+            else "actual_sell_layers"
+        )
+        status[side_key] = int(status.get(side_key, 0)) + 1
+        status[actual_key] = int(status.get(actual_key, 0)) + 1
+        if not status.get("maker_deferred_layers"):
+            status.update({
+                "state": "HEALTHY",
+                "reason": "maker_layer_recovered",
+            })
+        self._record_runtime_event(
+            "grid_maker_layer_recovered", pair=pair,
+            side=str(layer.get("side")),
+            original_price=str(layer.get("original_price")),
+            amount=str(layer.get("amount")), duration_seconds=duration,
+            retry_count=int(layer.get("retry_count") or 0), reason=reason,
+            episode_id=str(layer.get("episode_id") or layer_id), layer_id=layer_id,
+            refresh_generation=layer.get("refresh_generation"),
+        )
+
+    def _clear_maker_deferred_layers(self, pairs: set[str]) -> None:
+        for pair in pairs:
+            if pair in self.config.trading_pairs:
+                self._order_status(pair)["maker_deferred_layers"] = []
+
+    def _clear_ineligible_maker_deferred_layers(self) -> None:
+        for pair in self.config.trading_pairs:
+            status = self._order_status(pair)
+            layers = list(status.get("maker_deferred_layers") or [])
+            if not layers:
+                continue
+            if (
+                self.pair_recovery.get(pair, {}).get("phase") != ACTIVE
+                or self.ledgers[pair].halted
+            ):
+                status["maker_deferred_layers"] = []
+                continue
+            if not self.technical_buy_enabled_by_pair.get(pair, False):
+                status["maker_deferred_layers"] = []
+
+    def _advance_maker_deferred_layers(self, active_orders: list) -> bool:
+        """Retry due crossed layers only; never replace their original Grid price."""
+        now = float(self.current_timestamp)
+        active_ids = {
+            str(getattr(order, "client_order_id", "")) for order in active_orders
+        }
+        changed = False
+        for pair in self.config.trading_pairs:
+            status = self._order_status(pair)
+            layers = list(status.get("maker_deferred_layers") or [])
+            if (
+                status.get("reason") == "maker_book_unavailable"
+                and now >= float(status.get("maker_book_next_retry_at") or 0)
+            ):
+                status.update({
+                    "state": "UNKNOWN",
+                    "reason": "maker_book_retry_due",
+                    "maker_book_next_retry_at": None,
+                })
+                self.next_refresh = 0.0
+                return True
+            if not layers:
+                continue
+            gates_allow = bool(
+                self.pair_recovery.get(pair, {}).get("phase") == ACTIVE
+                and not self.ledgers[pair].halted and not self.macro_paused
+                and self.technical_gate_healthy_by_pair.get(pair, False)
+                and self.technical_buy_enabled_by_pair.get(pair, False)
+            )
+            current_generation = int(status.get("refresh_generation") or 0)
+            current_parameter = self.active_parameter_sha256
+            if not gates_allow:
+                status["maker_deferred_layers"] = []
+                changed = True
+                continue
+            for layer in layers:
+                if (
+                    int(layer.get("refresh_generation") or -1) != current_generation
+                    or str(layer.get("parameter_sha256") or "") != current_parameter
+                ):
+                    status["maker_deferred_layers"] = [
+                        value for value in status.get("maker_deferred_layers", [])
+                        if value.get("layer_id") != layer.get("layer_id")
+                    ]
+                    changed = True
+                    continue
+                pending_order_id = str(layer.get("pending_order_id") or "")
+                if pending_order_id:
+                    if pending_order_id in active_ids:
+                        self._complete_deferred_layer(
+                            pair, layer, reason="maker_order_confirmed_active",
+                        )
+                        changed = True
+                        continue
+                    age = now - float(layer.get("first_deferred_at") or now)
+                    if (
+                        age >= MAKER_LAYER_ESCALATION_SECONDS
+                        and not bool(layer.get("escalation_notified"))
+                    ):
+                        layer["escalation_notified"] = True
+                        self._record_runtime_event(
+                            "grid_maker_layer_retry_delayed", pair=pair,
+                            side=layer.get("side"),
+                            original_price=layer.get("original_price"),
+                            amount=layer.get("amount"), duration_seconds=age,
+                            retry_count=layer.get("retry_count"),
+                            reason="replacement_order_not_yet_confirmed",
+                            episode_id=layer.get("episode_id"),
+                            layer_id=layer.get("layer_id"),
+                            refresh_generation=layer.get("refresh_generation"),
+                        )
+                        changed = True
+                    if age >= MAKER_LAYER_TOPOLOGY_REFRESH_SECONDS:
+                        status["maker_deferred_layers"] = []
+                        status["maker_topology_refresh_count"] = int(
+                            status.get("maker_topology_refresh_count", 0)
+                        ) + 1
+                        self._record_runtime_event(
+                            "grid_maker_topology_refreshed", pair=pair,
+                            reason="replacement_order_unknown_for_30_seconds",
+                            duration_seconds=age,
+                            episode_id=layer.get("episode_id"),
+                            layer_id=layer.get("layer_id"),
+                            refresh_generation=layer.get("refresh_generation"),
+                        )
+                        self._request_pair_order_refresh(
+                            pair, reason="replacement_order_unknown_for_30_seconds",
+                        )
+                        return True
+                    continue
+                age = now - float(layer.get("first_deferred_at") or now)
+                if (
+                    age >= MAKER_LAYER_ESCALATION_SECONDS
+                    and not bool(layer.get("escalation_notified"))
+                ):
+                    layer["escalation_notified"] = True
+                    self._record_runtime_event(
+                        "grid_maker_layer_retry_delayed", pair=pair,
+                        side=layer.get("side"),
+                        original_price=layer.get("original_price"),
+                        amount=layer.get("amount"), duration_seconds=age,
+                        retry_count=layer.get("retry_count"),
+                        reason="original_grid_price_still_crosses_book",
+                        episode_id=layer.get("episode_id"),
+                        layer_id=layer.get("layer_id"),
+                        refresh_generation=layer.get("refresh_generation"),
+                    )
+                    changed = True
+                if age >= MAKER_LAYER_TOPOLOGY_REFRESH_SECONDS:
+                    status["maker_deferred_layers"] = []
+                    status["maker_topology_refresh_count"] = int(
+                        status.get("maker_topology_refresh_count", 0)
+                    ) + 1
+                    self._record_runtime_event(
+                        "grid_maker_topology_refreshed", pair=pair,
+                        reason="maker_layer_unsafe_for_30_seconds",
+                        duration_seconds=age, episode_id=layer.get("episode_id"),
+                        layer_id=layer.get("layer_id"),
+                        refresh_generation=layer.get("refresh_generation"),
+                    )
+                    self._request_pair_order_refresh(
+                        pair, reason="maker_layer_unsafe_for_30_seconds",
+                    )
+                    return True
+                if now < float(layer.get("next_retry_at") or 0):
+                    continue
+                side = str(layer["side"])
+                price = Decimal(str(layer["original_price"]))
+                amount = Decimal(str(layer["amount"]))
+                try:
+                    best_bid, best_ask, _ = self._maker_book_snapshot(pair)
+                    minimum = self._pair_minimum_order_quote(pair)
+                    amount_step, minimum_amount = self._pair_amount_filters(pair)
+                    normalized_price = self._quantized_price(pair, price)
+                    normalized_amount = self._quantized_amount(pair, amount)
+                    balance_ok = (
+                        normalized_amount * normalized_price <= self._available_balance(self.config.quote_asset)
+                        if side == "BUY" else
+                        normalized_amount <= self._available_balance(pair.split("-", 1)[0])
+                    )
+                    safe = bool(
+                        normalized_price == price and normalized_amount == amount
+                        and amount >= minimum_amount
+                        and (amount_step <= 0 or amount % amount_step == 0)
+                        and amount * price >= minimum and balance_ok
+                        and self._maker_price_is_safe(
+                            side, price, best_bid=best_bid, best_ask=best_ask,
+                        )
+                    )
+                except ParameterBuildError:
+                    safe = False
+                if safe:
+                    order_id = self._submit_ordinary_grid_order(
+                        pair, side, price, amount, generation=current_generation,
+                        deferred_layer=layer,
+                    )
+                    layer["pending_order_id"] = order_id
+                    layer["last_submit_at"] = now
+                    changed = True
+                    continue
+                retry_count = int(layer.get("retry_count") or 0) + 1
+                layer["retry_count"] = retry_count
+                delay = MAKER_LAYER_RETRY_SECONDS[min(
+                    retry_count, len(MAKER_LAYER_RETRY_SECONDS) - 1,
+                )]
+                layer["next_retry_at"] = now + delay
+                changed = True
+            remaining = list(status.get("maker_deferred_layers") or [])
+            if remaining:
+                live_buy, live_sell = self._pair_order_counts(pair, active_orders)
+                status.update({
+                    "state": "HEALTHY_DEFERRED" if live_buy + live_sell else "MAKER_WAIT",
+                    "reason": "maker_layers_waiting_for_safe_book",
+                    "actual_buy_layers": live_buy,
+                    "actual_sell_layers": live_sell,
+                })
+        return changed
 
     def _build_sell_orders(
         self, pair: str, levels: List[Decimal], sell_budget: Decimal,
@@ -1148,6 +1544,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 status.get("expected_sell_layers", 0)
             )
             actual = buy_count + sell_count
+            deferred_layers = list(status.get("maker_deferred_layers") or [])
             pair_active = (
                 self.pair_recovery.get(pair, {}).get("phase") == ACTIVE
                 and not self.ledgers[pair].halted
@@ -1169,6 +1566,14 @@ class LivePortfolioGrid(StrategyV2Base):
             if not pair_active or expected <= 0:
                 status["consecutive_empty_cycles"] = 0
                 status["first_empty_at"] = None
+                continue
+            if deferred_layers:
+                status.update({
+                    "state": "HEALTHY_DEFERRED" if actual > 0 else "MAKER_WAIT",
+                    "reason": "maker_layers_waiting_for_safe_book",
+                    "consecutive_empty_cycles": 0,
+                    "first_empty_at": None,
+                })
                 continue
             order_set_complete = (
                 buy_count >= int(status.get("expected_buy_layers", 0))
@@ -1243,22 +1648,44 @@ class LivePortfolioGrid(StrategyV2Base):
             raise ParameterBuildError(
                 pair, f"refusing overlapping grid generation: {len(existing)} active orders remain",
             )
+        status = self._order_status(pair)
         params = self._pair_params(pair)
+        try:
+            best_bid, best_ask, mid_price = self._maker_book_snapshot(pair)
+        except ParameterBuildError as exc:
+            now = float(self.current_timestamp)
+            if status.get("maker_book_unavailable_since") is None:
+                status["maker_book_unavailable_since"] = now
+            status.update({
+                "state": "MAKER_WAIT",
+                "reason": "maker_book_unavailable",
+                "maker_book_next_retry_at": now + MAKER_LAYER_RETRY_SECONDS[0],
+                "expected_buy_layers": 0,
+                "expected_sell_layers": 0,
+                "actual_buy_layers": 0,
+                "actual_sell_layers": 0,
+                "last_book_error": str(exc),
+            })
+            return remaining_quote
+        status["maker_book_unavailable_since"] = None
+        status["maker_book_next_retry_at"] = None
+        generation = int(status.get("refresh_generation") or 0) + 1
+        status["refresh_generation"] = generation
         state = self.grid_states.get(pair)
         if state is None:
-            state = self._new_grid(pair, price)
+            state = self._new_grid(pair, mid_price)
             self.grid_states[pair] = state
-        elif (price > state.upper * (Decimal("1") + params["move_threshold"])
-              or price < state.lower * (Decimal("1") - params["move_threshold"])):
+        elif (mid_price > state.upper * (Decimal("1") + params["move_threshold"])
+              or mid_price < state.lower * (Decimal("1") - params["move_threshold"])):
             if self.current_timestamp - state.last_move_ts >= params["min_grid_move_seconds"]:
-                state = self._new_grid(pair, price, state.moves + 1)
+                state = self._new_grid(pair, mid_price, state.moves + 1)
                 self.grid_states[pair] = state
-        lower_levels = [level for level in state.levels if level < price]
-        upper_levels = [level for level in state.levels if level > price]
+        lower_levels = [level for level in state.levels if level < mid_price]
+        upper_levels = [level for level in state.levels if level > mid_price]
         buy_limits = [max(ledger.quote, Decimal("0")), self.config.side_budget_quote]
         if self.config.inventory_exit_enabled:
-            extra_quote = max(ledger.inventory_delta(), Decimal("0")) * price
-            baseline_deficit_quote = max(-ledger.inventory_delta(), Decimal("0")) * price
+            extra_quote = max(ledger.inventory_delta(), Decimal("0")) * mid_price
+            baseline_deficit_quote = max(-ledger.inventory_delta(), Decimal("0")) * mid_price
             buy_limits.append(max(
                 baseline_deficit_quote + self.config.max_extra_inventory_quote - extra_quote,
                 Decimal("0"),
@@ -1273,12 +1700,12 @@ class LivePortfolioGrid(StrategyV2Base):
             if buy_budget >= minimum_order_quote and not buy_orders:
                 status = self._order_status(pair)
                 status.update({
-                    "last_price": str(price), "buy_budget": str(buy_budget),
+                    "last_price": str(mid_price), "buy_budget": str(buy_budget),
                     "minimum_order_quote": str(minimum_order_quote),
                     "amount_step": str(amount_step),
                 })
                 buy_build_error = (
-                    f"BUY build produced no executable order: price={price} "
+                    f"BUY build produced no executable order: price={mid_price} "
                     f"budget={buy_budget} minimum={minimum_order_quote} step={amount_step}"
                 )
         base_asset = pair.split("-", 1)[0]
@@ -1293,28 +1720,40 @@ class LivePortfolioGrid(StrategyV2Base):
                 if self.config.cost_floor_enabled else Decimal("0")
             )
             sell_orders = self._build_sell_orders(
-                pair, upper_levels, sell_budget, price, cost_floor,
+                pair, upper_levels, sell_budget, mid_price, cost_floor,
             )
         self._validate_order_generation(pair, buy_orders, sell_orders, sell_budget)
+        safe_buy_orders: List[tuple[Decimal, Decimal]] = []
+        safe_sell_orders: List[tuple[Decimal, Decimal]] = []
+        for side, orders, safe_orders in (
+            ("BUY", buy_orders, safe_buy_orders),
+            ("SELL", sell_orders, safe_sell_orders),
+        ):
+            for order_price, amount in orders:
+                if self._maker_price_is_safe(
+                    side, order_price, best_bid=best_bid, best_ask=best_ask,
+                ):
+                    safe_orders.append((order_price, amount))
+                else:
+                    self._defer_maker_layer(
+                        pair, side, order_price, amount, generation=generation,
+                        reason="pre_submit_price_crosses_latest_book",
+                    )
         submitted_quote = Decimal("0")
         submitted_buy = 0
-        for order_price, amount in buy_orders:
-            order_id = self.buy(
-                self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, order_price,
+        for order_price, amount in safe_buy_orders:
+            self._submit_ordinary_grid_order(
+                pair, "BUY", order_price, amount, generation=generation,
             )
-            ledger.open_order_ids.add(order_id)
-            self.buy_order_ids.add(order_id)
             submitted_quote += amount * order_price
             submitted_buy += 1
         remaining_quote = max(remaining_quote - submitted_quote, Decimal("0"))
-        for sell_price, amount in sell_orders:
-            order_id = self.sell(
-                self.config.exchange, pair, amount, OrderType.LIMIT_MAKER, sell_price,
+        for sell_price, amount in safe_sell_orders:
+            self._submit_ordinary_grid_order(
+                pair, "SELL", sell_price, amount, generation=generation,
             )
-            ledger.open_order_ids.add(order_id)
-            self.sell_order_ids.add(order_id)
-        expected_buy = len(buy_orders)
-        expected_sell = len(sell_orders)
+        expected_buy = len(safe_buy_orders)
+        expected_sell = len(safe_sell_orders)
         if buy_build_error is not None:
             # Preserve and execute the safe SELL side even if a future exchange
             # filter combination makes the BUY side temporarily unbuildable.
@@ -1339,8 +1778,16 @@ class LivePortfolioGrid(StrategyV2Base):
             reason = "orders_submitted"
         self._mark_order_build_healthy(
             pair, expected_buy=expected_buy, expected_sell=expected_sell,
-            actual_buy=submitted_buy, actual_sell=len(sell_orders), reason=reason,
+            actual_buy=submitted_buy, actual_sell=len(safe_sell_orders), reason=reason,
         )
+        if status.get("maker_deferred_layers"):
+            status.update({
+                "state": (
+                    "HEALTHY_DEFERRED"
+                    if submitted_buy + len(safe_sell_orders) > 0 else "MAKER_WAIT"
+                ),
+                "reason": "maker_layers_waiting_for_safe_book",
+            })
         return remaining_quote
 
     @staticmethod
@@ -1852,6 +2299,10 @@ class LivePortfolioGrid(StrategyV2Base):
             "grid_order_set_missing": ("runtime_error", "ERROR_OCCURRED", "warning"),
             "grid_order_rebuild_failed": ("runtime_error", "ERROR_OCCURRED", "critical"),
             "grid_order_set_recovered": ("runtime_error", "ERROR_RECOVERED", "info"),
+            "grid_maker_layer_deferred": ("runtime_error", "ERROR_OCCURRED", "warning"),
+            "grid_maker_layer_retry_delayed": ("runtime_error", "ERROR_OCCURRED", "warning"),
+            "grid_maker_layer_recovered": ("runtime_error", "ERROR_RECOVERED", "info"),
+            "grid_maker_topology_refreshed": ("runtime_error", "ERROR_OCCURRED", "warning"),
         }
         mapped = mapping.get(runtime_event)
         if not mapped or not mapped[0]:
@@ -1864,7 +2315,11 @@ class LivePortfolioGrid(StrategyV2Base):
         signal = self.technical_signal_by_pair.get(pair, {}) if pair in self.technical_signal_by_pair else {}
         correlation = str(
             signal.get("event_id") or recovery.get("triggered_at")
-            or details.get("episode_id")
+            or (
+                f"{details.get('episode_id')}:{runtime_event}"
+                if details.get("episode_id") and runtime_event.startswith("grid_maker_")
+                else details.get("episode_id")
+            )
             or f"{runtime_event}:{pair}:{reason}"
         )
         target = Path(self.config.runtime_state_file).parent / "telegram_events.jsonl"
@@ -1874,6 +2329,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 and not bool(getattr(self.config, "risk_auto_reentry_enabled", False))
             )
             event_details = dict(details)
+            event_details["runtime_event"] = runtime_event
             if recovery:
                 event_details.update({
                     "quote_asset": self.config.quote_asset,
@@ -1893,16 +2349,26 @@ class LivePortfolioGrid(StrategyV2Base):
                     ],
                 })
             if mechanism == "runtime_error":
+                maker_layer_event = runtime_event.startswith("grid_maker_")
                 event_details.update({
                     "component": f"grid_order_execution:{pair}",
                     "error_summary": str(
                         details.get("error_summary") or reason
                     ),
                     "trading_impact": (
+                        "仅原价穿过安全盘口的Maker层暂缓并单层重试；"
+                        "其余已挂订单继续交易，不清仓、不锁存，也不影响其他门控。"
+                        if maker_layer_event else
                         "仅该交易对自动重建挂单；不清仓、不锁存，"
                         "不影响另一个交易对或既有风控门"
                     ),
                     "trading_status": (
+                        (
+                            "单层已恢复，其他普通Maker订单始终保留"
+                            if runtime_event == "grid_maker_layer_recovered" else
+                            "正常交易（部分Maker层等待安全盘口）"
+                        )
+                        if maker_layer_event else
                         f"已恢复 B{details.get('actual_buy_layers', 0)} / "
                         f"S{details.get('actual_sell_layers', 0)} 个挂单"
                     ),
@@ -1998,6 +2464,8 @@ class LivePortfolioGrid(StrategyV2Base):
         return now - self.first_cycle_failure_at >= self.config.fail_closed_seconds
 
     def _forget_order(self, order_id: str) -> None:
+        if hasattr(self, "ordinary_order_intents"):
+            self.ordinary_order_intents.pop(str(order_id), None)
         self.buy_order_ids.discard(order_id)
         self.sell_order_ids.discard(order_id)
         for pair, value in list(self.inventory_exit_order_ids.items()):
@@ -2099,12 +2567,13 @@ class LivePortfolioGrid(StrategyV2Base):
         self._forget_order(event.order_id)
 
     def did_fail_order(self, event: MarketOrderFailureEvent):
-        # Failure events do not expose a trading_pair. Resolve ownership before
-        # forgetting the order and immediately rebuild only the affected pair.
-        # This removes the old 15-second liveness wait (which could stretch to a
-        # full strategy cycle) after a LIMIT_MAKER post-only rejection.
+        # Failure events do not expose a trading_pair. Resolve ownership and
+        # capture the process-local intent before forgetting the order.
         ordinary = self._is_ordinary_grid_order(event.order_id)
         pair = self._owned_order_pair(event.order_id) if ordinary else None
+        intent = dict(getattr(self, "ordinary_order_intents", {}).get(
+            str(event.order_id), {}
+        ))
         if pair is not None:
             error_message = str(getattr(event, "error_message", "") or "")
             reason = (
@@ -2118,7 +2587,58 @@ class LivePortfolioGrid(StrategyV2Base):
                 "last_failed_order_at": float(self.current_timestamp),
                 "last_failed_order_reason": reason,
             })
-            self._request_pair_order_refresh(pair, reason=reason)
+            if reason == "limit_maker_would_take" and intent:
+                current_generation = int(status.get("refresh_generation") or 0)
+                if (
+                    int(intent.get("refresh_generation") or -1) == current_generation
+                    and str(intent.get("parameter_sha256") or "")
+                    == self.active_parameter_sha256
+                ):
+                    self._defer_maker_layer(
+                        pair, str(intent["side"]),
+                        Decimal(str(intent["original_price"])),
+                        Decimal(str(intent["amount"])),
+                        generation=current_generation, reason=reason,
+                        first_deferred_at=intent.get("first_deferred_at"),
+                        episode_id=intent.get("episode_id"),
+                        already_notified=bool(intent.get("already_notified")),
+                    )
+                    expected_key = (
+                        "expected_buy_layers" if intent["side"] == "BUY"
+                        else "expected_sell_layers"
+                    )
+                    actual_key = (
+                        "actual_buy_layers" if intent["side"] == "BUY"
+                        else "actual_sell_layers"
+                    )
+                    if not bool(intent.get("already_notified")):
+                        status[expected_key] = max(
+                            0, int(status.get(expected_key, 0)) - 1
+                        )
+                        status[actual_key] = max(
+                            0, int(status.get(actual_key, 0)) - 1
+                        )
+                    sibling_count = (
+                        int(status.get("actual_buy_layers", 0))
+                        + int(status.get("actual_sell_layers", 0))
+                    )
+                    status.update({
+                        "state": "HEALTHY_DEFERRED" if sibling_count else "MAKER_WAIT",
+                        "reason": "maker_layers_waiting_for_safe_book",
+                    })
+                else:
+                    # A stale callback from an obsolete generation must never
+                    # resurrect that layer or disturb the current topology.
+                    self._record_runtime_event(
+                        "grid_maker_stale_rejection_ignored", pair=pair,
+                        order_id=str(event.order_id), reason=reason,
+                        intent_generation=intent.get("refresh_generation"),
+                        current_generation=current_generation,
+                    )
+            else:
+                # Unknown failures retain the established targeted full-pair
+                # recovery because the economic state cannot be reconstructed.
+                self._request_pair_order_refresh(pair, reason=reason)
         self._forget_order(event.order_id)
 
     def _owned_order_pair(self, order_id: str) -> str | None:
@@ -2306,6 +2826,14 @@ class LivePortfolioGrid(StrategyV2Base):
                         defaults.update({
                             key: value for key, value in raw.items() if key in defaults
                         })
+                    # Deferred Maker layers are persisted for audit/reporting,
+                    # but never replayed blindly after a process restart.  The
+                    # startup exchange reconciliation rebuilds them from the
+                    # current book and the current parameter generation.
+                    if defaults.get("maker_deferred_layers"):
+                        defaults["maker_deferred_layers"] = []
+                        defaults["state"] = "UNKNOWN"
+                        defaults["reason"] = "restart_requires_current_book_rebuild"
                     normalized_status[pair] = defaults
                 self.order_build_status = normalized_status
             self.runtime_events = [

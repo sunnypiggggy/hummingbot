@@ -1358,7 +1358,9 @@ class UnifiedTelegramReporting:
             order_build_healthy = order_build_state in {
                 "HEALTHY", "EXPECTED_EMPTY", "INTENTIONAL_IDLE",
                 "REFRESH_REQUESTED", "CANCEL_PENDING", "REBUILDING",
+                "HEALTHY_DEFERRED", "MAKER_WAIT",
             }
+            deferred_layers = list(order_build.get("maker_deferred_layers") or [])
             mechanisms = state.get("mechanisms", {})
             technical_contract = gate.get("pairs", {}).get(pair, {})
             runtime_technical = runtime.get("technical_buy_gate", {}).get(
@@ -1424,7 +1426,10 @@ class UnifiedTelegramReporting:
                     "order_execution_gate",
                     state=order_build_state,
                     buy_enabled=True, sell_enabled=True,
-                    health="HEALTHY" if order_build_healthy else "FAILED",
+                    health=(
+                        "DEGRADED" if order_build_state == "MAKER_WAIT"
+                        else "HEALTHY" if order_build_healthy else "FAILED"
+                    ),
                     reason=str(order_build.get("reason") or "runtime_order_status_unavailable"),
                     source="grid_runtime",
                 ),
@@ -1474,6 +1479,14 @@ class UnifiedTelegramReporting:
                     ),
                     "order_build_state": order_build_state,
                     "order_build_reason": order_build.get("reason"),
+                    "maker_deferred_layers": len(deferred_layers),
+                    "maker_rejection_count": order_build.get("maker_rejection_count", 0),
+                    "maker_topology_refresh_count": order_build.get(
+                        "maker_topology_refresh_count", 0
+                    ),
+                    "maker_longest_recovery_seconds": order_build.get(
+                        "maker_longest_recovery_seconds", 0
+                    ),
                 },
                 "order_build_status": order_build,
                 "runtime_code": {

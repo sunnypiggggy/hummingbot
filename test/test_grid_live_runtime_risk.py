@@ -6,7 +6,7 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from types import SimpleNamespace
 
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -42,14 +42,29 @@ class Connector:
             "BTC": Decimal("1"),
             "ETH": Decimal("10"),
         }
+        self.books = {
+            "BTC-FDUSD": {
+                PriceType.BestBid: Decimal("71499"),
+                PriceType.BestAsk: Decimal("71501"),
+                PriceType.MidPrice: Decimal("71500"),
+            },
+            "ETH-FDUSD": {
+                PriceType.BestBid: Decimal("2099"),
+                PriceType.BestAsk: Decimal("2101"),
+                PriceType.MidPrice: Decimal("2100"),
+            },
+        }
 
     def get_available_balance(self, asset):
         return self.available.get(asset, Decimal("0"))
 
+    def get_price_by_type(self, pair, price_type):
+        return self.books[pair][price_type]
+
 
 class GridLiveRuntimeRiskTest(unittest.TestCase):
-    def test_runtime_schema_migration_accepts_every_persisted_version_through_v10(self):
-        self.assertTrue(set(range(2, 11)).issubset(SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS))
+    def test_runtime_schema_migration_accepts_every_persisted_version_through_v12(self):
+        self.assertTrue(set(range(2, 13)).issubset(SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS))
 
     def strategy(self):
         strategy = LivePortfolioGrid.__new__(LivePortfolioGrid)
@@ -94,6 +109,7 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         }
         strategy.buy_order_ids = set()
         strategy.sell_order_ids = set()
+        strategy.ordinary_order_intents = {}
         strategy.first_cycle_failure_at = None
         strategy.pending_flatten = set()
         strategy.portfolio_tripped = False
@@ -229,6 +245,11 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy = self.strategy()
         pair = "ETH-FDUSD"
         price = Decimal("2418.22")
+        strategy.connector.books[pair] = {
+            PriceType.BestBid: Decimal("2418.21"),
+            PriceType.BestAsk: Decimal("2418.23"),
+            PriceType.MidPrice: price,
+        }
         strategy.grid_states[pair] = strategy._new_grid(pair, price)
         strategy._build_buy_orders = lambda *args, **kwargs: []
         strategy._build_sell_orders = lambda *args, **kwargs: [
@@ -393,11 +414,25 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             for row in strategy.runtime_events
         ))
 
-    def test_limit_maker_rejection_immediately_refreshes_only_owned_pair(self):
+    def test_limit_maker_rejection_defers_only_failed_layer_and_preserves_siblings(self):
         strategy = self.strategy()
         order_id = "btc-maker-crossed-book"
+        sibling_id = "btc-maker-safe-sibling"
         strategy.buy_order_ids.add(order_id)
-        strategy.ledgers["BTC-FDUSD"].open_order_ids.add(order_id)
+        strategy.buy_order_ids.add(sibling_id)
+        strategy.ledgers["BTC-FDUSD"].open_order_ids.update({order_id, sibling_id})
+        status = strategy.order_build_status["BTC-FDUSD"]
+        status.update({
+            "state": "HEALTHY", "expected_buy_layers": 2,
+            "actual_buy_layers": 2, "refresh_generation": 7,
+        })
+        strategy.ordinary_order_intents[order_id] = {
+            "pair": "BTC-FDUSD", "side": "BUY",
+            "original_price": "80563.87", "amount": "0.00013",
+            "parameter_sha256": "test", "refresh_generation": 7,
+            "first_deferred_at": None, "episode_id": None,
+            "already_notified": False,
+        }
 
         strategy.did_fail_order(MarketOrderFailureEvent(
             timestamp=1_000.0,
@@ -409,12 +444,226 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
 
         btc = strategy.order_build_status["BTC-FDUSD"]
         eth = strategy.order_build_status["ETH-FDUSD"]
-        self.assertEqual("REFRESH_REQUESTED", btc["state"])
-        self.assertEqual("limit_maker_would_take", btc["reason"])
+        self.assertEqual("HEALTHY_DEFERRED", btc["state"])
+        self.assertEqual("maker_layers_waiting_for_safe_book", btc["reason"])
         self.assertEqual(order_id, btc["last_failed_order_id"])
+        self.assertEqual(1, len(btc["maker_deferred_layers"]))
+        self.assertEqual("80563.87", btc["maker_deferred_layers"][0]["original_price"])
+        self.assertEqual(1, btc["expected_buy_layers"])
         self.assertEqual("UNKNOWN", eth["state"])
         self.assertNotIn(order_id, strategy.buy_order_ids)
         self.assertNotIn(order_id, strategy.ledgers["BTC-FDUSD"].open_order_ids)
+        self.assertIn(sibling_id, strategy.buy_order_ids)
+        self.assertIn(sibling_id, strategy.ledgers["BTC-FDUSD"].open_order_ids)
+        self.assertFalse(any(
+            row["event"] == "grid_pair_refresh_delayed"
+            for row in strategy.runtime_events
+        ))
+
+    def test_preflight_defers_crossed_layer_but_submits_other_maker_layers(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        strategy.connector.books[pair] = {
+            PriceType.BestBid: Decimal("80563.86"),
+            PriceType.BestAsk: Decimal("80563.87"),
+            PriceType.MidPrice: Decimal("80563.865"),
+        }
+        strategy.grid_states[pair] = GridState(
+            lower=Decimal("78000"), upper=Decimal("83000"),
+            levels=[Decimal("79000"), Decimal("80000"), Decimal("80563.87"), Decimal("82000")],
+            last_move_ts=1000.0,
+        )
+        strategy._build_buy_orders = lambda *args, **kwargs: [
+            (Decimal("79000"), Decimal("0.00013")),
+            (Decimal("80000"), Decimal("0.00013")),
+            (Decimal("80563.87"), Decimal("0.00013")),
+        ]
+        strategy._build_sell_orders = lambda *args, **kwargs: []
+        submitted = []
+        strategy.buy = lambda exchange, trading_pair, amount, order_type, order_price: (
+            submitted.append(order_price) or f"buy-{order_price}"
+        )
+        strategy.sell = lambda *args, **kwargs: self.fail("unexpected sell")
+
+        strategy._place_pair_grid(pair, Decimal("80564"), Decimal("100"))
+
+        self.assertEqual([Decimal("79000"), Decimal("80000")], submitted)
+        status = strategy.order_build_status[pair]
+        self.assertEqual("HEALTHY_DEFERRED", status["state"])
+        self.assertEqual(1, len(status["maker_deferred_layers"]))
+        self.assertEqual("80563.87", status["maker_deferred_layers"][0]["original_price"])
+        self.assertEqual(2, status["actual_buy_layers"])
+
+    def test_deferred_layer_retries_at_original_price_and_recovers_when_active(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        status = strategy.order_build_status[pair]
+        status["refresh_generation"] = 3
+        layer = strategy._defer_maker_layer(
+            pair, "BUY", Decimal("80563.87"), Decimal("0.00013"),
+            generation=3, reason="limit_maker_would_take",
+        )
+        strategy.connector.trading_rules = {
+            pair: SimpleNamespace(
+                min_notional_size=Decimal("10"),
+                min_base_amount_increment=Decimal("0.00001"),
+                min_order_size=Decimal("0.00001"),
+            )
+        }
+        strategy.connector.quantize_order_amount = lambda _, amount: Decimal(amount)
+        strategy.connector.quantize_order_price = lambda _, price: Decimal(price)
+        strategy.connector.books[pair] = {
+            PriceType.BestBid: Decimal("80560"),
+            PriceType.BestAsk: Decimal("80570"),
+            PriceType.MidPrice: Decimal("80565"),
+        }
+        submitted = []
+        strategy.buy = lambda exchange, trading_pair, amount, order_type, order_price: (
+            submitted.append((order_price, amount)) or "retry-original-layer"
+        )
+        strategy._set_current_timestamp(float(layer["next_retry_at"]))
+
+        self.assertTrue(strategy._advance_maker_deferred_layers([]))
+        self.assertEqual([(Decimal("80563.87"), Decimal("0.00013"))], submitted)
+        self.assertEqual(
+            "retry-original-layer",
+            status["maker_deferred_layers"][0]["pending_order_id"],
+        )
+
+        strategy._set_current_timestamp(strategy.current_timestamp + 1)
+        self.assertTrue(strategy._advance_maker_deferred_layers([
+            Order("retry-original-layer", pair),
+        ]))
+        self.assertEqual([], status["maker_deferred_layers"])
+        self.assertEqual("HEALTHY", status["state"])
+        recovered = [
+            row for row in strategy.runtime_events
+            if row["event"] == "grid_maker_layer_recovered"
+        ]
+        self.assertEqual(1, len(recovered))
+        self.assertLess(recovered[0]["duration_seconds"], 10)
+
+    def test_deferred_layer_triggers_one_topology_refresh_after_thirty_seconds(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        status = strategy.order_build_status[pair]
+        status["refresh_generation"] = 4
+        layer = strategy._defer_maker_layer(
+            pair, "BUY", Decimal("80563.87"), Decimal("0.00013"),
+            generation=4, reason="limit_maker_would_take",
+        )
+        strategy._set_current_timestamp(
+            float(layer["first_deferred_at"]) + 30.0
+        )
+
+        self.assertTrue(strategy._advance_maker_deferred_layers([]))
+        self.assertEqual("REFRESH_REQUESTED", status["state"])
+        self.assertEqual(1, status["maker_topology_refresh_count"])
+        self.assertEqual([], status["maker_deferred_layers"])
+        self.assertEqual(1, len([
+            row for row in strategy.runtime_events
+            if row["event"] == "grid_maker_topology_refreshed"
+        ]))
+
+    def test_incident_replay_four_async_rejections_keep_eight_sibling_orders(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        status = strategy.order_build_status[pair]
+        status.update({
+            "state": "HEALTHY", "expected_buy_layers": 9,
+            "actual_buy_layers": 9, "refresh_generation": 8,
+        })
+        siblings = {f"btc-safe-{index}" for index in range(8)}
+        rejected_id = "btc-cross-0"
+        strategy.buy_order_ids.update(siblings | {rejected_id})
+        strategy.ledgers[pair].open_order_ids.update(siblings | {rejected_id})
+        strategy.ordinary_order_intents[rejected_id] = {
+            "pair": pair, "side": "BUY", "original_price": "80563.87",
+            "amount": "0.00013", "parameter_sha256": "test",
+            "refresh_generation": 8, "first_deferred_at": None,
+            "episode_id": None, "already_notified": False,
+        }
+        strategy.connector.trading_rules = {
+            pair: SimpleNamespace(
+                min_notional_size=Decimal("10"),
+                min_base_amount_increment=Decimal("0.00001"),
+                min_order_size=Decimal("0.00001"),
+            )
+        }
+        strategy.connector.quantize_order_amount = lambda _, amount: Decimal(amount)
+        strategy.connector.quantize_order_price = lambda _, price: Decimal(price)
+        strategy.connector.books[pair] = {
+            PriceType.BestBid: Decimal("80560"),
+            PriceType.BestAsk: Decimal("80570"),
+            PriceType.MidPrice: Decimal("80565"),
+        }
+        submitted_ids = iter(["btc-cross-1", "btc-cross-2", "btc-cross-3"])
+        strategy.buy = lambda *args, **kwargs: next(submitted_ids)
+
+        for attempt in range(4):
+            strategy.did_fail_order(MarketOrderFailureEvent(
+                timestamp=strategy.current_timestamp,
+                order_id=rejected_id,
+                order_type=OrderType.LIMIT_MAKER,
+                error_message="Order would immediately match and take.",
+                error_type="-2010",
+            ))
+            self.assertTrue(siblings.issubset(strategy.buy_order_ids))
+            self.assertEqual(8, status["expected_buy_layers"])
+            self.assertNotEqual("REFRESH_REQUESTED", status["state"])
+            if attempt < 3:
+                layer = status["maker_deferred_layers"][0]
+                strategy._set_current_timestamp(float(layer["next_retry_at"]))
+                strategy._advance_maker_deferred_layers([
+                    Order(value, pair) for value in siblings
+                ])
+                rejected_id = str(status["maker_deferred_layers"][0]["pending_order_id"])
+
+        self.assertEqual(1, len(status["maker_deferred_layers"]))
+        self.assertEqual(1, len([
+            row for row in strategy.runtime_events
+            if row["event"] == "grid_maker_layer_deferred"
+        ]))
+        self.assertEqual(0, len([
+            row for row in strategy.runtime_events
+            if row["event"] == "grid_maker_topology_refreshed"
+        ]))
+
+    def test_missing_book_waits_and_retries_without_parameter_restriction(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        strategy.connector.get_price_by_type = lambda *_args: None
+
+        remaining = strategy._place_pair_grid(
+            pair, Decimal("71532"), Decimal("100"),
+        )
+
+        status = strategy.order_build_status[pair]
+        self.assertEqual(Decimal("100"), remaining)
+        self.assertEqual("MAKER_WAIT", status["state"])
+        self.assertEqual("maker_book_unavailable", status["reason"])
+        self.assertNotIn(pair, strategy.parameter_blocked_pairs)
+        strategy._set_current_timestamp(float(status["maker_book_next_retry_at"]))
+        self.assertTrue(strategy._advance_maker_deferred_layers([]))
+        self.assertEqual(0.0, strategy.next_refresh)
+
+    def test_risk_off_invalidates_all_deferred_layers_without_submitting(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        status = strategy.order_build_status[pair]
+        status["refresh_generation"] = 5
+        strategy._defer_maker_layer(
+            pair, "SELL", Decimal("82000"), Decimal("0.00013"),
+            generation=5, reason="limit_maker_would_take",
+        )
+        strategy.technical_buy_enabled_by_pair[pair] = False
+        submitted = []
+        strategy.sell = lambda *args, **kwargs: submitted.append(args)
+
+        strategy._clear_ineligible_maker_deferred_layers()
+
+        self.assertEqual([], status["maker_deferred_layers"])
+        self.assertEqual([], submitted)
 
     def test_unexpected_gap_waits_fifteen_seconds_before_requesting_refresh(self):
         strategy = self.strategy()
@@ -664,6 +913,11 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             lower=Decimal("1900"), upper=Decimal("2100"),
             levels=[Decimal("1900"), Decimal("2100")],
         )}
+        strategy.connector.books["ETH-FDUSD"] = {
+            PriceType.BestBid: Decimal("1999"),
+            PriceType.BestAsk: Decimal("2001"),
+            PriceType.MidPrice: Decimal("2000"),
+        }
         strategy.connector.available["FDUSD"] = Decimal("6")
         strategy.connector.available["ETH"] = Decimal("0.01")
         buys, sells = [], []
@@ -807,6 +1061,11 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
                 levels=[Decimal("39000"), Decimal("41000")],
             )
         }
+        strategy.connector.books["BTC-FDUSD"] = {
+            PriceType.BestBid: Decimal("39999"),
+            PriceType.BestAsk: Decimal("40001"),
+            PriceType.MidPrice: Decimal("40000"),
+        }
         strategy.buy = lambda *args, **kwargs: "buy"
         submitted = []
         strategy.sell = lambda exchange, pair, amount, order_type, price: (
@@ -832,6 +1091,11 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             lower=Decimal("39000"), upper=Decimal("41000"),
             levels=[Decimal("39000"), Decimal("41000")],
         )}
+        strategy.connector.books["BTC-FDUSD"] = {
+            PriceType.BestBid: Decimal("39999"),
+            PriceType.BestAsk: Decimal("40001"),
+            PriceType.MidPrice: Decimal("40000"),
+        }
         submitted = []
         strategy.buy = lambda exchange, pair, amount, order_type, price: (
             submitted.append(amount * price) or "buy"
@@ -851,6 +1115,11 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             lower=Decimal("37000"), upper=Decimal("41000"),
             levels=[Decimal("37000"), Decimal("38000"), Decimal("39000"), Decimal("41000")],
         )}
+        strategy.connector.books["BTC-FDUSD"] = {
+            PriceType.BestBid: Decimal("39999"),
+            PriceType.BestAsk: Decimal("40001"),
+            PriceType.MidPrice: Decimal("40000"),
+        }
         submitted = []
         strategy.buy = lambda exchange, pair, amount, order_type, price: (
             submitted.append((price, amount * price)) or "buy"
@@ -1086,6 +1355,11 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             lower=Decimal("39000"), upper=Decimal("41000"),
             levels=[Decimal("39000"), Decimal("41000")],
         )}
+        strategy.connector.books["BTC-FDUSD"] = {
+            PriceType.BestBid: Decimal("39999"),
+            PriceType.BestAsk: Decimal("40001"),
+            PriceType.MidPrice: Decimal("40000"),
+        }
         submitted = []
         strategy.buy = lambda exchange, pair, amount, order_type, price: (
             submitted.append(amount * price) or "buy"

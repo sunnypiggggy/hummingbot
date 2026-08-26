@@ -66,12 +66,14 @@ except ModuleNotFoundError:
     )
 try:
     from telegram_notifications import (
-        RuntimeErrorChannel, append_event, build_event, runtime_error_lines,
+        RuntimeErrorChannel, append_event, build_event,
+        is_structured_grid_maker_rejection, runtime_error_lines,
         sanitize_runtime_error,
     )
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import (
-        RuntimeErrorChannel, append_event, build_event, runtime_error_lines,
+        RuntimeErrorChannel, append_event, build_event,
+        is_structured_grid_maker_rejection, runtime_error_lines,
         sanitize_runtime_error,
     )
 
@@ -568,7 +570,10 @@ class Guard:
         temporary = self.runtime_log_cursor_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.runtime_log_cursors, indent=2), encoding="utf-8")
         temporary.replace(self.runtime_log_cursor_path)
-        errors = runtime_error_lines(lines)
+        errors = [
+            value for value in runtime_error_lines(lines)
+            if not is_structured_grid_maker_rejection(value)
+        ]
         component = f"container_log:{name}"
         if errors:
             self.runtime_errors.failure(
