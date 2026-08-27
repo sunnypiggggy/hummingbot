@@ -19,8 +19,9 @@ import yaml
 
 from grid_live_common import (
     CONFIRMATION,
-    FDUSD_BUDGET,
     PORTFOLIOS,
+    active_portfolio_pairs,
+    budget_for_live_pairs,
     build_live_config,
     extract_balances,
     validate_live_config,
@@ -100,8 +101,10 @@ def symbol_plan(pair: str) -> dict:
     info_response.raise_for_status()
     depth_response.raise_for_status()
     info = info_response.json()["symbols"][0]
+    pairs = active_portfolio_pairs(PORTFOLIOS["FDUSD"])
+    budget = budget_for_live_pairs("FDUSD", pairs)
     average, slippage, estimated_base = weighted_ask(
-        depth_response.json()["asks"], FDUSD_BUDGET.side_budget
+        depth_response.json()["asks"], budget.side_budget
     )
     if slippage > MAX_BOOTSTRAP_SLIPPAGE:
         raise RuntimeError(f"{pair} estimated bootstrap slippage {slippage:.4%} exceeds 0.1%.")
@@ -170,8 +173,9 @@ def load_bootstrap_receipt(path: Path, profile: str) -> tuple[dict, str]:
     if payload.get("profile") != profile:
         raise ValueError("bootstrap receipt belongs to another profile")
     orders = payload.get("orders", {})
-    if set(orders) != set(PORTFOLIOS["FDUSD"].pairs):
-        raise ValueError("bootstrap receipt must contain exactly both FDUSD pairs")
+    expected_pairs = active_portfolio_pairs(PORTFOLIOS["FDUSD"])
+    if set(orders) != set(expected_pairs):
+        raise ValueError(f"bootstrap receipt must contain exactly {expected_pairs}")
     for pair, order in orders.items():
         executed = Decimal(str(order.get("executed_base", "0")))
         quote = Decimal(str(order.get("quote_spent", "0")))
@@ -218,6 +222,8 @@ def main() -> int:
         override_confirmation=args.no_go_confirm,
     )
     profile = PORTFOLIOS["FDUSD"].profile_name
+    pairs = active_portfolio_pairs(PORTFOLIOS["FDUSD"])
+    budget = budget_for_live_pairs("FDUSD", pairs)
     receipt = None
     receipt_sha256 = None
     if args.bootstrap_receipt is not None:
@@ -258,9 +264,9 @@ def main() -> int:
         (Decimal(str(order["quote_spent"])) for order in receipt["orders"].values()),
         Decimal("0"),
     ) if receipt else Decimal("0")
-    if balances_before.get("FDUSD", Decimal("0")) + acquired_quote < FDUSD_BUDGET.capital_limit:
+    if balances_before.get("FDUSD", Decimal("0")) + acquired_quote < budget.capital_limit:
         raise RuntimeError(
-            f"The account has less than the required {FDUSD_BUDGET.capital_limit} FDUSD."
+            f"The account has less than the required {budget.capital_limit} FDUSD."
         )
 
     authorization = {
@@ -280,7 +286,7 @@ def main() -> int:
     bootstrap = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "profile": profile,
-        "quote_budget_per_pair": str(FDUSD_BUDGET.side_budget),
+        "quote_budget_per_pair": str(budget.side_budget),
         "orders": {},
         "completed": False,
         "bot_deployed": False,
@@ -289,7 +295,7 @@ def main() -> int:
     atomic_json(bootstrap_path, bootstrap)
 
     reservations: Dict[str, Decimal] = {}
-    plans = {pair: symbol_plan(pair) for pair in PORTFOLIOS["FDUSD"].pairs}
+    plans = {pair: symbol_plan(pair) for pair in pairs}
     prices: Dict[str, Decimal] = {}
     if receipt:
         for pair, order in receipt["orders"].items():
@@ -304,7 +310,7 @@ def main() -> int:
         if receipt:
             pass
         else:
-            for pair in PORTFOLIOS["FDUSD"].pairs:
+            for pair in pairs:
                 plan = plans[pair]
                 before_base = api.portfolio(profile).get(plan["base"], Decimal("0"))
                 response = api.market_buy(profile, pair, plan["amount"])
@@ -336,8 +342,7 @@ def main() -> int:
 
     maker_fee = Decimal(str(preflight["maker_fee"]))
     if not prices:
-        prices = {pair: Decimal(str(plans[pair]["average_ask"]))
-                  for pair in PORTFOLIOS["FDUSD"].pairs}
+        prices = {pair: Decimal(str(plans[pair]["average_ask"])) for pair in pairs}
     config = build_live_config(
         PORTFOLIOS["FDUSD"],
         prices,
@@ -347,15 +352,7 @@ def main() -> int:
         bootstrap_from_quote=True,
         bootstrap_completed=True,
     )
-    params = selection["parameters"]
     config.update({
-        "grid_range": float(Decimal(str(params["half_range"])) * Decimal("2")),
-        "grid_levels": int(params.get("levels") or config["grid_levels"]),
-        "take_profit": float(max(
-            Decimal(str(params["take_profit"])), maker_fee * Decimal("2") + Decimal("0.004")
-        )),
-        "move_threshold": float(params["move_threshold"]),
-        "min_grid_move_seconds": int(params["min_grid_move_seconds"]),
         "active_parameter_version": selection["parameter_version"],
         "technical_model_sha256": str(technical_gate["model_sha256"]),
         "technical_feature_sha256": str(technical_gate["feature_schema_sha256"]),
@@ -363,6 +360,17 @@ def main() -> int:
         # automatic market re-entry after reviewing the audit trail.
         "risk_auto_reentry_enabled": bool(args.authorize_auto_reentry),
     })
+    if int(selection.get("schema_version", 1)) == 1:
+        params = selection["parameters"]
+        config.update({
+            "grid_range": float(Decimal(str(params["half_range"])) * Decimal("2")),
+            "grid_levels": int(params.get("levels") or config["grid_levels"]),
+            "take_profit": float(max(
+                Decimal(str(params["take_profit"])), maker_fee * Decimal("2") + Decimal("0.004")
+            )),
+            "move_threshold": float(params["move_threshold"]),
+            "min_grid_move_seconds": int(params["min_grid_move_seconds"]),
+        })
     validate_live_config(config)
     scripts_dir = args.bots_path / "scripts"
     configs_dir = args.bots_path / "conf" / "scripts"
@@ -376,6 +384,8 @@ def main() -> int:
                  scripts_dir / "grid_macro_gate.py")
     shutil.copy2(Path(__file__).with_name("grid_xgboost_risk_gate.py"),
                  scripts_dir / "grid_xgboost_risk_gate.py")
+    shutil.copy2(Path(__file__).with_name("sol_grid_weekly_risk.py"),
+                 scripts_dir / "sol_grid_weekly_risk.py")
     shutil.copy2(Path(__file__).with_name("risk_recovery.py"),
                  scripts_dir / "risk_recovery.py")
     config_path = configs_dir / PORTFOLIOS["FDUSD"].config_name
@@ -392,7 +402,7 @@ def main() -> int:
         "reservations": {
             "FDUSD": {
                 "quote": str(
-                    FDUSD_BUDGET.capital_limit - FDUSD_BUDGET.side_budget * Decimal("2")
+                    budget.capital_limit - budget.side_budget * Decimal(len(pairs))
                 ),
                 "base": {
                     pair.split("-")[0]: str(amount)

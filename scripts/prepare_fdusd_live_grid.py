@@ -16,9 +16,9 @@ from typing import Any, Dict
 import requests
 
 from grid_live_common import (
-    FDUSD_RECOMMENDED_BALANCE,
-    FDUSD_BUDGET,
     PORTFOLIOS,
+    active_portfolio_pairs,
+    budget_for_live_pairs,
     extract_balances,
     validate_exchange_filters,
 )
@@ -76,7 +76,10 @@ def weighted_ask(asks: list[list[str]], quote_amount: Decimal) -> tuple[Decimal,
 def public_checks() -> dict:
     session = requests.Session()
     result = {}
-    for pair in PORTFOLIOS["FDUSD"].pairs:
+    portfolio = PORTFOLIOS["FDUSD"]
+    pairs = active_portfolio_pairs(portfolio)
+    budget = budget_for_live_pairs("FDUSD", pairs)
+    for pair in pairs:
         symbol = pair.replace("-", "")
         info = session.get(f"{BINANCE_API}/api/v3/exchangeInfo",
                            params={"symbol": symbol}, timeout=20)
@@ -85,9 +88,9 @@ def public_checks() -> dict:
         info.raise_for_status()
         depth.raise_for_status()
         symbol_info = info.json()["symbols"][0]
-        validate_exchange_filters(symbol_info, FDUSD_BUDGET.side_budget)
+        validate_exchange_filters(symbol_info, budget.side_budget)
         average, slippage, estimated_base = weighted_ask(
-            depth.json()["asks"], FDUSD_BUDGET.side_budget
+            depth.json()["asks"], budget.side_budget
         )
         result[pair] = {
             "average_ask": str(average),
@@ -111,6 +114,7 @@ def load_receipt(path: Path | None, name: str) -> dict:
 
 def validate_receipts(commission: dict, permissions: dict, test_order: dict) -> dict:
     profile = PORTFOLIOS["FDUSD"].profile_name
+    pairs = active_portfolio_pairs(PORTFOLIOS["FDUSD"])
     commission_ok = (
         commission.get("profile") == profile
         and Decimal(str(commission.get("maker_fee", "-1"))) >= 0
@@ -128,7 +132,7 @@ def validate_receipts(commission: dict, permissions: dict, test_order: dict) -> 
     )
     test_order_ok = (
         test_order.get("profile") == profile
-        and set(test_order.get("pairs", [])) == set(PORTFOLIOS["FDUSD"].pairs)
+        and set(test_order.get("pairs", [])) == set(pairs)
         and bool(test_order.get("passed"))
         and bool(test_order.get("no_fill"))
     )
@@ -151,6 +155,8 @@ def main() -> int:
     parser.add_argument("--test-order-receipt", type=Path)
     args = parser.parse_args()
     args.state_dir.mkdir(parents=True, exist_ok=True)
+    pairs = active_portfolio_pairs(PORTFOLIOS["FDUSD"])
+    budget = budget_for_live_pairs("FDUSD", pairs)
 
     validation = json.loads((args.validation_dir / "validation_result.json").read_text(encoding="utf-8"))
     quantitative_go = all(
@@ -169,7 +175,7 @@ def main() -> int:
         balances = extract_balances(api.portfolio(profile))
         account_status["fdusd_balance"] = str(balances.get("FDUSD", Decimal("0")))
         account_status["balance_passed"] = (
-            balances.get("FDUSD", Decimal("0")) >= FDUSD_BUDGET.capital_limit
+            balances.get("FDUSD", Decimal("0")) >= budget.capital_limit
         )
 
     commission = load_receipt(args.commission_receipt, "commission")
@@ -197,10 +203,10 @@ def main() -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "fetched_at": int(time.time()),
         "profile": profile,
-        "pairs": list(PORTFOLIOS["FDUSD"].pairs),
-        "required_fdusd": str(FDUSD_BUDGET.capital_limit),
-        "recommended_fdusd": str(FDUSD_RECOMMENDED_BALANCE),
-        "bootstrap_quote_per_pair": str(FDUSD_BUDGET.side_budget),
+        "pairs": list(pairs),
+        "required_fdusd": str(budget.capital_limit),
+        "recommended_fdusd": str(budget.recommended_balance),
+        "bootstrap_quote_per_pair": str(budget.side_budget),
         "maximum_bootstrap_slippage": str(MAX_BOOTSTRAP_SLIPPAGE),
         "public_checks": public,
         "account": account_status,

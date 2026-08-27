@@ -202,7 +202,7 @@ class GridGuardShadowTest(unittest.TestCase):
             guard.inventory_ledger = Mock()
             guard.inventory_ledger.status_path = Path(directory) / "account_inventory_status.json"
             guard.inventory_ledger.status_path.write_text(json.dumps({
-                "schema": "account-inventory-status-v3",
+                "schema": "account-inventory-status-v4",
                 "generated_at": time.time(),
                 "healthy": False,
                 "sources_healthy": True,
@@ -302,7 +302,7 @@ class GridGuardShadowTest(unittest.TestCase):
             guard.inventory_ledger = Mock()
             guard.inventory_ledger.status_path = Path(directory) / "account_inventory_status.json"
             guard.inventory_ledger.status_path.write_text(json.dumps({
-                "schema": "account-inventory-status-v3",
+                "schema": "account-inventory-status-v4",
                 "generated_at": time.time() - 31,
                 "healthy": True,
                 "sources_healthy": True,
@@ -328,7 +328,7 @@ class GridGuardShadowTest(unittest.TestCase):
             guard.inventory_ledger = Mock()
             guard.inventory_ledger.status_path = Path(directory) / "account_inventory_status.json"
             guard.inventory_ledger.status_path.write_text(json.dumps({
-                "schema": "account-inventory-status-v3",
+                "schema": "account-inventory-status-v4",
                 "generated_at": time.time(),
                 "healthy": False,
                 "sources_healthy": False,

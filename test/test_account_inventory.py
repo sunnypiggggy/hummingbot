@@ -92,7 +92,7 @@ def test_ownership_does_not_double_count_adjustments_already_in_latest_net_base(
 
 def test_dca_approval_preflight_uses_current_unified_ownership():
     status = {
-        "schema": "account-inventory-status-v3",
+        "schema": "account-inventory-status-v4",
         "generated_at": 95,
         "sources_healthy": True,
         # Normal activity can make overall healthy false without invalidating

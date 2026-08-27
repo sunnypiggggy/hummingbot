@@ -8,6 +8,7 @@ COPY scripts/grid_live_common.py /app/grid_live_common.py
 COPY scripts/grid_macro_gate.py /app/grid_macro_gate.py
 COPY scripts/grid_technical_gate.py /app/grid_technical_gate.py
 COPY scripts/grid_xgboost_risk_gate.py /app/grid_xgboost_risk_gate.py
+COPY scripts/sol_grid_weekly_risk.py /app/sol_grid_weekly_risk.py
 COPY scripts/risk_recovery.py /app/risk_recovery.py
 COPY scripts/ethbtc_forced_exit_contract.py /app/ethbtc_forced_exit_contract.py
 COPY scripts/validate_grid_live.py /app/validate_grid_live.py

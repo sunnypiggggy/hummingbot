@@ -201,6 +201,12 @@ services:
       GRID_LIVE_MACRO_STATE_PATH: /workspace/macro/state.json
       GRID_LIVE_GATE_RECONCILE_SECONDS: "5"
       GRID_PAIR_PARAMETER_SCHEMA_V2_ENABLED: "${GRID_PAIR_PARAMETER_SCHEMA_V2_ENABLED:-true}"
+      # First SOL activation remains inert until evidence delivery plus an
+      # explicit profile-bound approval file.  Defaults preserve BTC/ETH only.
+      GRID_SOL_FDUSD_LIVE_ENABLED: "${GRID_SOL_FDUSD_LIVE_ENABLED:-false}"
+      GRID_SOL_FDUSD_PROFILE: "${GRID_SOL_FDUSD_PROFILE:-}"
+      GRID_SOL_INITIAL_APPROVAL_PATH: /workspace/state/sol_initial_approval.json
+      SOL_GRID_EVIDENCE_ROOT: /workspace/sol-weekly/backtest
       V22_WEEKLY_AUTO_UPDATE_ENABLED: "${V22_WEEKLY_AUTO_UPDATE_ENABLED:-true}"
       V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS: "${V22_WEEKLY_DEFAULT_APPROVAL_DELAY_SECONDS:-43200}"
       V22_WEEKLY_GENERATION_LEAD_SECONDS: "${V22_WEEKLY_GENERATION_LEAD_SECONDS:-57600}"
@@ -225,6 +231,7 @@ services:
       - ./dca-live-data:/workspace/dca-state:ro
       - ./release_packages/ethbtc-forced-exit:/workspace/releases
       - ./results/ethbtc_forced_exit_weekly:/workspace/weekly
+      - ./results/backtests/sol_fdusd_binance_ai_profiles_360d:/workspace/sol-weekly/backtest:ro
     depends_on:
       - hummingbot-api
     healthcheck:
@@ -297,6 +304,8 @@ services:
       GRID_V22_AUTHORIZATION_PATH: /workspace/state/ethbtc_forced_exit_authorization.json
       V22_RUNTIME_ROOT: /workspace/state/v22-runtime
       GRID_RISK_V22_WEEKLY_GATE_ENABLED: "${GRID_RISK_V22_WEEKLY_GATE_ENABLED:-true}"
+      GRID_SOL_FDUSD_LIVE_ENABLED: "${GRID_SOL_FDUSD_LIVE_ENABLED:-false}"
+      GRID_RISK_SOL_WEEKLY_GATE_ENABLED: "${GRID_RISK_SOL_WEEKLY_GATE_ENABLED:-false}"
       GRID_RISK_FOMC_GATE_ENABLED: "${GRID_RISK_FOMC_GATE_ENABLED:-true}"
       GRID_RISK_STRATEGY_LOSS_BREAKER_ENABLED: "${GRID_RISK_STRATEGY_LOSS_BREAKER_ENABLED:-true}"
       GRID_RISK_STRATEGY_DRAWDOWN_BREAKER_ENABLED: "${GRID_RISK_STRATEGY_DRAWDOWN_BREAKER_ENABLED:-true}"
@@ -408,6 +417,8 @@ services:
       GRID_LIVE_STATE_PATH: /workspace/grid
       ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
       GRID_PARAMETER_EVIDENCE_ROOT: /workspace/grid-parameter-evidence
+      SOL_GRID_EVIDENCE_ROOT: /workspace/sol-grid-evidence
+      GRID_SOL_FDUSD_LIVE_ENABLED: "${GRID_SOL_FDUSD_LIVE_ENABLED:-false}"
       MODEL_APPROVAL_PUBLIC_ROOT: /workspace/model-approvals
       ACCOUNT_INVENTORY_LEDGER_PATH: /workspace/account-inventory
       # Approval requests and their PNG jobs are picked up within one minute.
@@ -438,6 +449,7 @@ services:
       - ./release_packages/ethbtc-forced-exit:/workspace/releases:ro
       - ./results/ethbtc_forced_exit_weekly/approval_public:/workspace/model-approvals:ro
       - ./release_packages/ethbtc-forced-exit/parameter_evidence/grid_btc_medium_eth_long_v1:/workspace/grid-parameter-evidence:ro
+      - ./results/backtests/sol_fdusd_binance_ai_profiles_360d:/workspace/sol-grid-evidence:ro
       - ./account-inventory-data:/workspace/account-inventory:ro
     secrets:
       - telegram_notify_bot_token

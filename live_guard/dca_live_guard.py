@@ -43,6 +43,7 @@ from ethbtc_forced_exit_contract import (
 )
 try:
     from account_inventory import (
+        SCHEMA as INVENTORY_STATUS_SCHEMA,
         UnifiedInventoryLedger, api_key_fingerprint, canonical_sha256,
         liquidation_identity, ownership_from_documents,
     )
@@ -52,6 +53,7 @@ try:
     )
 except ModuleNotFoundError:
     from live_guard.account_inventory import (
+        SCHEMA as INVENTORY_STATUS_SCHEMA,
         UnifiedInventoryLedger, api_key_fingerprint, canonical_sha256,
         liquidation_identity, ownership_from_documents,
     )
@@ -715,7 +717,7 @@ class Guard:
         fresh = generated_at > 0 and now - generated_at < 30
         contract_healthy = bool(
             fresh
-            and status.get("schema") == "account-inventory-status-v3"
+            and status.get("schema") == INVENTORY_STATUS_SCHEMA
             and status.get("sources_healthy") is True
             and bool(status.get("account_fingerprint"))
             and bool(status.get("evidence_sha256"))
@@ -1151,7 +1153,10 @@ class Guard:
             raise RuntimeError("shared inventory reconciliation requires emergency exchange")
         self._flush_inventory_events()
         ownership, evidence, sources_healthy = self._inventory_evidence()
-        pairs = ("BTC-USDT", "ETH-USDT", "BTC-FDUSD", "ETH-FDUSD")
+        sol_live = os.getenv("GRID_SOL_FDUSD_LIVE_ENABLED", "false").lower() == "true"
+        pairs = ("BTC-USDT", "ETH-USDT", "BTC-FDUSD", "ETH-FDUSD") + (
+            ("SOL-USDT", "SOL-FDUSD") if sol_live else ()
+        )
         order_counts = {
             pair: len(self.emergency_exchange.open_orders(pair)) for pair in pairs
         }
@@ -1211,6 +1216,20 @@ class Guard:
                         correlation_id=episode_id, details=row,
                     )
                     self.inventory_ledger.mark_deficit_notified(asset)
+                continue
+            if asset == "SOL" and not sol_live:
+                # Compatibility deployment: an account may already contain SOL.
+                # Until the explicit three-pair activation transaction assigns
+                # Grid ownership, never classify or liquidate it as unowned.
+                row.update({
+                    "inventory_phase": "QUARANTINED_PRE_ACTIVATION",
+                    "confirmation_eligible": False,
+                    "confirmation_block_reason": "sol_grid_not_live",
+                    "tradable_quantity": "0",
+                    "estimated_notional": "0",
+                    "minimum_notional": "0",
+                    "tradable": False,
+                })
                 continue
             try:
                 market = self._inventory_market_diagnostics(asset, row)

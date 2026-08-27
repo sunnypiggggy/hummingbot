@@ -266,10 +266,47 @@ def render_360_card(root: Path, strategy: str, pair: str, symbol: str,
 def build_parameter_attachments(event: Mapping[str, Any], *, release_root: Path,
                                 output_root: Path) -> list[dict[str, Any]]:
     request = str(event.get("details", {}).get("report_request", ""))
-    if request not in {"v22_png_windows", "v22_360d", "grid_360d"}:
+    if request not in {"v22_png_windows", "v22_360d", "grid_360d", "sol_grid_360d"}:
         return []
     directory = output_root / str(event["event_id"])
     directory.mkdir(parents=True, exist_ok=True)
+    if request == "sol_grid_360d":
+        evidence_root = Path(str(
+            event.get("details", {}).get("evidence_root")
+            or os.getenv("SOL_GRID_EVIDENCE_ROOT", "/workspace/sol-grid-evidence")
+        ))
+        manifest_path = evidence_root / "sol_grid_evidence_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"SOL PNG evidence manifest is missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != "sol-grid-mobile-evidence-v1":
+            raise ValueError("invalid SOL Grid PNG evidence schema")
+        expected_identity = str(event.get("release_sha256") or event.get("model_sha256") or "")
+        if not expected_identity or expected_identity not in {
+            str(manifest.get("identity_sha256", "")), str(manifest.get("model_sha256", "")),
+        }:
+            raise ValueError("SOL PNG evidence is not bound to the requested candidate")
+        images = list(manifest.get("images", []))
+        if manifest.get("evidence_complete") is not True or len(images) != 3:
+            raise ValueError("SOL update requires three complete PNG windows")
+        labels = {
+            "360d": "过去360天", "2026_jan_feb": "2026年1–2月重点窗口",
+            "2026_may_june": "2026年5–6月重点窗口",
+        }
+        photos = []
+        for row in images:
+            image_path = evidence_root / str(row["path"])
+            if not image_path.is_file() or sha256_file(image_path) != str(row["sha256"]):
+                raise ValueError(f"SOL PNG evidence hash mismatch: {image_path.name}")
+            with Image.open(image_path) as image:
+                if image.size != (WIDTH, HEIGHT):
+                    raise ValueError(f"SOL PNG is not mobile 1440x2400: {image_path.name}")
+            photos.append({
+                "path": str(image_path), "kind": "photo", "sha256": str(row["sha256"]),
+                "caption": f"GRID SOL-FDUSD｜{labels[str(row['window'])]}｜短期/中短期横盘对照",
+                "evidence_complete": True,
+            })
+        return photos
     if request == "grid_360d":
         evidence_root = Path(str(
             event.get("details", {}).get("evidence_root")

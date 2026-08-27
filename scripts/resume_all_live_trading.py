@@ -26,7 +26,7 @@ DCA_BOTS = ("dca-live-btcusdt-200", "dca-live-ethusdt-200")
 PAIRS = ("BTC-FDUSD", "ETH-FDUSD")
 EXPECTED_GRID_REASON = "recoverable PORTFOLIO exit remained incomplete for 4.4s"
 EXPECTED_DCA_REASON = "monitor unavailable for 60s"
-INVENTORY_STATUS_SCHEMA = "account-inventory-status-v3"
+INVENTORY_STATUS_SCHEMA = "account-inventory-status-v4"
 
 
 def load(path: Path) -> dict[str, Any]:

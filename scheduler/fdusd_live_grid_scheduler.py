@@ -26,7 +26,11 @@ from fdusd_live_grid_optimizer import select_candidate, weekly_cutoff
 from grid_live_common import (
     ACTIVE_SELECTION_SCHEMA_VERSION,
     BINANCE_AI_GRID_PROFILES,
+    FDUSD_SOL_PAIRS,
     PORTFOLIOS,
+    SOL_ACTIVE_SELECTION_SCHEMA_VERSION,
+    active_portfolio_pairs,
+    fdusd_sol_live_enabled,
     build_live_config,
     effective_take_profit,
 )
@@ -57,6 +61,12 @@ class Scheduler:
         self.evidence_receipt_root = Path(os.getenv(
             "PARAMETER_EVIDENCE_RECEIPT_ROOT",
             "/workspace/dca-state/telegram/evidence_receipts",
+        ))
+        self.sol_evidence_root = Path(os.getenv(
+            "SOL_GRID_EVIDENCE_ROOT", "/workspace/sol-weekly/backtest",
+        ))
+        self.sol_initial_approval_path = Path(os.getenv(
+            "GRID_SOL_INITIAL_APPROVAL_PATH", "/workspace/state/sol_initial_approval.json",
         ))
         self.canonical_config = self.root / PORTFOLIOS["FDUSD"].config_name
         self.macro_source = Path(
@@ -171,7 +181,7 @@ class Scheduler:
         train_start = train_end - lookback_days * 86400
         candles = {
             pair: load_candles(pair, train_start, train_end, self.cache, allow_download=True)
-            for pair in PORTFOLIOS["FDUSD"].pairs
+            for pair in active_portfolio_pairs(PORTFOLIOS["FDUSD"])
         }
         selected, evaluations = select_candidate(candles, maker_fee, taker_fee=taker_fee,
                                                  require_eligible=False)
@@ -189,7 +199,7 @@ class Scheduler:
                 "start_ts": train_start,
                 "end_ts": train_end,
             },
-            "trading_pairs": list(PORTFOLIOS["FDUSD"].pairs),
+            "trading_pairs": list(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
             "maker_fee": maker_fee,
             "taker_fee": taker_fee,
             "parameters": {
@@ -212,7 +222,7 @@ class Scheduler:
             append_event(self.notification_path, build_event(
                 source="grid-live-fdusd-scheduler", strategy="grid",
                 bot=PORTFOLIOS["FDUSD"].bot_name,
-                pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                pair=",".join(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
                 mechanism="parameter_update", transition="PARAMETER_RETAINED",
                 reason="无合格参数，维持旧参数", severity="warning",
                 action="keep_previous_parameters", parameter_sha256=selection_hash,
@@ -251,7 +261,7 @@ class Scheduler:
                 event = build_event(
                     source="grid-live-fdusd-scheduler", strategy="grid",
                     bot=PORTFOLIOS["FDUSD"].bot_name,
-                    pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                    pair=",".join(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
                     mechanism="parameter_update", transition="PARAMETER_APPROVAL_PENDING",
                     reason="Grid参数候选已通过计算门槛；等待6张回测PNG送达后再激活",
                     severity="warning", action="wait_for_telegram_evidence_delivery",
@@ -292,7 +302,7 @@ class Scheduler:
         append_event(self.notification_path, build_event(
             source="grid-live-fdusd-scheduler", strategy="grid",
             bot=PORTFOLIOS["FDUSD"].bot_name,
-            pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+            pair=",".join(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
             mechanism="parameter_update", transition="PARAMETER_ACTIVATED",
             reason=f"Grid 参数已发布到 {updated_instances} 个实例", severity="info",
             action="instances_reload_after_order_cancellation",
@@ -339,16 +349,31 @@ class Scheduler:
                 },
             }
 
+        sol_enabled = fdusd_sol_live_enabled()
+        pairs = active_portfolio_pairs(PORTFOLIOS["FDUSD"])
+        sol_profile = os.getenv("GRID_SOL_FDUSD_PROFILE", "").strip()
+        if sol_enabled and sol_profile not in {"short_sideways", "medium_sideways"}:
+            raise ValueError(
+                "GRID_SOL_FDUSD_PROFILE must be explicitly approved as short_sideways "
+                "or medium_sideways before SOL activation"
+            )
         selection = {
-            "schema_version": ACTIVE_SELECTION_SCHEMA_VERSION,
-            "parameter_version": "binance-ai-btc-medium-sideways-eth-long-volatility-v1",
+            "schema_version": (
+                SOL_ACTIVE_SELECTION_SCHEMA_VERSION
+                if sol_enabled else ACTIVE_SELECTION_SCHEMA_VERSION
+            ),
+            "parameter_version": (
+                f"binance-ai-btc-medium-eth-long-sol-{sol_profile}-v1"
+                if sol_enabled else
+                "binance-ai-btc-medium-sideways-eth-long-volatility-v1"
+            ),
             "generated_at": "2026-08-20T00:00:00+00:00",
             "valid_from": 0,
             "training_window": {
                 "mode": "fixed-approved-pair-profiles",
                 "source": "binance-ai-grid-presets-360d-safety-validation",
             },
-            "trading_pairs": list(PORTFOLIOS["FDUSD"].pairs),
+            "trading_pairs": list(pairs),
             "maker_fee": None,
             "taker_fee": None,
             "pair_parameters": {
@@ -364,7 +389,17 @@ class Scheduler:
                 "mechanism1_runtime_fallback": False,
             },
         }
-        if not self.pair_parameter_schema_v2_enabled:
+        if sol_enabled:
+            selection["sol_execution_enabled"] = True
+            selection["pair_parameters"]["SOL-FDUSD"] = serialise_profile(sol_profile)
+            selection["sol_technical_buy_gate"] = {
+                "schema": "sol-grid-weekly-risk-live-contract-v1",
+                "model_version": "sol-grid-weekly-risk-v1",
+                "execution_policy_version": "sol-risk-off-forced-exit-v1",
+                "pair_state_isolation": True,
+                "fallback_allowed": False,
+            }
+        if not self.pair_parameter_schema_v2_enabled and not sol_enabled:
             selection = {
                 "schema_version": 1,
                 "parameter_version": "fixed-grid-6pct-ethbtc-forced-exit-v22",
@@ -374,7 +409,7 @@ class Scheduler:
                     "mode": "fixed-approved-structure",
                     "source": "180d-parameter-search-2026-07-28",
                 },
-                "trading_pairs": list(PORTFOLIOS["FDUSD"].pairs),
+                "trading_pairs": list(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
                 "maker_fee": None,
                 "taker_fee": None,
                 "parameters": {
@@ -397,8 +432,15 @@ class Scheduler:
         current = self.read_json(self.canonical_selection, None)
         if current != selection:
             parameter_sha = canonical_sha256(selection)
+            sol_manifest = (
+                self.read_json(self.sol_evidence_root / "sol_grid_evidence_manifest.json", {}) or {}
+                if sol_enabled else {}
+            )
+            evidence_identity = (
+                str(sol_manifest.get("identity_sha256", "")) if sol_enabled else parameter_sha
+            )
             receipt = self.read_json(
-                self.evidence_receipt_root / f"{parameter_sha}.json", {}
+                self.evidence_receipt_root / f"{evidence_identity}.json", {}
             ) or {}
             unsigned_receipt = dict(receipt)
             receipt_hash = str(unsigned_receipt.pop("delivery_receipt_sha256", ""))
@@ -414,16 +456,54 @@ class Scheduler:
                     and receipt_hash == canonical_sha256(unsigned_receipt)
                 )
             )
-            if not evidence_delivered:
+            if sol_enabled:
+                evidence_delivered = (
+                    len(evidence_identity) == 64
+                    and sol_manifest.get("schema") == "sol-grid-mobile-evidence-v1"
+                    and sol_manifest.get("evidence_complete") is True
+                    and sol_manifest.get("activation_eligible") is True
+                    and (sol_manifest.get("hard_gates") or {}).get(
+                        "sol_account_fee_verified"
+                    ) is True
+                    and receipt.get("schema") == "telegram-evidence-delivery-receipt-v1"
+                    and receipt.get("identity_sha256") == evidence_identity
+                    and receipt.get("parameter_sha256") == parameter_sha
+                    and receipt.get("report_request") == "sol_grid_360d"
+                    and int(receipt.get("expected_photo_count", 0)) == 3
+                    and len(receipt.get("photo_sha256", [])) == 3
+                    and receipt_hash == canonical_sha256(unsigned_receipt)
+                )
+            approval = self.read_json(self.sol_initial_approval_path, {}) or {}
+            manual_approval = (
+                not sol_enabled
+                or (
+                    approval.get("schema") == "sol-grid-initial-approval-v1"
+                    and approval.get("approved") is True
+                    and approval.get("consumed") is not True
+                    and approval.get("profile") == sol_profile
+                    and approval.get("candidate_identity_sha256") == evidence_identity
+                    and approval.get("selection_sha256") == parameter_sha
+                )
+            )
+            if not evidence_delivered or not manual_approval:
                 saved = self.read_json(self.state_path, {}) or {}
                 if saved.get("pending_parameter_sha256") != parameter_sha:
                     event = build_event(
                         source="grid-live-fdusd-scheduler", strategy="grid",
                         bot=PORTFOLIOS["FDUSD"].bot_name,
-                        pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                        pair=",".join(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
                         mechanism="parameter_update", transition="PARAMETER_APPROVAL_PENDING",
-                        reason="Grid参数候选已准备；先发送6张哈希绑定PNG证据，送达后才允许激活",
-                        severity="warning", action="wait_for_telegram_evidence_delivery",
+                        reason=(
+                            "SOL短期/中短期横盘候选已准备；先发送3张哈希绑定PNG，"
+                            "并等待首次人工选择批准" if sol_enabled else
+                            "Grid参数候选已准备；先发送6张哈希绑定PNG证据，送达后才允许激活"
+                        ),
+                        severity="warning", action=(
+                            "wait_for_sol_evidence_and_manual_approval" if sol_enabled else
+                            "wait_for_telegram_evidence_delivery"
+                        ),
+                        release_sha256=evidence_identity if sol_enabled else "",
+                        model_sha256=str(sol_manifest.get("model_sha256", "")),
                         parameter_sha256=parameter_sha,
                         correlation_id=f"evidence:{selection['parameter_version']}",
                         details={"parameter_version": selection["parameter_version"],
@@ -432,11 +512,19 @@ class Scheduler:
                                  "previous_parameters": (current or {}).get(
                                      "pair_parameters", (current or {}).get("parameters", {})
                                  ),
-                                 "report_request": "grid_360d"},
+                                 "report_request": (
+                                     "sol_grid_360d" if sol_enabled else "grid_360d"
+                                 ),
+                                 "evidence_root": str(self.sol_evidence_root) if sol_enabled else "",
+                                 "manual_approval_required": sol_enabled,
+                                 "approved_profile": sol_profile if sol_enabled else ""},
                     )
                     append_event(self.notification_path, event)
                     saved.update({
-                        "mode": "fixed", "phase": "AWAITING_TELEGRAM_EVIDENCE",
+                        "mode": "fixed", "phase": (
+                            "AWAITING_SOL_EVIDENCE_AND_MANUAL_APPROVAL" if sol_enabled else
+                            "AWAITING_TELEGRAM_EVIDENCE"
+                        ),
                         "pending_parameter_sha256": parameter_sha,
                         "pending_event_id": event["event_id"],
                         "parameter_updates_enabled": False,
@@ -447,12 +535,20 @@ class Scheduler:
                     return current
                 return selection
             self.atomic_json(self.canonical_selection, selection)
+            if sol_enabled:
+                approval.update({
+                    "consumed": True,
+                    "consumed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                self.atomic_json(self.sol_initial_approval_path, approval)
             append_event(self.notification_path, build_event(
                 source="grid-live-fdusd-scheduler", strategy="grid",
                 bot=PORTFOLIOS["FDUSD"].bot_name,
-                pair=",".join(PORTFOLIOS["FDUSD"].pairs),
+                pair=",".join(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
                 mechanism="parameter_update", transition="PARAMETER_ACTIVATED",
                 reason=(
+                    f"BTC中短期横盘、ETH长期波动和SOL {sol_profile}参数已原子发布"
+                    if sol_enabled else
                     "BTC中短期横盘与ETH长期波动参数已原子发布"
                     if self.pair_parameter_schema_v2_enabled else
                     "schema v2消费者预部署中，继续使用现网6%参数"
@@ -515,6 +611,7 @@ class Scheduler:
         shutil.copy2("/app/grid_live_common.py", scripts / "grid_live_common.py")
         shutil.copy2("/app/grid_macro_gate.py", scripts / "grid_macro_gate.py")
         shutil.copy2("/app/grid_xgboost_risk_gate.py", scripts / "grid_xgboost_risk_gate.py")
+        shutil.copy2("/app/sol_grid_weekly_risk.py", scripts / "sol_grid_weekly_risk.py")
         shutil.copy2(
             "/app/ethbtc_forced_exit_contract.py",
             scripts / "ethbtc_forced_exit_contract.py",

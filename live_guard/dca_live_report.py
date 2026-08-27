@@ -788,7 +788,7 @@ class ParameterReportWorker:
     @staticmethod
     def _requires_report(event: Mapping[str, Any]) -> bool:
         return str(event.get("details", {}).get("report_request", "")) in {
-            "v22_png_windows", "v22_360d", "grid_360d",
+            "v22_png_windows", "v22_360d", "grid_360d", "sol_grid_360d",
         }
 
     def schedule(self, event: dict[str, Any]) -> list[dict[str, Any]]:
@@ -887,7 +887,11 @@ class ParameterReportWorker:
                 continue
             attachments = list(job.get("attachments", []))
             request = str(job.get("report_request", ""))
-            expected_photos = 12 if request in {"v22_png_windows", "v22_360d"} else 6
+            expected_photos = (
+                12 if request in {"v22_png_windows", "v22_360d"}
+                else 3 if request == "sol_grid_360d"
+                else 6
+            )
             photos = [row for row in attachments if row.get("kind") == "photo"]
             if len(photos) != expected_photos or any(
                 row.get("evidence_complete") is not True for row in attachments
@@ -999,7 +1003,11 @@ class UnifiedTelegramReporting:
         errors: list[dict[str, Any]] = []
         sources = (
             ("grid", self.grid_state / "runtime_error_state.json",
-             "grid-live-fdusd-400", "BTC-FDUSD,ETH-FDUSD"),
+             "grid-live-fdusd-400", (
+                 "BTC-FDUSD,ETH-FDUSD,SOL-FDUSD"
+                 if os.getenv("GRID_SOL_FDUSD_LIVE_ENABLED", "false").lower() == "true"
+                 else "BTC-FDUSD,ETH-FDUSD"
+             )),
             ("dca", self.dca_state / "runtime_error_state.json",
              "dca-live-btcusdt-200,dca-live-ethusdt-200", "BTC-USDT,ETH-USDT"),
             ("report", self.dca_state / "report_runtime_error_state.json",
@@ -1156,7 +1164,10 @@ class UnifiedTelegramReporting:
             gates = [
                 gate_row(
                     "v22_weekly_buy_gate",
-                    enabled=bool(mechanisms.get("v22_weekly_buy_gate", True)),
+                    enabled=bool(mechanisms.get(
+                        "sol_weekly_buy_gate" if pair == "SOL-FDUSD"
+                        else "v22_weekly_buy_gate", True
+                    )),
                     state=("UNAVAILABLE" if not v22_healthy else str(
                         technical_row.get("model_signal") or (
                             "RISK_ON" if aggregate.get("v22_buy_enabled") else "RISK_OFF"
@@ -1309,6 +1320,7 @@ class UnifiedTelegramReporting:
         bot = state.get("bots", {}).get(bot_name, {})
         latest = bot.get("latest", {})
         gate = state.get("xgboost_risk_gate", {})
+        sol_gate = state.get("sol_weekly_risk_gate", {})
         cutover = self._load(self.grid_state / "v22_cutover_status.json")
         output = []
         runtime_candidates = sorted(
@@ -1321,7 +1333,10 @@ class UnifiedTelegramReporting:
         runtime_buy_ids = {str(value) for value in runtime.get("buy_order_ids", [])}
         runtime_sell_ids = {str(value) for value in runtime.get("sell_order_ids", [])}
         active_pair_parameters = runtime.get("active_pair_parameters", {})
-        for pair in ("BTC-FDUSD", "ETH-FDUSD"):
+        grid_pairs = ["BTC-FDUSD", "ETH-FDUSD"]
+        if os.getenv("GRID_SOL_FDUSD_LIVE_ENABLED", "false").lower() == "true":
+            grid_pairs.append("SOL-FDUSD")
+        for pair in grid_pairs:
             values = latest.get("pairs", {}).get(pair, {})
             pnl = float(values["pnl"]) if values.get("pnl") is not None else None
             equity = None if pnl is None else 200 + pnl
@@ -1362,13 +1377,14 @@ class UnifiedTelegramReporting:
             }
             deferred_layers = list(order_build.get("maker_deferred_layers") or [])
             mechanisms = state.get("mechanisms", {})
-            technical_contract = gate.get("pairs", {}).get(pair, {})
+            pair_gate = sol_gate if pair == "SOL-FDUSD" else gate
+            technical_contract = pair_gate.get("pairs", {}).get(pair, {})
             runtime_technical = runtime.get("technical_buy_gate", {}).get(
                 "pairs", {}
             ).get(pair, {})
             runtime_macro = runtime.get("macro_gate", {})
             v22_healthy = bool(
-                gate.get("source_healthy") and runtime_technical.get("healthy", True)
+                pair_gate.get("source_healthy") and runtime_technical.get("healthy", True)
             )
             macro_healthy = bool(runtime_macro.get("healthy", not macro.get("pause_new_orders")))
             process_running = bool(runtime and data_age is not None and data_age <= 90)
@@ -1390,7 +1406,7 @@ class UnifiedTelegramReporting:
             )
             gates = [
                 gate_row(
-                    "v22_weekly_buy_gate",
+                    "sol_weekly_buy_gate" if pair == "SOL-FDUSD" else "v22_weekly_buy_gate",
                     enabled=bool(mechanisms.get("v22_weekly_buy_gate", True)),
                     state=("UNAVAILABLE" if not v22_healthy else str(
                         technical_contract.get("model_signal") or (
@@ -1400,8 +1416,9 @@ class UnifiedTelegramReporting:
                     )),
                     buy_enabled=v22_buy, sell_enabled=True,
                     health="HEALTHY" if v22_healthy else "FAILED",
-                    reason=str(technical_contract.get("reason") or gate.get("reason") or "unknown"),
-                    source="shared_v22_contract",
+                    reason=str(technical_contract.get("reason") or pair_gate.get("reason") or "unknown"),
+                    source=("isolated_sol_weekly_contract" if pair == "SOL-FDUSD"
+                            else "shared_v22_contract"),
                 ),
                 gate_row(
                     "fomc_gate", enabled=bool(mechanisms.get("fomc_gate", True)),
@@ -1417,7 +1434,7 @@ class UnifiedTelegramReporting:
                     buy_enabled=infra_healthy, sell_enabled=infra_healthy,
                     health="HEALTHY" if infra_healthy else "FAILED",
                     reason="all_sources_fresh" if infra_healthy else str(
-                        state.get("last_monitor_error") or gate.get("reason") or "runtime_unhealthy"
+                        state.get("last_monitor_error") or pair_gate.get("reason") or "runtime_unhealthy"
                     ), source="grid_guard",
                 ),
                 gate_row("capital_budget_gate", applicable=False, reason="not_applicable_to_grid"),
@@ -1451,17 +1468,23 @@ class UnifiedTelegramReporting:
                 process_running=process_running, phase=phase, gates=gates,
                 generated_at=now.astimezone(SHANGHAI).isoformat(), strategy="grid",
                 bot=bot_name, pair=pair,
-                runtime_generation=gate.get("runtime_generation"),
-                release_sha256=gate.get("release_sha256"),
+                runtime_generation=pair_gate.get("runtime_generation"),
+                release_sha256=pair_gate.get("release_sha256"),
                 model_week=technical_contract.get("model_week"),
-                cutover_phase=self._reported_cutover_phase(cutover, gate, now),
+                cutover_phase=(
+                    str(pair_gate.get("cutover_phase") or "ACTIVE")
+                    if pair == "SOL-FDUSD"
+                    else self._reported_cutover_phase(cutover, gate, now)
+                ),
             )
             item = {
                 "strategy": "grid", "bot": bot_name, "pair": pair,
                 "quote_asset": "FDUSD", "generated_at_bjt": now.astimezone(SHANGHAI).isoformat(),
                 "data_age_seconds": data_age,
                 "data_sources": ["Hummingbot SQLite TradeFill",
-                                 "grid-live-guard snapshot", "v22 shared contract"],
+                                 "grid-live-guard snapshot",
+                                 ("isolated SOL weekly contract" if pair == "SOL-FDUSD"
+                                  else "v22 shared contract")],
                 "profit": {"all_time_mtm_quote": pnl}, "equity": equity,
                 "peak_equity": peak, "drawdown_pct": drawdown,
                 "owned_base": values.get("net_base"), "fees_quote": fees,
@@ -1512,7 +1535,7 @@ class UnifiedTelegramReporting:
                 },
                 "v22_gate": (
                     "不可用" if not v22_healthy else
-                    "Risk-Off" if gate.get("pairs", {}).get(pair, {}).get("risk_off_active")
+                    "Risk-Off" if pair_gate.get("pairs", {}).get(pair, {}).get("risk_off_active")
                     else "Risk-On"
                 ),
                 "fomc_gate": "暂停" if macro.get("pause_new_orders") else "放行",
@@ -1564,8 +1587,9 @@ class UnifiedTelegramReporting:
             attachments.append({"path": str(path), "kind": "photo",
                                 "caption": f"{item['strategy'].upper()} {item['pair']}｜单机器人收益"})
         event = build_event(
-            source="dca-live-report", strategy="grid+dca", bot="4 robots",
-            pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT",
+            source="dca-live-report", strategy="grid+dca",
+            bot=f"{len(robots)} robots",
+            pair=",".join(item["pair"] for item in robots),
             mechanism="profit_report", transition="PROFIT_REPORT",
             reason="北京时间每4小时收益报告", severity="info",
             action="read_only_report", correlation_id=slot,
@@ -1629,7 +1653,11 @@ def main() -> int:
         event_path=args.output_dir / "telegram_events.jsonl",
         state_path=args.output_dir / "report_runtime_error_state.json",
         source="dca-live-report", strategy="grid+dca", bot="report-service",
-        pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT",
+        pair=(
+            "BTC-FDUSD,ETH-FDUSD,SOL-FDUSD,BTC-USDT,ETH-USDT"
+            if os.getenv("GRID_SOL_FDUSD_LIVE_ENABLED", "false").lower() == "true"
+            else "BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT"
+        ),
     )
     while True:
         try:

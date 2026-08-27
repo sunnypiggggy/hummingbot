@@ -28,7 +28,7 @@ def test_prepare_reconciles_grid_to_cash_and_preserves_dca_inventory() -> None:
         "runtime_events": [],
     }
     inventory = {
-        "schema": "account-inventory-status-v3", "healthy": True,
+        "schema": "account-inventory-status-v4", "healthy": True,
         "generated_at": now, "open_order_counts": {pair: 0 for pair in PAIRS},
         "assets": {
             "BTC": {"ownership_deficit": "0", "owners": {

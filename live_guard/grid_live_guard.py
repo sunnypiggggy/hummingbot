@@ -21,12 +21,16 @@ from urllib3.util.retry import Retry
 
 from grid_live_common import (
     PAIR_DRAWDOWN_LIMIT_PCT, PORTFOLIO_DRAWDOWN_LIMIT_PCT, PORTFOLIOS,
-    budget_for_quote,
+    active_portfolio_pairs, budget_for_live_pairs, budget_for_quote,
 )
 from grid_xgboost_risk_gate import MODEL_VERSION as XGBOOST_MODEL_VERSION
 from grid_xgboost_risk_gate import SCHEMA as XGBOOST_GATE_SCHEMA
 from grid_xgboost_risk_gate import atomic_json as atomic_gate_json
 from grid_xgboost_risk_gate import load_runtime_xgboost_gate
+from sol_grid_weekly_risk import (
+    CONTRACT_SCHEMA as SOL_GATE_SCHEMA,
+    load_runtime_sol_gate,
+)
 from ethbtc_forced_exit_contract import (
     MODEL_VERSION as V22_MODEL_VERSION,
     PACKAGE_ID as V22_PACKAGE_ID,
@@ -276,7 +280,8 @@ class Guard:
             event_path=self.notification_path,
             state_path=self.state_dir / "runtime_error_state.json",
             source="grid-live-guard", strategy="grid",
-            bot="grid-live-fdusd-400", pair="BTC-FDUSD,ETH-FDUSD",
+            bot="grid-live-fdusd-400",
+            pair=",".join(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
         )
         self.runtime_error_notify_after_seconds = min(
             10.0,
@@ -310,6 +315,10 @@ class Guard:
         if self.armed and self.shadow:
             raise ValueError("Grid Guard cannot be armed and shadowed at the same time")
         self.technical_gate_path = self.state_dir / "xgboost_risk_gate.json"
+        self.sol_gate_path = self.state_dir / "sol_grid_weekly_risk.json"
+        self.sol_gate_enabled = os.getenv(
+            "GRID_RISK_SOL_WEEKLY_GATE_ENABLED", "false"
+        ).lower() == "true"
         self.v21_in_guard_enabled = os.getenv(
             "GRID_V21_IN_GUARD_ENABLED", "true"
         ).lower() == "true"
@@ -413,7 +422,10 @@ class Guard:
                     "armed Grid Guard requires independent Binance credentials "
                     "and the Docker emergency socket"
                 )
-            pairs = [pair for key in self.portfolio_keys for pair in PORTFOLIOS[key].pairs]
+            pairs = [
+                pair for key in self.portfolio_keys
+                for pair in active_portfolio_pairs(PORTFOLIOS[key])
+            ]
             self.emergency_exchange.verify_ready(pairs)
             for key in self.portfolio_keys:
                 self.emergency_docker.matching_containers(PORTFOLIOS[key].bot_name)
@@ -441,7 +453,8 @@ class Guard:
             "v22_package_id": V22_PACKAGE_ID,
             "fdusd_external_breakers_enabled": self.fdusd_external_breakers_enabled,
         })
-        fdusd_budget = budget_for_quote("FDUSD")
+        fdusd_pairs = active_portfolio_pairs(PORTFOLIOS["FDUSD"])
+        fdusd_budget = budget_for_live_pairs("FDUSD", fdusd_pairs)
         self.state["mechanism_parameters"] = {
             "v22_weekly_buy_gate": {
                 "update_cycle": "weekly", "contract_max_age_seconds": 150,
@@ -518,7 +531,8 @@ class Guard:
             return
         try:
             pairs = [
-                pair for key in self.portfolio_keys for pair in PORTFOLIOS[key].pairs
+                pair for key in self.portfolio_keys
+                for pair in active_portfolio_pairs(PORTFOLIOS[key])
             ]
             preflight = self.verify_shadow_exchange_ready(pairs)
             self.state["shadow_preflight"] = preflight
@@ -652,7 +666,8 @@ class Guard:
         failed = audit_event.endswith("action_failed")
         append_event(self.notification_path, build_event(
             source="grid-live-guard", strategy="grid",
-            bot=str(details.get("bot", "")), pair="BTC-FDUSD,ETH-FDUSD",
+            bot=str(details.get("bot", "")),
+            pair=",".join(active_portfolio_pairs(PORTFOLIOS["FDUSD"])),
             mechanism="infrastructure_integrity_breaker",
             transition="ACTION_FAILED" if failed else "LATCHED",
             reason=str(details.get("reason") or details.get("error") or audit_event),
@@ -790,6 +805,30 @@ class Guard:
             for instance in (self.bots_path / "instances").glob(f"{bot_name}*"):
                 targets.append(instance / "data" / "xgboost_risk_gate.json")
         return sorted(set(targets))
+
+    def _sol_gate_targets(self) -> list[Path]:
+        targets = [self.sol_gate_path]
+        for instance in (self.bots_path / "instances").glob(
+            f"{PORTFOLIOS['FDUSD'].bot_name}*"
+        ):
+            targets.append(instance / "data" / "sol_grid_weekly_risk.json")
+        return sorted(set(targets))
+
+    def publish_sol_technical_gate(self) -> dict[str, Any]:
+        if not getattr(self, "sol_gate_enabled", False):
+            return {"enabled": False, "runtime_gate_healthy": True}
+        runtime = load_runtime_sol_gate(self.sol_gate_path)
+        try:
+            raw = json.loads(self.sol_gate_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = runtime
+        if raw.get("schema") != SOL_GATE_SCHEMA:
+            raw = runtime
+        for target in self._sol_gate_targets():
+            if target != self.sol_gate_path:
+                atomic_gate_json(target, raw)
+        self.state["sol_weekly_risk_gate"] = runtime
+        return runtime
 
     @staticmethod
     def _is_distributable_technical_gate(gate: dict) -> bool:
@@ -1061,7 +1100,7 @@ class Guard:
         pnl, pairs = Decimal("0"), {}
         reservations = self.manifest["reservations"][key]["base"]
         bot_state = self.state.get("bots", {}).get(portfolio.bot_name, {})
-        for pair in portfolio.pairs:
+        for pair in active_portfolio_pairs(portfolio):
             mark = self.price(pair)
             fill_value, net_base = fill_pnl(
                 self.rows(database, pair), mark, base_asset=pair.split("-")[0],
@@ -1361,7 +1400,7 @@ class Guard:
                 })
             except Exception as exc:
                 result["graceful_stops"].append({"name": candidate, "error": repr(exc)})
-        for pair in portfolio.pairs:
+        for pair in active_portfolio_pairs(portfolio):
             orders = self.emergency_exchange.open_orders(pair)
             result["exchange_cancellations"][pair] = [
                 str(item.get("clientOrderId") or item.get("orderId")) for item in orders
@@ -1373,7 +1412,7 @@ class Guard:
                 "name": instance,
                 "response": self.emergency_docker.stop(instance),
             })
-        for pair in portfolio.pairs:
+        for pair in active_portfolio_pairs(portfolio):
             remaining = self.emergency_exchange.open_orders(pair)
             for _ in range(5):
                 if not remaining:
@@ -1463,6 +1502,7 @@ class Guard:
                 duration_seconds=float(retry.get("duration_seconds", 0.0)),
             )
         self.publish_technical_buy_gate()
+        self.publish_sol_technical_gate()
         snapshots = {}
         for key in self.portfolio_keys:
             portfolio = PORTFOLIOS[key]
@@ -1477,7 +1517,7 @@ class Guard:
                 raise RuntimeError(f"Missing SQLite for running bot {portfolio.bot_name}")
             snapshots[key] = snapshot
             bot = self.state["bots"].setdefault(portfolio.bot_name, {})
-            budget = budget_for_quote(key)
+            budget = budget_for_live_pairs(key, active_portfolio_pairs(portfolio))
             equity = budget.capital_limit + Decimal(snapshot["pnl"])
             peak, drawdown = peak_drawdown(
                 equity,
@@ -1535,7 +1575,12 @@ class Guard:
         self.state["combined_pnl"] = str(combined_pnl)
         if len(snapshots) == len(self.portfolio_keys):
             initial = sum(
-                (budget_for_quote(key).capital_limit for key in snapshots), Decimal("0")
+                (
+                    budget_for_live_pairs(
+                        key, active_portfolio_pairs(PORTFOLIOS[key])
+                    ).capital_limit
+                    for key in snapshots
+                ), Decimal("0")
             )
             combined_equity = initial + combined_pnl
             combined_peak, combined_drawdown = peak_drawdown(
@@ -1610,10 +1655,13 @@ def main() -> int:
         guard = Guard()
         result = {
             "scenario_id": os.environ["GUARD_SCENARIO_ID"],
-            "prices": {pair: str(guard.price(pair)) for pair in ("BTC-FDUSD", "ETH-FDUSD")},
+            "prices": {
+                pair: str(guard.price(pair))
+                for pair in active_portfolio_pairs(PORTFOLIOS["FDUSD"])
+            },
             "filters": {
                 pair: [str(value) for value in guard.market_filter(pair)]
-                for pair in ("BTC-FDUSD", "ETH-FDUSD")
+                for pair in active_portfolio_pairs(PORTFOLIOS["FDUSD"])
             },
             "balances": guard.emergency_exchange.account_balances(),
         }

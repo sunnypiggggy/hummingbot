@@ -2,7 +2,7 @@
 
 The Grid and DCA guards use the same Binance spot account.  This module keeps
 their base-asset ownership in one SQLite database so independent emergency
-paths cannot both sell the same BTC/ETH.  It deliberately contains no trading
+paths cannot both sell the same BTC/ETH/SOL.  It deliberately contains no trading
 API calls; callers must acquire an asset lease, refresh Binance, and then
 record the resulting exchange order.
 """
@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 
-SCHEMA = "account-inventory-status-v3"
-ASSETS = ("BTC", "ETH")
+SCHEMA = "account-inventory-status-v4"
+ASSETS = ("BTC", "ETH", "SOL")
+DCA_ASSETS = ("BTC", "ETH")
 ZERO = Decimal("0")
 
 
@@ -67,7 +68,7 @@ def ownership_from_documents(
 
     pair_docs = managed_inventory.get("pairs", {})
     dca_bots = dca_state.get("bots", {})
-    for asset in ASSETS:
+    for asset in DCA_ASSETS:
         pair = f"{asset}-USDT"
         bot_name = f"dca-live-{asset.lower()}usdt-200"
         bot = dca_bots.get(bot_name, {})

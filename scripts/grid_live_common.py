@@ -18,6 +18,11 @@ def _risk_enabled(name: str) -> bool:
     return os.getenv(name, "true").lower() == "true"
 
 
+def fdusd_sol_live_enabled() -> bool:
+    """Explicit activation latch; compatibility deployments leave this false."""
+    return os.getenv("GRID_SOL_FDUSD_LIVE_ENABLED", "false").lower() == "true"
+
+
 @dataclass(frozen=True)
 class BudgetLimits:
     capital_limit: Decimal
@@ -40,7 +45,7 @@ USDT_BUDGET = BudgetLimits(
     portfolio_loss_limit=Decimal("40"),
     recommended_balance=Decimal("525"),
 )
-FDUSD_BUDGET = BudgetLimits(
+FDUSD_LEGACY_BUDGET = BudgetLimits(
     capital_limit=Decimal("420"),
     strategy_budget=Decimal("400"),
     reserve_quote=Decimal("20"),
@@ -50,6 +55,19 @@ FDUSD_BUDGET = BudgetLimits(
     portfolio_loss_limit=Decimal("24"),
     recommended_balance=Decimal("440"),
 )
+FDUSD_SOL_BUDGET = BudgetLimits(
+    capital_limit=Decimal("620"),
+    strategy_budget=Decimal("600"),
+    reserve_quote=Decimal("20"),
+    pair_budget=Decimal("200"),
+    side_budget=Decimal("100"),
+    pair_loss_limit=Decimal("6"),
+    portfolio_loss_limit=Decimal("36"),
+    recommended_balance=Decimal("640"),
+)
+# Keep the legacy alias stable so merely deploying SOL-compatible code cannot
+# change a running two-pair portfolio's capital or breaker baselines.
+FDUSD_BUDGET = FDUSD_LEGACY_BUDGET
 
 # Backwards-compatible aliases for the pre-existing USDT validation path.
 CAPITAL_LIMIT = USDT_BUDGET.capital_limit
@@ -69,7 +87,10 @@ PORTFOLIO_DRAWDOWN_LIMIT_PCT = Decimal("0.06")
 CONFIRMATION = "LIVE-GRID-FDUSD-400"
 FDUSD_RECOMMENDED_BALANCE = FDUSD_BUDGET.recommended_balance
 ACTIVE_SELECTION_SCHEMA_VERSION = 2
-SUPPORTED_ACTIVE_SELECTION_SCHEMA_VERSIONS = frozenset({1, 2})
+SOL_ACTIVE_SELECTION_SCHEMA_VERSION = 3
+SUPPORTED_ACTIVE_SELECTION_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+FDUSD_LEGACY_PAIRS = ("BTC-FDUSD", "ETH-FDUSD")
+FDUSD_SOL_PAIRS = ("BTC-FDUSD", "ETH-FDUSD", "SOL-FDUSD")
 ALLOWED_HALF_RANGES = (Decimal("0.03"), Decimal("0.04"), Decimal("0.05"))
 ALLOWED_MIN_SPREADS = (Decimal("0.006"), Decimal("0.008"), Decimal("0.010"))
 ALLOWED_TAKE_PROFITS = (Decimal("0.006"), Decimal("0.008"), Decimal("0.010"))
@@ -79,6 +100,15 @@ GRID_MOVE_COOLDOWN_SECONDS = 1800
 # Immutable production profiles.  Schema-v2 contracts must match these values
 # exactly; a profile name is not an escape hatch for arbitrary live settings.
 BINANCE_AI_GRID_PROFILES: Dict[str, Dict[str, Decimal | int]] = {
+    "short_sideways": {
+        "grid_range": Decimal("0.07695669969152726"),
+        "grid_levels": 18,
+        "take_profit": Decimal("0.004"),
+        "minimum_order_quote": Decimal("10"),
+        "move_threshold": Decimal("0.015"),
+        "min_grid_move_seconds": 1800,
+        "order_refresh_seconds": ORDER_REFRESH_SECONDS,
+    },
     "medium_sideways": {
         "grid_range": Decimal("0.12698379475402316"),
         "grid_levels": 18,
@@ -102,6 +132,7 @@ APPROVED_PAIR_PROFILES = {
     "BTC-FDUSD": "medium_sideways",
     "ETH-FDUSD": "long_volatility",
 }
+SOL_APPROVED_PROFILES = frozenset({"short_sideways", "medium_sideways"})
 
 
 @dataclass(frozen=True)
@@ -110,7 +141,7 @@ class GridPortfolio:
     bot_name: str
     profile_name: str
     config_name: str
-    pairs: tuple[str, str]
+    pairs: tuple[str, ...]
 
 
 PORTFOLIOS: Dict[str, GridPortfolio] = {
@@ -140,8 +171,27 @@ def budget_for_quote(quote_asset: str) -> BudgetLimits:
     raise ValueError(f"Unsupported live-grid quote asset: {quote_asset}")
 
 
+def budget_for_live_pairs(quote_asset: str, trading_pairs: Sequence[str]) -> BudgetLimits:
+    """Resolve capital limits without changing a deployed two-pair portfolio."""
+    quote = quote_asset.upper()
+    pairs = tuple(str(pair).upper() for pair in trading_pairs)
+    if quote == "FDUSD" and pairs == FDUSD_SOL_PAIRS:
+        return FDUSD_SOL_BUDGET
+    if quote == "FDUSD" and pairs == FDUSD_LEGACY_PAIRS:
+        return FDUSD_LEGACY_BUDGET
+    if quote == "USDT" and pairs == PORTFOLIOS["USDT"].pairs:
+        return USDT_BUDGET
+    raise ValueError(f"Unsupported live-grid pair set for {quote}: {pairs}")
+
+
 def budget_for_pair(trading_pair: str) -> BudgetLimits:
     return budget_for_quote(trading_pair.rsplit("-", 1)[-1])
+
+
+def active_portfolio_pairs(portfolio: GridPortfolio) -> tuple[str, ...]:
+    if portfolio.quote_asset == "FDUSD" and fdusd_sol_live_enabled():
+        return FDUSD_SOL_PAIRS
+    return portfolio.pairs
 
 
 @dataclass
@@ -378,16 +428,19 @@ def clip_quantized_buy_levels(
 
 def required_balances(prices: Mapping[str, Decimal], quote_only_fdusd: bool = False) -> Dict[str, Decimal]:
     if quote_only_fdusd:
-        return {"FDUSD": FDUSD_BUDGET.capital_limit}
+        budget = FDUSD_SOL_BUDGET if fdusd_sol_live_enabled() else FDUSD_BUDGET
+        return {"FDUSD": budget.capital_limit}
     requirements: Dict[str, Decimal] = {
         "USDT": USDT_BUDGET.side_budget * Decimal("2") + USDT_BUDGET.reserve_quote,
         "FDUSD": FDUSD_BUDGET.side_budget * Decimal("2") + FDUSD_BUDGET.reserve_quote,
         "BTC": Decimal("0"),
         "ETH": Decimal("0"),
+        "SOL": Decimal("0"),
     }
     for portfolio in PORTFOLIOS.values():
-        budget = budget_for_quote(portfolio.quote_asset)
-        for pair in portfolio.pairs:
+        pairs = active_portfolio_pairs(portfolio)
+        budget = budget_for_live_pairs(portfolio.quote_asset, pairs)
+        for pair in pairs:
             base = pair.split("-")[0]
             requirements[base] += budget.side_budget / prices[pair]
     return requirements
@@ -395,9 +448,10 @@ def required_balances(prices: Mapping[str, Decimal], quote_only_fdusd: bool = Fa
 
 def build_fdusd_bootstrap_plan(prices: Mapping[str, Decimal]) -> Dict[str, Any]:
     portfolio = PORTFOLIOS["FDUSD"]
-    budget = FDUSD_BUDGET
+    pairs = active_portfolio_pairs(portfolio)
+    budget = budget_for_live_pairs("FDUSD", pairs)
     purchases = {}
-    for pair in portfolio.pairs:
+    for pair in pairs:
         price = Decimal(str(prices[pair]))
         if price <= 0:
             raise ValueError(f"Invalid bootstrap price for {pair}.")
@@ -409,13 +463,13 @@ def build_fdusd_bootstrap_plan(prices: Mapping[str, Decimal]) -> Dict[str, Any]:
     return {
         "quote_asset": "FDUSD",
         "minimum_balance": str(budget.capital_limit),
-        "recommended_balance": str(FDUSD_RECOMMENDED_BALANCE),
+        "recommended_balance": str(budget.recommended_balance),
         "strategy_budget": str(budget.strategy_budget),
         "strategy_reserve": str(budget.reserve_quote),
-        "external_safety_buffer": str(FDUSD_RECOMMENDED_BALANCE - budget.capital_limit),
+        "external_safety_buffer": str(budget.recommended_balance - budget.capital_limit),
         "purchases": purchases,
         "expected_remaining_strategy_fdusd": str(
-            budget.capital_limit - budget.side_budget * Decimal(len(portfolio.pairs))
+            budget.capital_limit - budget.side_budget * Decimal(len(pairs))
         ),
         "automatic_rollback": False,
     }
@@ -438,8 +492,52 @@ def validate_active_selection(payload: Mapping[str, Any], maker_rate: Decimal | 
         raise ValueError("Unsupported active selection schema version.")
     if not str(payload.get("parameter_version", "")).strip():
         raise ValueError("Active selection requires a parameter_version.")
-    if tuple(payload.get("trading_pairs", ())) != PORTFOLIOS["FDUSD"].pairs:
-        raise ValueError("Active selection must target BTC-FDUSD and ETH-FDUSD.")
+    trading_pairs = tuple(payload.get("trading_pairs", ()))
+    expected_pairs = FDUSD_SOL_PAIRS if schema_version == 3 else FDUSD_LEGACY_PAIRS
+    if trading_pairs != expected_pairs:
+        raise ValueError(f"Active selection must target exactly {expected_pairs}.")
+    if schema_version == 3:
+        raw_pairs = payload.get("pair_parameters")
+        if not isinstance(raw_pairs, Mapping) or set(raw_pairs) != set(FDUSD_SOL_PAIRS):
+            raise ValueError("Schema-v3 selection requires BTC, ETH and SOL pair_parameters.")
+        execution_enabled = bool(payload.get("sol_execution_enabled", False))
+        pair_parameters: Dict[str, Dict[str, Any]] = {}
+        for pair in FDUSD_SOL_PAIRS:
+            raw_pair = raw_pairs[pair]
+            if not isinstance(raw_pair, Mapping):
+                raise ValueError(f"{pair} parameters are missing.")
+            profile = str(raw_pair.get("profile", ""))
+            if pair == "SOL-FDUSD":
+                if profile not in SOL_APPROVED_PROFILES:
+                    raise ValueError("SOL-FDUSD must use short_sideways or medium_sideways.")
+            elif profile != APPROVED_PAIR_PROFILES[pair]:
+                raise ValueError(f"{pair} must use approved profile {APPROVED_PAIR_PROFILES[pair]}.")
+            approved = BINANCE_AI_GRID_PROFILES[profile]
+            candidate = {
+                "grid_range": Decimal(str(raw_pair["grid_range"])),
+                "grid_levels": int(raw_pair["grid_levels"]),
+                "take_profit": Decimal(str(raw_pair["take_profit"])),
+                "minimum_order_quote": Decimal(str(raw_pair["minimum_order_quote"])),
+                "move_threshold": Decimal(str(raw_pair["move_threshold"])),
+                "min_grid_move_seconds": int(raw_pair["min_grid_move_seconds"]),
+                "order_refresh_seconds": int(raw_pair["order_refresh_seconds"]),
+            }
+            if candidate != approved:
+                raise ValueError(f"{pair} parameters do not match immutable profile {profile}.")
+            if candidate["grid_levels"] < 4 or candidate["grid_levels"] % 2:
+                raise ValueError(f"{pair} grid_levels must be an even number of at least four.")
+            if candidate["minimum_order_quote"] < Decimal("10"):
+                raise ValueError(f"{pair} minimum_order_quote must be at least 10 FDUSD.")
+            pair_parameters[pair] = {"profile": profile, **candidate}
+        return {
+            "schema_version": schema_version,
+            "parameter_version": str(payload["parameter_version"]),
+            "selection_sha256": hashlib.sha256(json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), default=str,
+            ).encode("utf-8")).hexdigest(),
+            "pair_parameters": pair_parameters,
+            "sol_execution_enabled": execution_enabled,
+        }
     if schema_version == 2:
         raw_pairs = payload.get("pair_parameters")
         if not isinstance(raw_pairs, Mapping) or set(raw_pairs) != set(APPROVED_PAIR_PROFILES):
@@ -527,16 +625,17 @@ def build_live_config(portfolio: GridPortfolio, prices: Mapping[str, Decimal], m
                       bootstrap_from_quote: bool = False,
                       bootstrap_completed: bool = False) -> Dict[str, Any]:
     take_profit = effective_take_profit(maker_rate)
-    budget = budget_for_quote(portfolio.quote_asset)
+    pairs = active_portfolio_pairs(portfolio)
+    budget = budget_for_live_pairs(portfolio.quote_asset, pairs)
     base_reservations = reserved_base_by_pair or {
-        pair: budget.side_budget / prices[pair] for pair in portfolio.pairs
+        pair: budget.side_budget / prices[pair] for pair in pairs
     }
-    reservations = {pair: str(base_reservations[pair]) for pair in portfolio.pairs}
+    reservations = {pair: str(base_reservations[pair]) for pair in pairs}
     return {
         "script_file_name": "walk_forward_portfolio_grid_live.py",
         "controllers_config": [],
         "exchange": CONNECTOR,
-        "trading_pairs": list(portfolio.pairs),
+        "trading_pairs": list(pairs),
         "quote_asset": portfolio.quote_asset,
         "capital_limit_quote": float(budget.capital_limit),
         "strategy_budget_quote": float(budget.strategy_budget),
@@ -590,6 +689,14 @@ def build_live_config(portfolio: GridPortfolio, prices: Mapping[str, Decimal], m
         "technical_buy_fail_closed": True,
         "technical_model_sha256": "",
         "technical_feature_sha256": "",
+        "sol_technical_buy_gate_enabled": (
+            portfolio.quote_asset == "FDUSD"
+            and "SOL-FDUSD" in pairs
+            and _risk_enabled("GRID_RISK_SOL_WEEKLY_GATE_ENABLED")
+        ),
+        "sol_technical_buy_gate_file": "data/sol_grid_weekly_risk.json",
+        "sol_technical_model_sha256": "",
+        "sol_technical_feature_sha256": "",
     }
 
 
@@ -599,9 +706,8 @@ def validate_live_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Live grid must use the Binance spot connector.")
     if quote not in PORTFOLIOS:
         raise ValueError("Only USDT and FDUSD live portfolios are supported.")
-    if tuple(config.get("trading_pairs", ())) != PORTFOLIOS[quote].pairs:
-        raise ValueError("Live grid pairs must be BTC and ETH for the selected quote asset.")
-    budget = budget_for_quote(quote)
+    trading_pairs = tuple(config.get("trading_pairs", ()))
+    budget = budget_for_live_pairs(quote, trading_pairs)
     if Decimal(str(config.get("capital_limit_quote"))) != budget.capital_limit:
         raise ValueError(f"Capital limit must be exactly {budget.capital_limit} {quote}.")
     if Decimal(str(config.get("strategy_budget_quote"))) != budget.strategy_budget:
@@ -634,7 +740,7 @@ def validate_live_config(config: Mapping[str, Any]) -> None:
     if int(config.get("startup_order_reconcile_seconds", 0)) != STARTUP_ORDER_RECONCILE_SECONDS:
         raise ValueError("Live Grid startup order reconciliation must last exactly 30 seconds.")
     reservations = config.get("reserved_base_by_pair", {})
-    if set(reservations) != set(PORTFOLIOS[quote].pairs):
+    if set(reservations) != set(trading_pairs):
         raise ValueError("Every live pair requires an explicit base reservation.")
     if any(Decimal(str(value)) <= 0 for value in reservations.values()):
         raise ValueError("Base reservations must be positive.")
@@ -667,6 +773,22 @@ def validate_live_config(config: Mapping[str, Any]) -> None:
             raise ValueError("FDUSD technical BUY gate freshness must be between 30 and 180 seconds.")
         if not 1 <= int(config.get("technical_buy_gate_poll_seconds", 0)) <= 30:
             raise ValueError("FDUSD technical BUY gate polling must be between 1 and 30 seconds.")
+        if trading_pairs == FDUSD_SOL_PAIRS:
+            if not bool(config.get("sol_technical_buy_gate_enabled")):
+                raise ValueError("SOL-FDUSD requires its isolated weekly BUY gate.")
+            if Path(str(config.get("sol_technical_buy_gate_file", ""))).name != "sol_grid_weekly_risk.json":
+                raise ValueError("SOL-FDUSD requires the isolated SOL weekly contract file.")
+            if bool(config.get("trading_enabled")):
+                hashes = (
+                    str(config.get("sol_technical_model_sha256", "")),
+                    str(config.get("sol_technical_feature_sha256", "")),
+                )
+                if any(
+                    len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value.lower())
+                    for value in hashes
+                ):
+                    raise ValueError("Enabled SOL Grid requires locked SOL model and feature hashes.")
 
 
 def validate_exchange_filters(symbol_info: Mapping[str, Any], order_quote: Decimal) -> None:

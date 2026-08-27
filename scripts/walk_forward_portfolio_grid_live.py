@@ -51,6 +51,9 @@ from scripts.grid_live_common import (
     SIDE_BUDGET,
     STRATEGY_BUDGET,
     PairLedger,
+    FDUSD_LEGACY_PAIRS,
+    FDUSD_SOL_PAIRS,
+    budget_for_live_pairs,
     budget_for_quote,
     clip_quantized_buy_levels,
     clip_quantized_sell_levels,
@@ -58,6 +61,7 @@ from scripts.grid_live_common import (
 )
 from scripts.grid_macro_gate import load_runtime_macro_gate
 from scripts.grid_xgboost_risk_gate import load_runtime_xgboost_gate
+from scripts.sol_grid_weekly_risk import load_runtime_sol_gate
 from scripts.risk_recovery import (
     ACTIVE, COOLDOWN, EXITING, LATCHED, REENTRY,
     REQUIRED_HEALTHY_CYCLES,
@@ -70,7 +74,7 @@ try:
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
 
-RUNTIME_STATE_SCHEMA_VERSION = 12
+RUNTIME_STATE_SCHEMA_VERSION = 13
 SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS = frozenset(range(2, RUNTIME_STATE_SCHEMA_VERSION + 1))
 ORDER_REBUILD_BACKOFF_SECONDS = (5, 15, 30, 60)
 UNEXPECTED_ORDER_GAP_SECONDS = 15
@@ -157,6 +161,10 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
     technical_buy_fail_closed: bool = True
     technical_model_sha256: str = ""
     technical_feature_sha256: str = ""
+    sol_technical_buy_gate_enabled: bool = False
+    sol_technical_buy_gate_file: str = "data/sol_grid_weekly_risk.json"
+    sol_technical_model_sha256: str = ""
+    sol_technical_feature_sha256: str = ""
     risk_auto_reentry_enabled: bool = False
 
     @field_validator("trading_pairs", mode="before")
@@ -168,8 +176,12 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
 
     @model_validator(mode="after")
     def validate_safety(self):
-        expected = [f"BTC-{self.quote_asset}", f"ETH-{self.quote_asset}"]
-        budget = budget_for_quote(self.quote_asset)
+        expected = (
+            list(FDUSD_SOL_PAIRS)
+            if self.quote_asset == "FDUSD" and "SOL-FDUSD" in self.trading_pairs
+            else [f"BTC-{self.quote_asset}", f"ETH-{self.quote_asset}"]
+        )
+        budget = budget_for_live_pairs(self.quote_asset, self.trading_pairs)
         if self.exchange != "binance" or "perpetual" in self.exchange:
             raise ValueError("Live portfolio grid supports Binance spot only.")
         if self.trading_pairs != expected:
@@ -235,6 +247,22 @@ class LivePortfolioGridConfig(StrategyV2ConfigBase):
                 raise ValueError("Technical BUY gate polling must be between 1 and 30 seconds.")
             if not 30 <= self.technical_buy_gate_max_age_seconds <= 180:
                 raise ValueError("Technical BUY gate freshness must be between 30 and 180 seconds.")
+            if self.trading_pairs == list(FDUSD_SOL_PAIRS):
+                if not self.sol_technical_buy_gate_enabled:
+                    raise ValueError("Live SOL-FDUSD requires its isolated weekly BUY gate.")
+                if Path(self.sol_technical_buy_gate_file).name != "sol_grid_weekly_risk.json":
+                    raise ValueError("SOL Grid requires the isolated SOL weekly contract file.")
+                if self.trading_enabled:
+                    hashes = (
+                        self.sol_technical_model_sha256,
+                        self.sol_technical_feature_sha256,
+                    )
+                    if any(
+                        len(value) != 64
+                        or any(character not in "0123456789abcdef" for character in value.lower())
+                        for value in hashes
+                    ):
+                        raise ValueError("Enabled SOL Grid requires locked SOL model and feature hashes.")
         if self.grid_levels < 4 or self.grid_levels % 2:
             raise ValueError("grid_levels must be an even number of at least four.")
         return self
@@ -677,8 +705,9 @@ class LivePortfolioGrid(StrategyV2Base):
         healthy = bool(gate.get("runtime_gate_healthy"))
         reason = str(gate.get("reason", "unknown"))
         gate_pairs = gate.get("pairs", {})
+        primary_pairs = [pair for pair in self.config.trading_pairs if pair != "SOL-FDUSD"]
         transitions = []
-        for pair in self.config.trading_pairs:
+        for pair in primary_pairs:
             pair_signal = dict(gate_pairs.get(pair, {}))
             pair_healthy = bool(healthy and pair_signal)
             enabled = bool(pair_signal.get("buy_enabled")) if pair_healthy else False
@@ -727,6 +756,8 @@ class LivePortfolioGrid(StrategyV2Base):
                     "xgboost_buy_gate_recovered_immediate_refresh",
                     pair=pair, reason=pair_reason,
                 )
+        if "SOL-FDUSD" in self.config.trading_pairs:
+            self._poll_sol_technical_gate(transitions)
         self.technical_buy_enabled = all(self.technical_buy_enabled_by_pair.values())
         self.technical_gate_healthy = all(self.technical_gate_healthy_by_pair.values())
         self.technical_reason = reason
@@ -751,7 +782,15 @@ class LivePortfolioGrid(StrategyV2Base):
                     classification=decision["classification"],
                     elapsed_seconds=decision["elapsed_seconds"],
                 )
-                self._latch_integrity_failure(f"technical contract unhealthy: {reason}")
+                if "SOL-FDUSD" in self.config.trading_pairs:
+                    for pair in primary_pairs:
+                        self._latch_pair_integrity_failure(
+                            pair, f"technical contract unhealthy: {reason}"
+                        )
+                else:
+                    self._latch_integrity_failure(
+                        f"technical contract unhealthy: {reason}"
+                    )
             elif not previous_failure:
                 self._record_runtime_event(
                     "technical_contract_transport_grace_started",
@@ -779,6 +818,93 @@ class LivePortfolioGrid(StrategyV2Base):
             self.notify(
                 f"XGBOOST BUY GATE {state}: healthy={healthy} reason={reason}"
             )
+
+    def _poll_sol_technical_gate(self, transitions: list[tuple]) -> None:
+        pair = "SOL-FDUSD"
+        key = "sol_technical_contract"
+        if not self.config.sol_technical_buy_gate_enabled:
+            self.technical_gate_healthy_by_pair[pair] = True
+            self.technical_buy_enabled_by_pair[pair] = True
+            self.technical_reason_by_pair[pair] = "disabled"
+            self.technical_signal_by_pair[pair] = {}
+            transitions.append((pair, True, True, "disabled"))
+            return
+        contract = load_runtime_sol_gate(
+            Path(self.config.sol_technical_buy_gate_file),
+            now=datetime.now(timezone.utc),
+            max_age_seconds=self.config.technical_buy_gate_max_age_seconds,
+            expected_model_sha256=self.config.sol_technical_model_sha256 or None,
+            expected_feature_sha256=self.config.sol_technical_feature_sha256 or None,
+        )
+        healthy = bool(contract.get("runtime_gate_healthy"))
+        signal = dict(contract.get("pairs", {}).get(pair, {}))
+        pair_healthy = bool(healthy and signal)
+        enabled = bool(signal.get("buy_enabled")) if pair_healthy else False
+        reason = str(signal.get("reason") or contract.get("reason") or "unknown")
+        previous_enabled = self.technical_buy_enabled_by_pair[pair]
+        self.technical_gate_healthy_by_pair[pair] = pair_healthy
+        self.technical_buy_enabled_by_pair[pair] = enabled
+        self.technical_reason_by_pair[pair] = reason
+        self.technical_signal_by_pair[pair] = signal
+        transitions.append((pair, pair_healthy, enabled, reason))
+        if pair_healthy:
+            previous_failure = self.integrity_failure_grace.pop(key, None)
+            if previous_failure:
+                self._record_runtime_event(
+                    "sol_contract_transport_grace_recovered", pair=pair,
+                    previous_failure=previous_failure,
+                )
+            if signal.get("force_exit") and self.pair_recovery[pair].get("phase") == ACTIVE:
+                self.ledgers[pair].halted = True
+                self.pending_flatten.add(pair)
+                self.pair_recovery[pair] = trigger_state(
+                    mechanism="sol_weekly_buy_gate", scope="technical",
+                    now=self.current_timestamp,
+                    trigger_value=signal.get("probability"), signal_price="", reason=reason,
+                )
+                self.cancel_owned_orders()
+                self._record_runtime_event(
+                    "sol_weekly_forced_exit_triggered", pair=pair,
+                    event_id=signal.get("event_id"), reason=reason,
+                )
+            elif not enabled:
+                self.cancel_owned_buy_orders(pair)
+            elif not previous_enabled:
+                self.next_refresh = 0.0
+                self._record_runtime_event(
+                    "sol_weekly_buy_gate_recovered_immediate_refresh", pair=pair,
+                    reason=reason,
+                )
+            return
+        previous_failure = self.integrity_failure_grace.get(key)
+        decision = advance_integrity_failure(
+            previous_failure, reason=reason, now=self.current_timestamp,
+            grace_seconds=self.config.fail_closed_seconds,
+        )
+        self.integrity_failure_grace[key] = decision
+        if decision["expired"]:
+            self._latch_pair_integrity_failure(pair, f"SOL contract unhealthy: {reason}")
+        elif not previous_failure:
+            self._record_runtime_event(
+                "sol_contract_transport_grace_started", pair=pair, reason=reason,
+                grace_seconds=self.config.fail_closed_seconds,
+            )
+
+    def _latch_pair_integrity_failure(self, pair: str, reason: str) -> None:
+        if self.pair_recovery[pair].get("phase") == LATCHED:
+            return
+        self.pair_recovery[pair] = trigger_state(
+            mechanism="infrastructure_integrity_breaker", scope="infrastructure",
+            now=self.current_timestamp, trigger_value=reason, signal_price="",
+            reason=reason, latch_after_exit=True,
+        )
+        self.ledgers[pair].halted = True
+        self.pending_flatten.add(pair)
+        self.cancel_owned_orders()
+        self._record_runtime_event(
+            "pair_integrity_failure_latched", pair=pair, reason=reason,
+            recovery=self.pair_recovery[pair],
+        )
 
     def _latch_integrity_failure(self, reason: str) -> None:
         if not hasattr(self, "portfolio_recovery"):
@@ -2738,15 +2864,26 @@ class LivePortfolioGrid(StrategyV2Base):
             schema_version = int(state.get("schema_version", -1))
             if schema_version not in SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS:
                 raise ValueError("runtime state schema version mismatch")
-            if tuple(state.get("trading_pairs", ())) != tuple(self.config.trading_pairs):
+            saved_pair_tuple = tuple(state.get("trading_pairs", ()))
+            configured_pair_tuple = tuple(self.config.trading_pairs)
+            sol_migration = (
+                configured_pair_tuple == FDUSD_SOL_PAIRS
+                and saved_pair_tuple == FDUSD_LEGACY_PAIRS
+            )
+            if saved_pair_tuple != configured_pair_tuple and not sol_migration:
                 raise ValueError("runtime state trading pairs mismatch")
             ledgers_payload = state.get("ledgers", {})
-            if set(ledgers_payload) != set(self.config.trading_pairs):
+            if set(ledgers_payload) != set(saved_pair_tuple):
                 raise ValueError("runtime state ledgers do not match configured pairs")
             restored = {
                 pair: PairLedger.from_mapping(ledgers_payload[pair])
-                for pair in self.config.trading_pairs
+                for pair in saved_pair_tuple
             }
+            if sol_migration:
+                restored["SOL-FDUSD"] = PairLedger.create(
+                    "SOL-FDUSD",
+                    Decimal(str(self.config.reserved_base_by_pair["SOL-FDUSD"])),
+                )
             for pair, ledger in restored.items():
                 configured_base = Decimal(str(self.config.reserved_base_by_pair[pair]))
                 if ledger.initial_base != configured_base:
@@ -2807,6 +2944,10 @@ class LivePortfolioGrid(StrategyV2Base):
             self.portfolio_episode_baseline = Decimal(str(
                 state.get("portfolio_episode_baseline", self.config.capital_limit_quote)
             ))
+            if sol_migration:
+                funding = self.config.pair_budget_quote
+                self.peak_equity += funding
+                self.portfolio_episode_baseline += funding
             self.active_parameter_version = str(
                 state.get("active_parameter_version", self.active_parameter_version)
             )
@@ -2840,6 +2981,12 @@ class LivePortfolioGrid(StrategyV2Base):
                 value for value in state.get("runtime_events", [])
                 if isinstance(value, dict)
             ][-100:]
+            if sol_migration:
+                self.runtime_events.append({
+                    "event": "sol_external_capital_injection_migrated",
+                    "amount_quote": str(self.config.pair_budget_quote),
+                    "pnl_effect": "0",
+                })
             saved_integrity_grace = state.get("integrity_failure_grace", {})
             if isinstance(saved_integrity_grace, dict):
                 self.integrity_failure_grace = {
