@@ -300,6 +300,37 @@ def test_existing_dust_job_migrates_without_reconfirmation():
         assert eth["confirmation_block_reason"] == "already_classified_dust"
 
 
+def test_dust_that_cleared_then_reappeared_starts_new_confirmation_episode():
+    with tempfile.TemporaryDirectory() as directory:
+        ledger = UnifiedInventoryLedger(Path(directory))
+        ledger.start_job(
+            job_id="old-dust", asset="ETH", scope="unattributed_dust",
+            pair="ETH-USDT", requested_quantity=Decimal("0.0022"),
+            client_order_id="inv-old-dust", now=1,
+        )
+        ledger.finish_job("old-dust", status="DUST", error="below minimum", now=2)
+        first = ledger.reconcile(
+            account_fingerprint="account", balances=balances("0", "0.0527"),
+            ownership={"BTC": {}, "ETH": {"dca": "0.0505"}},
+            evidence_sha256="first", open_order_counts={}, sources_healthy=True, now=100,
+        )
+        original_episode = first["assets"]["ETH"]["episode_id"]
+        ledger.reconcile(
+            account_fingerprint="account", balances=balances("0", "0.0505"),
+            ownership={"BTC": {}, "ETH": {"dca": "0.0505"}},
+            evidence_sha256="clear", open_order_counts={}, sources_healthy=True, now=110,
+        )
+        appeared = ledger.reconcile(
+            account_fingerprint="account", balances=balances("0", "0.0527"),
+            ownership={"BTC": {}, "ETH": {"dca": "0.0505"}},
+            evidence_sha256="again", open_order_counts={}, sources_healthy=True, now=120,
+        )
+        eth = appeared["assets"]["ETH"]
+        assert eth["episode_id"] != original_episode
+        assert eth["inventory_phase"] == "DETECTED"
+        assert eth["confirmation"]["cycles"] == 1
+
+
 def test_asset_lease_and_bootstrap_cap_are_persistent():
     with tempfile.TemporaryDirectory() as directory:
         ledger = UnifiedInventoryLedger(Path(directory))
@@ -602,6 +633,29 @@ def test_unattributed_below_minimum_is_persisted_as_dust_without_order():
         assert job["status"] == "DUST"
         assert "minimum_notional=5" in job["error"]
         assert not guard.notification_path.exists()
+
+
+def test_repeated_dust_reconciliation_writes_classification_audit_once():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        guard = Guard.__new__(Guard)
+        guard.inventory_ledger = UnifiedInventoryLedger(root / "shared")
+        seed_ownership(guard.inventory_ledger, eth="0.0505")
+        guard.emergency_exchange = Exchange("0")
+        guard.emergency_exchange.account_balances = lambda: balances("0", "0.0527")
+        guard._lot_filter = lambda pair: (Decimal("0.0001"), Decimal("5"))
+        guard._price = lambda pair: Decimal("1900")
+        audits = []
+        guard._audit = lambda event, **details: audits.append((event, details))
+        row = {
+            "owned_total": "0.0505", "unattributed": "0.0022",
+            "last_notified_transition": "INVENTORY_UNATTRIBUTED_CONFIRMED",
+            "confirmation": {"cycles": 3, "confirmed": True},
+        }
+        guard._liquidate_unattributed("ETH", row, "same-episode")
+        guard._liquidate_unattributed("ETH", row, "same-episode")
+        assert [event for event, _ in audits] == ["inventory_dust_classified"]
+        assert guard.emergency_exchange.orders == []
 
 
 def test_unattributed_alert_waits_for_persisted_confirmation():

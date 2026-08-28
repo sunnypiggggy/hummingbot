@@ -61,6 +61,7 @@ from deploy_fdusd_live_grid import (  # noqa: E402
 )
 from live_guard.grid_live_guard import (  # noqa: E402
     ApiClient as GuardApiClient,
+    GetOnlyReadClient,
     Guard,
     _read_retry_session,
     fill_pnl,
@@ -72,6 +73,7 @@ class _DisconnectOnceHandler(BaseHTTPRequestHandler):
     get_calls = 0
     post_calls = 0
     disconnect_gets = 1
+    status_failures = 0
 
     def log_message(self, _format, *args):
         return
@@ -82,7 +84,29 @@ class _DisconnectOnceHandler(BaseHTTPRequestHandler):
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
             return
-        payload = b'{"healthy":true}'
+        if type(self).status_failures > 0:
+            type(self).status_failures -= 1
+            payload = b'{"error":"temporary"}'
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path.startswith("/api/v3/ticker/price"):
+            payload = b'{"price":"65000.25"}'
+        elif self.path.startswith("/api/v3/exchangeInfo"):
+            payload = (
+                b'{"symbols":[{"filters":['
+                b'{"filterType":"LOT_SIZE","stepSize":"0.00001"},'
+                b'{"filterType":"MARKET_LOT_SIZE","stepSize":"0.00001"},'
+                b'{"filterType":"MIN_NOTIONAL","minNotional":"5"}'
+                b']}]}'
+            )
+        elif self.path.startswith("/docker/active-containers"):
+            payload = b'[{"name":"grid-live-fdusd-400"}]'
+        else:
+            payload = b'{"healthy":true}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -100,6 +124,7 @@ class GridGuardHttpRetryTest(unittest.TestCase):
         _DisconnectOnceHandler.get_calls = 0
         _DisconnectOnceHandler.post_calls = 0
         _DisconnectOnceHandler.disconnect_gets = 1
+        _DisconnectOnceHandler.status_failures = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _DisconnectOnceHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -156,6 +181,47 @@ class GridGuardHttpRetryTest(unittest.TestCase):
             with self.assertRaises(requests.exceptions.ConnectionError):
                 client.stop("grid-live-fdusd-400")
         self.assertEqual(1, _DisconnectOnceHandler.post_calls)
+
+    def test_binance_ticker_uses_same_get_only_retry_client(self):
+        client = GetOnlyReadClient(self.base_url)
+        guard = Guard.__new__(Guard)
+        guard.binance_reads = client
+        self.assertEqual(Decimal("65000.25"), guard.price("BTC-FDUSD"))
+        retries = client.consume_read_retry_events()
+        self.assertEqual(2, _DisconnectOnceHandler.get_calls)
+        self.assertEqual(1, len(retries))
+        self.assertTrue(retries[0]["pool_replaced"])
+
+    def test_exchange_info_uses_same_get_only_retry_client(self):
+        client = GetOnlyReadClient(self.base_url)
+        guard = Guard.__new__(Guard)
+        guard.binance_reads = client
+        step, minimum = guard.market_filter("ETH-FDUSD")
+        self.assertEqual(Decimal("0.00001"), step)
+        self.assertEqual(Decimal("5"), minimum)
+
+    def test_binance_get_retries_http_500_and_records_telemetry(self):
+        _DisconnectOnceHandler.disconnect_gets = 0
+        _DisconnectOnceHandler.status_failures = 1
+        client = GetOnlyReadClient(self.base_url)
+        guard = Guard.__new__(Guard)
+        guard.binance_reads = client
+        self.assertEqual(Decimal("65000.25"), guard.price("BTC-FDUSD"))
+        retries = client.consume_read_retry_events()
+        self.assertEqual(2, _DisconnectOnceHandler.get_calls)
+        self.assertEqual(1, len(retries))
+        self.assertEqual(1, retries[0]["attempts"])
+
+    def test_active_containers_is_routed_through_retry_telemetry(self):
+        with patch.dict("os.environ", {
+            "HUMMINGBOT_API_URL": self.base_url,
+            "USERNAME": "test-user", "PASSWORD": "test-password",
+        }):
+            client = GuardApiClient()
+            result = client.active_containers("grid-live")
+            retries = client.consume_read_retry_events()
+        self.assertEqual("grid-live-fdusd-400", result[0]["name"])
+        self.assertEqual(1, len(retries))
 
 
 class GridLiveSafetyTest(unittest.TestCase):

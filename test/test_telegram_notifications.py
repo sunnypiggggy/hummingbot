@@ -4,6 +4,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import requests
 from PIL import Image
@@ -206,20 +207,26 @@ def test_four_hour_report_counts_only_recent_suppressed_grid_recoveries(tmp_path
     now = datetime.fromtimestamp(20_000, timezone.utc)
     (tmp_path / "runtime_error_state.json").write_text(json.dumps({
         "history": [
-            {"component": "guard_cycle", "recovered_at": 19_000,
+            {"component": "guard_read:binance_public", "recovered_at": 19_000,
              "occurrences": 2, "summary": "recent", "suppressed_as_transient": True},
-            {"component": "guard_cycle", "recovered_at": 1_000,
+            {"component": "guard_read:binance_public", "recovered_at": 1_000,
              "occurrences": 5, "summary": "old", "suppressed_as_transient": True},
             {"component": "report_cycle", "recovered_at": 19_500,
              "occurrences": 3, "summary": "other", "suppressed_as_transient": True},
-            {"component": "guard_cycle", "recovered_at": 19_800,
+            {"component": "guard_read:hummingbot_api", "recovered_at": 19_800,
              "occurrences": 1, "summary": "alerted", "suppressed_as_transient": False},
+            {"component": "trade_sync:order-1", "recovered_at": 19_900,
+             "duration_seconds": 142, "occurrences": 1,
+             "summary": "myTrades 500", "suppressed_as_transient": False},
         ]
     }), encoding="utf-8")
     summary = reporting._grid_transport_summary(now)
     assert summary["recovered_episodes"] == 1
     assert summary["retry_attempts"] == 2
     assert summary["last_reason"] == "recent"
+    assert summary["trade_sync_recovered"] == 1
+    assert summary["trade_sync_longest_recovery_seconds"] == 142
+    assert summary["trade_sync_pending"] == 0
 
 
 def test_management_runtime_error_snapshot_contains_only_active_episodes(tmp_path):
@@ -546,7 +553,8 @@ def test_profit_report_is_sent_as_telegram_markdown():
     assert text.startswith(MARKDOWN_MESSAGE_PREFIX)
     assert "*GRID · BTC-FDUSD*" in text
     assert "- 累计：`+7.6650 FDUSD`" in text
-    assert "Guard连接瞬时恢复（4h）：`2 次`，交易权限未受影响" in text
+    assert "Guard只读连接自动恢复（4h）：`2 次`，交易权限未受影响" in text
+    assert "成交同步延迟（4h）：`0 次`" in text
     with tempfile.TemporaryDirectory() as directory:
         token = Path(directory) / "token"
         token.write_text("notify-token", encoding="utf-8")
@@ -840,6 +848,58 @@ def test_grid_log_scanner_suppresses_structured_maker_crossing_duplicate(tmp_pat
 
     assert guard.runtime_errors.failures == []
     assert guard.runtime_log_cursor_path.exists()
+
+
+def test_grid_trade_sync_500_recovers_immediately_on_same_order_fill(tmp_path):
+    order_id = "x-MG43PCSNBBCFD65a1ac3175a41c707"
+
+    class DockerLogs:
+        batches = [
+            [
+                "14:00:06 - BinanceExchange - Failed to fetch trade updates for order "
+                f"{order_id}. Error: GET /api/v3/myTrades. HTTP status is 500. Error: N/A"
+            ],
+            [
+                "14:02:26 - client_order_tracker - The BUY order "
+                f"{order_id} amounting to 0.00014/0.00014 BTC has been filled at 78866 FDUSD."
+            ],
+        ]
+
+        def logs_since(self, _name, _since):
+            return self.batches.pop(0)
+
+    guard = GridGuard.__new__(GridGuard)
+    guard.emergency_docker = DockerLogs()
+    guard.runtime_log_cursors = {"grid-live-fdusd-400": 1.0}
+    guard.runtime_log_cursor_path = tmp_path / "cursor.json"
+    guard.state_path = tmp_path / "guard-state.json"
+    guard.state = {}
+    events = tmp_path / "events.jsonl"
+    guard.runtime_errors = RuntimeErrorChannel(
+        event_path=events, state_path=tmp_path / "runtime-errors.json",
+        source="grid-live-guard", strategy="grid",
+        bot="grid-live-fdusd-400", pair="BTC-FDUSD,ETH-FDUSD",
+    )
+    with patch("live_guard.grid_live_guard.time.time", return_value=100.0) as clock:
+        guard._scan_runtime_logs()
+        clock.return_value = 242.0
+        guard._scan_runtime_logs()
+
+    rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    trade_rows = [
+        row for row in rows
+        if row.get("details", {}).get("component") == f"trade_sync:{order_id}"
+    ]
+    assert [row["transition"] for row in trade_rows] == [
+        "ERROR_OCCURRED", "ERROR_RECOVERED",
+    ]
+    assert trade_rows[-1]["details"]["duration_seconds"] == 142
+    assert trade_rows[-1]["details"]["trading_status"].startswith("订单最终状态已")
+    assert guard.state["trade_sync_pending"] == {}
+    assert not any(
+        row.get("details", {}).get("component") == "container_log:grid-live-fdusd-400"
+        for row in rows
+    )
 
 
 def test_risk_event_message_explains_cause_and_follow_up_impact_in_one_line():

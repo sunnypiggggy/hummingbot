@@ -1287,18 +1287,39 @@ class UnifiedTelegramReporting:
     def _grid_transport_summary(self, now: datetime) -> dict[str, Any]:
         state = self._load(self.grid_state / "runtime_error_state.json")
         cutoff = now.timestamp() - 4 * 60 * 60
-        rows = [
+        read_rows = [
             row for row in state.get("history", [])
             if isinstance(row, Mapping)
-            and row.get("component") == "guard_cycle"
+            and str(row.get("component") or "").startswith("guard_read:")
             and bool(row.get("suppressed_as_transient"))
             and float(row.get("recovered_at", 0) or 0) >= cutoff
         ]
+        trade_rows = [
+            row for row in state.get("history", [])
+            if isinstance(row, Mapping)
+            and str(row.get("component") or "").startswith("trade_sync:")
+            and float(row.get("recovered_at", 0) or 0) >= cutoff
+        ]
+        components = state.get("components", {})
+        pending = sum(
+            1 for name, row in components.items()
+            if str(name).startswith("trade_sync:") and bool(row.get("active"))
+        ) if isinstance(components, Mapping) else 0
         return {
             "window_hours": 4,
-            "recovered_episodes": len(rows),
-            "retry_attempts": sum(int(row.get("occurrences", 1) or 1) for row in rows),
-            "last_reason": str(rows[-1].get("summary") or "") if rows else None,
+            "recovered_episodes": len(read_rows),
+            "retry_attempts": sum(
+                int(row.get("occurrences", 1) or 1) for row in read_rows
+            ),
+            "last_reason": (
+                str(read_rows[-1].get("summary") or "") if read_rows else None
+            ),
+            "trade_sync_recovered": len(trade_rows),
+            "trade_sync_longest_recovery_seconds": max(
+                (float(row.get("duration_seconds", 0) or 0) for row in trade_rows),
+                default=0.0,
+            ),
+            "trade_sync_pending": pending,
             "trading_impact": "none",
         }
 

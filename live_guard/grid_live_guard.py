@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -156,16 +157,24 @@ def peak_drawdown(current_equity: Decimal, stored_peak: Decimal,
     return peak, drawdown
 
 
-class ApiClient:
-    def __init__(self):
-        self.base = os.getenv("HUMMINGBOT_API_URL", "http://hummingbot-api:8000").rstrip("/")
-        self.auth = (os.environ["USERNAME"], os.environ["PASSWORD"])
+class GetOnlyReadClient:
+    """Persistent HTTP client whose automatic recovery is limited to GET.
+
+    urllib3 handles two ordinary connection/read/status retries.  If a server
+    closes every socket in the pooled Session, a final GET is made with a
+    fresh, no-retry Session.  Mutating methods never enter either retry path.
+    """
+
+    def __init__(self, base: str, *, auth: tuple[str, str] | None = None):
+        self.base = base.rstrip("/")
+        self.auth = auth
         self.session = self._new_session()
         self._read_retry_events: list[dict[str, Any]] = []
 
     def _new_session(self, *, retry_total: int = 2) -> requests.Session:
         session = _read_retry_session(retry_total=retry_total)
-        session.auth = self.auth
+        if self.auth is not None:
+            session.auth = self.auth
         return session
 
     @staticmethod
@@ -194,11 +203,16 @@ class ApiClient:
         events, self._read_retry_events = self._read_retry_events, []
         return events
 
-    def request(self, method: str, path: str, payload: Dict[str, Any] | None = None) -> Any:
+    def request(
+        self, method: str, path: str, payload: Dict[str, Any] | None = None,
+        *, params: Mapping[str, Any] | None = None, timeout: float = 30,
+    ) -> Any:
         method = method.upper()
         url = f"{self.base}{path}"
         try:
-            response = self.session.request(method, url, json=payload, timeout=30)
+            response = self.session.request(
+                method, url, json=payload, params=params, timeout=timeout,
+            )
         except requests.exceptions.ConnectionError as exc:
             if method != "GET" or not self._is_remote_disconnect(exc):
                 raise
@@ -208,7 +222,9 @@ class ApiClient:
             one_shot = self._new_session(retry_total=0)
             started = time.monotonic()
             try:
-                response = one_shot.request(method, url, json=payload, timeout=30)
+                response = one_shot.request(
+                    method, url, json=payload, params=params, timeout=timeout,
+                )
             finally:
                 one_shot.close()
                 self.session = self._new_session()
@@ -232,6 +248,14 @@ class ApiClient:
         response.raise_for_status()
         return response.json() if response.content else {}
 
+
+class ApiClient(GetOnlyReadClient):
+    def __init__(self):
+        super().__init__(
+            os.getenv("HUMMINGBOT_API_URL", "http://hummingbot-api:8000"),
+            auth=(os.environ["USERNAME"], os.environ["PASSWORD"]),
+        )
+
     def status(self) -> Any:
         return self.request("GET", "/bot-orchestration/status")
 
@@ -241,13 +265,10 @@ class ApiClient:
         })
 
     def active_containers(self, name_filter: str) -> Any:
-        response = self.session.get(
-            f"{self.base}/docker/active-containers",
-            params={"name_filter": name_filter},
-            timeout=30,
+        return self.request(
+            "GET", "/docker/active-containers",
+            params={"name_filter": name_filter}, timeout=30,
         )
-        response.raise_for_status()
-        return response.json() if response.content else []
 
     def market(self, profile: str, pair: str, side: str, amount: Decimal) -> Any:
         return self.request("POST", "/trading/orders", {
@@ -378,6 +399,7 @@ class Guard:
             raise RuntimeError("armed Grid Guard requires the in-process v22 producer")
         self.next_technical_refresh = 0.0
         self.api = ApiClient()
+        self.binance_reads = GetOnlyReadClient(binance_api_base())
         secret_path = Path(os.getenv(
             "GRID_BINANCE_EMERGENCY_CREDENTIALS_FILE",
             "/run/secrets/grid_binance_emergency_credentials",
@@ -545,6 +567,17 @@ class Guard:
             self.state["emergency_healthy_cycles"] = 0
         self.save()
 
+    _TRADE_SYNC_FAILURE = re.compile(
+        r"Failed to fetch trade updates for order\s+([A-Za-z0-9_-]+).*?HTTP status is\s+(5\d\d)",
+        re.IGNORECASE,
+    )
+    _ORDER_TERMINAL = re.compile(
+        r"(?:order\s+([A-Za-z0-9_-]+).*?(?:has been filled|completely filled|"
+        r"successfully cancel(?:led|ed)|has been canceled|has failed)|"
+        r"(?:filled|cancel(?:led|ed))\s+order\s+([A-Za-z0-9_-]+))",
+        re.IGNORECASE,
+    )
+
     def _scan_runtime_logs(self) -> None:
         if self.emergency_docker is None:
             return
@@ -570,9 +603,73 @@ class Guard:
         temporary = self.runtime_log_cursor_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.runtime_log_cursors, indent=2), encoding="utf-8")
         temporary.replace(self.runtime_log_cursor_path)
+        if not hasattr(self, "state"):
+            self.state = {}
+        pending = self.state.setdefault("trade_sync_pending", {})
+        pending_changed = False
+        trade_sync_failure_lines: set[str] = set()
+        for raw in lines:
+            value = " ".join(str(raw).split())
+            failure = self._TRADE_SYNC_FAILURE.search(value)
+            if failure:
+                client_order_id, http_status = failure.groups()
+                trade_sync_failure_lines.add(sanitize_runtime_error(value))
+                row = pending.setdefault(client_order_id, {
+                    "client_order_id": client_order_id,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "http_status": http_status,
+                    "occurrences": 0,
+                    "timeout_alerted": False,
+                })
+                row["last_seen_at"] = now
+                row["occurrences"] = int(row.get("occurrences", 0)) + 1
+                row["last_error"] = sanitize_runtime_error(value)
+                self.runtime_errors.failure(
+                    f"trade_sync:{client_order_id}", value,
+                    trading_impact=(
+                        "成交同步读取暂时失败；原生轮询继续核对，单次读取失败不改变交易权限。"
+                    ),
+                    severity="warning", action="retry_trade_sync_and_verify_terminal_state",
+                    details={"client_order_id": client_order_id, "http_status": http_status},
+                    now=now,
+                )
+                pending_changed = True
+            terminal = self._ORDER_TERMINAL.search(value)
+            if terminal:
+                client_order_id = terminal.group(1) or terminal.group(2)
+                row = pending.pop(client_order_id, None)
+                if row is not None:
+                    self.runtime_errors.recovered(
+                        f"trade_sync:{client_order_id}", now=now,
+                        trading_status=(
+                            "订单最终状态已由后续轮询核对；成交/撤单只记一次，无重复成交证据"
+                        ),
+                    )
+                    self.runtime_errors.recovered(
+                        f"trade_sync_timeout:{client_order_id}", now=now,
+                        trading_status="订单最终状态已核对，成交同步超时告警解除",
+                    )
+                    pending_changed = True
+        for client_order_id, row in list(pending.items()):
+            if now - float(row.get("first_seen_at", now)) < 300:
+                continue
+            if row.get("timeout_alerted"):
+                continue
+            self.runtime_errors.failure(
+                f"trade_sync_timeout:{client_order_id}",
+                f"trade status remained unverified for 300 seconds: {client_order_id}",
+                trading_impact="该订单成交状态仍待核对；不自动改变交易权限，持续只读复核。",
+                severity="critical", action="escalate_trade_sync_verification",
+                details={"client_order_id": client_order_id, "pending_seconds": 300},
+                now=now,
+            )
+            row["timeout_alerted"] = True
+            pending_changed = True
         errors = [
             value for value in runtime_error_lines(lines)
             if not is_structured_grid_maker_rejection(value)
+            and value not in trade_sync_failure_lines
         ]
         component = f"container_log:{name}"
         if errors:
@@ -586,6 +683,8 @@ class Guard:
             component, quiet_seconds=300,
             trading_status="连续5分钟无新的 Grid 机器人日志错误；当前风控状态保持不变",
         )
+        if pending_changed:
+            self.save()
 
     def audit(self, event: str, **details):
         with self.audit_path.open("a", encoding="utf-8") as output:
@@ -595,6 +694,22 @@ class Guard:
                 **details,
             }, default=str) + "\n")
         self._emit_notification(event, details)
+
+    def _record_read_retry_events(self) -> None:
+        for source, client in (
+            ("hummingbot_api", getattr(self, "api", None)),
+            ("binance_public", getattr(self, "binance_reads", None)),
+        ):
+            if client is None:
+                continue
+            consume = getattr(client, "consume_read_retry_events", lambda: [])
+            for retry in consume():
+                self.runtime_errors.record_transient_recovery(
+                    f"guard_read:{source}",
+                    retry.get("reason", "transient GET retry"),
+                    occurrences=int(retry.get("attempts", 1)),
+                    duration_seconds=float(retry.get("duration_seconds", 0.0)),
+                )
 
     def _emit_notification(self, audit_event: str, details: Dict[str, Any]) -> None:
         if audit_event == "grid_xgboost_risk_gate_transition":
@@ -1012,24 +1127,29 @@ class Guard:
                             key=lambda path: path.stat().st_mtime, reverse=True)
         return candidates[0] if candidates else None
 
-    @staticmethod
-    def price(pair: str) -> Decimal:
-        response = requests.get(f"{binance_api_base()}/api/v3/ticker/price",
-                                params={"symbol": pair.replace("-", "")}, timeout=15)
-        response.raise_for_status()
-        return Decimal(str(response.json()["price"]))
+    def _binance_read_client(self) -> GetOnlyReadClient:
+        client = getattr(self, "binance_reads", None)
+        if client is None:
+            client = GetOnlyReadClient(binance_api_base())
+            self.binance_reads = client
+        return client
 
-    @staticmethod
-    def market_filter(pair: str) -> tuple[Decimal, Decimal]:
-        response = requests.get(
-            f"{binance_api_base()}/api/v3/exchangeInfo",
+    def price(self, pair: str) -> Decimal:
+        response = self._binance_read_client().request(
+            "GET", "/api/v3/ticker/price",
+            params={"symbol": pair.replace("-", "")}, timeout=15,
+        )
+        return Decimal(str(response["price"]))
+
+    def market_filter(self, pair: str) -> tuple[Decimal, Decimal]:
+        response = self._binance_read_client().request(
+            "GET", "/api/v3/exchangeInfo",
             params={"symbol": pair.replace("-", "")},
             timeout=15,
         )
-        response.raise_for_status()
         filters = {
             item["filterType"]: item
-            for item in response.json()["symbols"][0]["filters"]
+            for item in response["symbols"][0]["filters"]
         }
         lot = filters.get("MARKET_LOT_SIZE") or filters["LOT_SIZE"]
         if Decimal(str(lot.get("stepSize", "0"))) <= 0:
@@ -1037,9 +1157,8 @@ class Guard:
         notional = filters.get("NOTIONAL") or filters["MIN_NOTIONAL"]
         return Decimal(str(lot["stepSize"])), Decimal(str(notional["minNotional"]))
 
-    @staticmethod
-    def quantity_step(pair: str) -> Decimal:
-        return Guard.market_filter(pair)[0]
+    def quantity_step(self, pair: str) -> Decimal:
+        return self.market_filter(pair)[0]
 
     @staticmethod
     def rows(database: Path, pair: str) -> list[tuple[Any, ...]]:
@@ -1455,13 +1574,7 @@ class Guard:
         if self.manifest_path.exists():
             self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         status = json.dumps(self.api.status(), ensure_ascii=True)
-        consume_retries = getattr(self.api, "consume_read_retry_events", lambda: [])
-        for retry in consume_retries():
-            self.runtime_errors.record_transient_recovery(
-                "guard_cycle", retry.get("reason", "transient GET retry"),
-                occurrences=int(retry.get("attempts", 1)),
-                duration_seconds=float(retry.get("duration_seconds", 0.0)),
-            )
+        self._record_read_retry_events()
         self.publish_technical_buy_gate()
         snapshots = {}
         for key in self.portfolio_keys:
@@ -1562,6 +1675,9 @@ class Guard:
                 )
         self.state["first_failure_at"] = None
         self.state["last_success_at"] = time.time()
+        # Include ticker/exchangeInfo retries performed by snapshot() in this
+        # completed cycle rather than delaying telemetry to the next cycle.
+        self._record_read_retry_events()
         self.save()
 
     def run(self):

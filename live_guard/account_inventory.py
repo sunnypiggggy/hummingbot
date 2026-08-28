@@ -417,10 +417,16 @@ class UnifiedInventoryLedger:
                         ).fetchone()
                 elif sources_healthy and deficit == 0:
                     if episode is None or episode["phase"] == "RECOVERED":
-                        phase = (
-                            "DUST" if self._dust_job_covers(connection, asset, unattributed)
-                            else "DETECTED"
+                        # Historical dust jobs are migration evidence only for
+                        # ledgers that do not yet have an episode.  A balance
+                        # that recovered to zero and later reappears starts a
+                        # new confirmation episode, even if its quantity is
+                        # below a previous dust job.
+                        inherited_dust = bool(
+                            episode is None
+                            and self._dust_job_covers(connection, asset, unattributed)
                         )
+                        phase = "DUST" if inherited_dust else "DETECTED"
                         created_at = now
                         episode_id = self._episode_id(
                             account_fingerprint=account_fingerprint, asset=asset,

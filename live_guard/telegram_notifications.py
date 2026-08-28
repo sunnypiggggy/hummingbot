@@ -767,9 +767,15 @@ def format_event(event: Mapping[str, Any]) -> str:
                 transport, Mapping
             ):
                 lines.append(
-                    "- Guard连接瞬时恢复（4h）："
+                    "- Guard只读连接自动恢复（4h）："
                     f"`{int(transport.get('recovered_episodes', 0) or 0)} 次`"
                     "，交易权限未受影响"
+                )
+                lines.append(
+                    "- 成交同步延迟（4h）："
+                    f"`{int(transport.get('trade_sync_recovered', 0) or 0)} 次`，"
+                    f"最长 `{float(transport.get('trade_sync_longest_recovery_seconds', 0) or 0):.1f}s`，"
+                    f"当前未决 `{int(transport.get('trade_sync_pending', 0) or 0)}`"
                 )
         lines.extend(("", "_不同报价币种不折算、不合并；详见四张单机器人 PNG。_"))
         return MARKDOWN_MESSAGE_PREFIX + "\n".join(lines)[:4096]

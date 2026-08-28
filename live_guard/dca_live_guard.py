@@ -1032,7 +1032,7 @@ class Guard:
                 job_id, client_order_id = liquidation_identity(
                     asset, "unattributed_dust", dust_quantity, evidence
                 )
-                self.inventory_ledger.start_job(
+                job = self.inventory_ledger.start_job(
                     job_id=job_id, asset=asset, scope="unattributed_dust",
                     pair=pair, requested_quantity=dust_quantity,
                     client_order_id=client_order_id,
@@ -1048,16 +1048,25 @@ class Guard:
                 # Expected exchange dust is durable audit evidence, not an
                 # operator alert. A fill/ownership snapshot race commonly
                 # settles here after the next monitor cycle.
-                self._audit(
-                    "inventory_dust_classified",
-                    asset=asset, pair=pair, job_id=job_id,
-                    quantity=str(dust_quantity), rounded_quantity=str(amount),
-                    notional=str(amount * mark),
-                    minimum_notional=str(minimum_notional),
-                    dust_reason=(
-                        "rounded_quantity_zero" if amount <= 0
-                        else "below_minimum_notional"
-                    ),
+                last_transition = str(row.get("last_notified_transition") or "")
+                first_classification = bool(
+                    str(job.get("status") or "") != "DUST"
+                    and last_transition != "INVENTORY_DUST_CLASSIFIED"
+                )
+                if first_classification:
+                    self._audit(
+                        "inventory_dust_classified",
+                        asset=asset, pair=pair, job_id=job_id,
+                        quantity=str(dust_quantity), rounded_quantity=str(amount),
+                        notional=str(amount * mark),
+                        minimum_notional=str(minimum_notional),
+                        dust_reason=(
+                            "rounded_quantity_zero" if amount <= 0
+                            else "below_minimum_notional"
+                        ),
+                    )
+                self.inventory_ledger.mark_episode_notified(
+                    asset, "INVENTORY_DUST_CLASSIFIED",
                 )
                 return
             related_pairs = (f"{asset}-USDT", f"{asset}-FDUSD")
@@ -1231,6 +1240,7 @@ class Guard:
                 self.inventory_ledger.set_episode_phase(
                     asset, "DETECTED", reset_confirmation=True,
                 )
+                self.inventory_ledger.mark_episode_notified(asset, "")
                 row["inventory_phase"] = "DETECTED"
                 row["confirmation_eligible"] = True
                 row["confirmation_block_reason"] = "dust_became_tradable_reconfirm"
@@ -1241,12 +1251,19 @@ class Guard:
             phase = str(row.get("inventory_phase") or "CLEAR")
             episode_id = str(row.get("episode_id") or "")
             confirmed_unattributed = self._confirmed_unattributed_alert(row)
-            if confirmed_unattributed:
+            already_notified = str(row.get("last_notified_transition") or "") in {
+                "INVENTORY_UNATTRIBUTED_CONFIRMED", "INVENTORY_DUST_CLASSIFIED",
+            }
+            if confirmed_unattributed and not already_notified:
                 self._audit(
                     "inventory_unattributed_confirmed",
                     asset=asset, episode_id=episode_id,
                     unattributed=str(unattributed), details=row,
                 )
+                self.inventory_ledger.mark_episode_notified(
+                    asset, "INVENTORY_UNATTRIBUTED_CONFIRMED",
+                )
+                row["last_notified_transition"] = "INVENTORY_UNATTRIBUTED_CONFIRMED"
             if (
                 risk_actions_enabled and self.unattributed_auto_liquidate
                 and confirmed_unattributed
@@ -1271,7 +1288,8 @@ class Guard:
         if audit_path is not None:
             with audit_path.open("a", encoding="utf-8") as output:
                 output.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        LOG.warning("%s %s", event, json.dumps(details, ensure_ascii=False, default=str))
+        log = LOG.info if event == "inventory_dust_classified" else LOG.warning
+        log("%s %s", event, json.dumps(details, ensure_ascii=False, default=str))
         self._emit_notification(event, details)
 
     def _emit_notification(self, audit_event: str, details: Dict[str, Any]) -> None:
