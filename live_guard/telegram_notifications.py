@@ -1640,16 +1640,36 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
             parameter_value = "无可信逐交易对参数"
         metrics.append(("Grid参数", parameter_value))
     metrics.append(dust_metric(report.get("pair"), report.get("unattributed_dust")))
+    runtime_health = report.get("runtime_health", {})
+    if isinstance(runtime_health, Mapping):
+        current_error = str(runtime_health.get("current_error") or "无")
+        recovered_error = str(runtime_health.get("last_recovered_error") or "无")
+        recovered_at = runtime_health.get("last_recovered_at")
+        totals = int(runtime_health.get("source_error_total") or 0) + int(
+            runtime_health.get("integrity_error_total") or 0
+        )
+        metrics.extend([
+            ("当前错误", current_error[:28]),
+            ("历史恢复", (
+                f"{recovered_error[:18]} / {recovered_at or '-'} / 累计{totals}"
+                if recovered_error != "无" else f"无 / 累计{totals}"
+            )),
+            ("GET读取韧性", (
+                f"重试{int(runtime_health.get('read_retry_attempts') or 0)} / "
+                f"换池{int(runtime_health.get('pool_replacements') or 0)} / "
+                f"最长{float(runtime_health.get('longest_read_recovery_seconds') or 0):.2f}秒"
+            )),
+        ])
     top = 790
-    draw.rounded_rectangle((70, top, 1370, top + 390), radius=18,
+    draw.rounded_rectangle((70, top, 1370, top + 450), radius=18,
                            fill="#ffffff", outline="#dce3ea", width=2)
     for index, (label, value) in enumerate(metrics):
         x = 105 + (index % 2) * 650
-        y = top + 30 + (index // 2) * 82
-        draw.text((x, y), f"{label}：{value}", fill="#334155", font=report_font(29))
-    draw.text((70, 1220), "全部有效门控", fill="#172033", font=report_font(34, bold=True))
-    table_top = 1270
-    draw.rounded_rectangle((70, table_top, 1370, table_top + 710), radius=18,
+        y = top + 28 + (index // 2) * 58
+        draw.text((x, y), f"{label}：{value}", fill="#334155", font=report_font(24))
+    draw.text((70, 1270), "全部有效门控", fill="#172033", font=report_font(34, bold=True))
+    table_top = 1320
+    draw.rounded_rectangle((70, table_top, 1370, table_top + 650), radius=18,
                            fill="#ffffff", outline="#dce3ea", width=2)
     headers = (("机制", 90), ("开关", 390), ("状态", 520),
                ("BUY", 720), ("SELL", 840), ("原因", 970))
@@ -1658,7 +1678,7 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
                   font=report_font(24, bold=True))
     draw.line((85, table_top + 55, 1355, table_top + 55), fill="#cbd5e1", width=2)
     for index, row in enumerate(status.get("gate_statuses", [])[:13]):
-        y = table_top + 65 + index * 49
+        y = table_top + 65 + index * 45
         if index % 2:
             draw.rectangle((82, y - 5, 1358, y + 43), fill="#f8fafc")
         blocked = (

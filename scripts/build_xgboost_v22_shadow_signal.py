@@ -14,7 +14,6 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-import requests
 
 from grid_xgboost_shadow_gate_v22 import atomic_json, build_contract, failed_contract
 from xgboost_v22_io import load_candles, sha256_file
@@ -43,25 +42,36 @@ def ensure_live_cache(cache_dir: Path, seed_cache_dir: Path | None) -> None:
         shutil.copy2(source, target)
 
 
-def refresh_binance_cache(cache_dir: Path) -> None:
+try:
+    from get_only_read_client import GetOnlyReadClient
+except ModuleNotFoundError:
+    from scripts.get_only_read_client import GetOnlyReadClient
+try:
+    from runtime_endpoints import binance_api_base
+except ModuleNotFoundError:
+    from live_guard.runtime_endpoints import binance_api_base
+
+
+def refresh_binance_cache(
+    cache_dir: Path, *, read_client: GetOnlyReadClient | None = None,
+) -> None:
     """Append complete Binance Spot 5m candles; this is v22 self-contained I/O."""
-    server = requests.get("https://api.binance.com/api/v3/time", timeout=15)
-    server.raise_for_status()
-    server_ms = int(server.json()["serverTime"])
+    client = read_client or GetOnlyReadClient(binance_api_base())
+    server = client.request("GET", "/api/v3/time", timeout=15)
+    server_ms = int(server["serverTime"])
     for pair in PAIRS:
         path = cache_dir / f"binance_{pair}_5m.csv"
         frame = pd.read_csv(path)
         cursor = int(float(frame.timestamp.max()) * 1000) + 300_000
         additions = []
         while cursor < server_ms:
-            response = requests.get(
-                "https://api.binance.com/api/v3/klines",
+            response = client.request(
+                "GET", "/api/v3/klines",
                 params={"symbol": pair.replace("-", ""), "interval": "5m",
                         "startTime": cursor, "limit": 1000},
                 timeout=20,
             )
-            response.raise_for_status()
-            rows = [item for item in response.json() if int(item[6]) < server_ms]
+            rows = [item for item in response if int(item[6]) < server_ms]
             if not rows:
                 break
             additions.extend({
@@ -159,7 +169,10 @@ def produce_once(args: argparse.Namespace) -> dict[str, Any]:
     if strategy_schema_sha256(bundle["strategy_spec"]) != lock["strategy_schema_sha256"]:
         raise ValueError("strategy hash mismatch")
     ensure_live_cache(args.cache_dir, args.seed_cache_dir)
-    if args.refresh_binance: refresh_binance_cache(args.cache_dir)
+    if args.refresh_binance:
+        refresh_binance_cache(
+            args.cache_dir, read_client=getattr(args, "read_client", None),
+        )
     candles = load_candles(args.cache_dir)
     for pair, frame in candles.items():
         if len(frame) < 45 * 24 * 12 or not np.all(np.diff(frame.timestamp.to_numpy(np.int64)) == 300):

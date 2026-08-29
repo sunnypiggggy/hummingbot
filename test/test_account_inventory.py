@@ -300,6 +300,123 @@ def test_existing_dust_job_migrates_without_reconfirmation():
         assert eth["confirmation_block_reason"] == "already_classified_dust"
 
 
+def test_dust_recheck_is_persistent_and_short_tradable_blip_keeps_episode():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ledger = UnifiedInventoryLedger(root)
+        ledger.start_job(
+            job_id="dust", asset="ETH", scope="unattributed_dust",
+            pair="ETH-USDT", requested_quantity=Decimal("0.0022"),
+            client_order_id="inv-dust", now=1,
+        )
+        ledger.finish_job("dust", status="DUST", error="below minimum", now=2)
+        value = ledger.reconcile(
+            account_fingerprint="account", balances=balances("0", "0.0527"),
+            ownership={"BTC": {}, "ETH": {"dca": "0.0505"}},
+            evidence_sha256="stable", open_order_counts={},
+            sources_healthy=True, now=100,
+        )
+        episode_id = value["assets"]["ETH"]["episode_id"]
+        observations = [ledger.observe_dust_recheck(
+            "ETH", episode_id=episode_id, evidence_sha256="tradable-evidence",
+            tradable_quantity=Decimal("0.0022"), eligible=True,
+            now=101 + index * 0.05,
+        ) for index in range(500)]
+        restarted = UnifiedInventoryLedger(root).observe_dust_recheck(
+            "ETH", episode_id=episode_id, evidence_sha256="tradable-evidence",
+            tradable_quantity=Decimal("0.0022"), eligible=True, now=126,
+        )
+        cancelled = UnifiedInventoryLedger(root).observe_dust_recheck(
+            "ETH", episode_id=episode_id, evidence_sha256="dust-again",
+            tradable_quantity=Decimal("0.0022"), eligible=False, now=117,
+        )
+        after = UnifiedInventoryLedger(root).reconcile(
+            account_fingerprint="account", balances=balances("0", "0.0527"),
+            ownership={"BTC": {}, "ETH": {"dca": "0.0505"}},
+            evidence_sha256="dynamic", open_order_counts={},
+            sources_healthy=True, now=118,
+        )["assets"]["ETH"]
+        assert observations[0]["cycles"] == 1
+        assert observations[-1]["cycles"] == 500
+        assert not any(row["confirmed"] for row in observations)
+        assert restarted["cycles"] == 501
+        assert not cancelled["active"]
+        assert after["episode_id"] == episode_id
+        assert after["inventory_phase"] == "DUST"
+        assert after["last_notified_transition"] == "INVENTORY_DUST_CLASSIFIED"
+
+
+def test_dust_recheck_requires_three_cycles_and_thirty_seconds_before_reopen():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ledger = UnifiedInventoryLedger(root)
+        ledger.start_job(
+            job_id="dust", asset="ETH", scope="unattributed_dust",
+            pair="ETH-USDT", requested_quantity=Decimal("0.0022"),
+            client_order_id="inv-dust", now=1,
+        )
+        ledger.finish_job("dust", status="DUST", error="below minimum", now=2)
+        old_episode = ledger.reconcile(
+            account_fingerprint="account", balances=balances("0", "0.0527"),
+            ownership={"BTC": {}, "ETH": {"dca": "0.0505"}},
+            evidence_sha256="stable", open_order_counts={},
+            sources_healthy=True, now=100,
+        )["assets"]["ETH"]["episode_id"]
+        results = [ledger.observe_dust_recheck(
+            "ETH", episode_id=old_episode, evidence_sha256="tradable",
+            tradable_quantity=Decimal("0.0022"), eligible=True, now=now,
+        ) for now in (101, 116, 132)]
+        assert [row["cycles"] for row in results] == [1, 2, 3]
+        assert [row["confirmed"] for row in results] == [False, False, True]
+        new_episode = ledger.reopen_dust_episode(
+            "ETH", expected_episode_id=old_episode,
+            evidence_sha256="new-stability", quantity=Decimal("0.0022"), now=132,
+        )
+        assert new_episode != old_episode
+        with ledger._connection() as connection:
+            episode = connection.execute(
+                "SELECT phase,last_notified_transition FROM inventory_episodes WHERE asset='ETH'"
+            ).fetchone()
+            assert connection.execute(
+                "SELECT COUNT(*) FROM dust_rechecks WHERE asset='ETH'"
+            ).fetchone()[0] == 0
+        assert episode["phase"] == "DETECTED"
+        assert episode["last_notified_transition"] == ""
+
+
+def test_dca_v22_current_error_is_cleared_but_recovery_history_is_preserved():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        contract_path = root / "contract.json"
+        contract_path.write_text("{}", encoding="utf-8")
+        guard = Guard.__new__(Guard)
+        guard.v22_observation_gate_path = contract_path
+        guard.v21_max_age_seconds = 150
+        guard.state = {"v22_observation": {
+            "release_sha256": "a" * 64,
+            "last_error": "Connection reset by peer",
+            "current_error_since": 90,
+            "source_error_total": 14,
+            "integrity_error_total": 0,
+        }}
+        healthy = {
+            "release_sha256": "a" * 64,
+            "runtime_gate_healthy": True,
+            "pairs": {
+                "BTC-FDUSD": {"event_id": "btc"},
+                "ETH-FDUSD": {"event_id": "eth"},
+            },
+        }
+        with patch("dca_live_guard.load_runtime_v22_contract", return_value=healthy):
+            guard._observe_v22_contract(100)
+        observation = guard.state["v22_observation"]
+        assert "last_error" not in observation
+        assert "current_error_since" not in observation
+        assert observation["last_recovered_error"] == "Connection reset by peer"
+        assert observation["last_recovered_at"] == 100
+        assert observation["source_error_total"] == 14
+
+
 def test_dust_that_cleared_then_reappeared_starts_new_confirmation_episode():
     with tempfile.TemporaryDirectory() as directory:
         ledger = UnifiedInventoryLedger(Path(directory))
@@ -429,19 +546,17 @@ def test_exit_preflight_rejects_shared_deficit_and_owner_overreach():
 
 
 def test_market_filter_zero_market_step_falls_back_to_lot_size(monkeypatch):
-    class Response:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
+    class ReadClient:
+        def request(self, *_args, **_kwargs):
             return {"symbols": [{"filters": [
                 {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.00000000"},
                 {"filterType": "LOT_SIZE", "stepSize": "0.00001000"},
                 {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
             ]}]}
 
-    monkeypatch.setattr("dca_live_guard.requests.get", lambda *args, **kwargs: Response())
-    step, minimum = Guard._lot_filter("BTC-USDT")
+    guard = Guard.__new__(Guard)
+    guard.binance_reads = ReadClient()
+    step, minimum = guard._lot_filter("BTC-USDT")
     assert step == Decimal("0.00001000")
     assert minimum == Decimal("5")
 

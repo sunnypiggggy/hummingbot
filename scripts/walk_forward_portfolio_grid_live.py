@@ -426,11 +426,15 @@ class LivePortfolioGrid(StrategyV2Base):
                 self._clear_maker_deferred_layers(set(self.config.trading_pairs))
                 if self._owned_active_orders(active):
                     self.cancel_owned_orders()
+                else:
+                    self._mark_expected_empty_for_active_gates()
                 self._persist(prices)
                 self.first_cycle_failure_at = None
                 return
 
             self._clear_ineligible_maker_deferred_layers()
+
+            self._mark_expected_empty_for_active_gates(active)
 
             if self._advance_risk_recovery(prices, active):
                 self._persist(prices)
@@ -898,6 +902,28 @@ class LivePortfolioGrid(StrategyV2Base):
             "maker_longest_recovery_seconds": 0.0,
             "maker_last_recovered_at": None,
         }
+
+    def _mark_expected_empty_for_active_gates(self, active_orders: list | None = None) -> None:
+        """Remove stale healthy snapshots only after risk-owned orders are gone."""
+        active_orders = list(active_orders or [])
+        for pair in self.config.trading_pairs:
+            recovery = self.pair_recovery.get(pair, {})
+            phase = str(recovery.get("phase") or ACTIVE)
+            if phase == ACTIVE and not self.macro_paused:
+                continue
+            buy_count, sell_count = self._pair_order_counts(pair, active_orders)
+            if buy_count + sell_count:
+                continue
+            reason = (
+                f"{recovery.get('mechanism') or 'risk_recovery'}:{phase}"
+                if phase != ACTIVE else f"fomc_gate:{self.macro_reason}"
+            )
+            self._order_status(pair).update({
+                "state": "EXPECTED_EMPTY", "reason": reason,
+                "expected_buy_layers": 0, "expected_sell_layers": 0,
+                "actual_buy_layers": 0, "actual_sell_layers": 0,
+                "consecutive_empty_cycles": 0, "first_empty_at": None,
+            })
 
     def _pair_amount_filters(self, pair: str) -> tuple[Decimal, Decimal]:
         rules = getattr(self.connector, "trading_rules", {}) or {}

@@ -164,13 +164,14 @@ def _runtime_deployment(
 class V22LiveGateProducer:
     def __init__(self, *, package_dir: Path, cache_dir: Path, seed_cache_dir: Path,
                  state_dir: Path, authorization_path: Path, refresh_binance: bool = True,
-                 runtime_root: Path | None = None):
+                 runtime_root: Path | None = None, read_client: Any | None = None):
         self.package_dir = package_dir
         self.cache_dir = cache_dir
         self.seed_cache_dir = seed_cache_dir
         self.state_dir = state_dir
         self.authorization_path = authorization_path
         self.refresh_binance = refresh_binance
+        self.read_client = read_client
         self.runtime_root = runtime_root or state_dir / "v22-runtime"
         self.output = state_dir / "xgboost_risk_gate.json"
         self.shadow_output = state_dir / "xgboost_risk_gate_v22_internal.json"
@@ -421,6 +422,7 @@ class V22LiveGateProducer:
                 observed_at=observed, lock=lock_path, cache_dir=self.cache_dir,
                 seed_cache_dir=self.seed_cache_dir, output=shadow_output,
                 state=shadow_state, refresh_binance=self.refresh_binance,
+                read_client=self.read_client,
             ))
             authorized, receipt, receipt_hash = _authorization(
                 authorization, production, observed,

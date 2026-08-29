@@ -17,6 +17,42 @@ from ethbtc_forced_exit_contract import MODEL_VERSION, PACKAGE_ID, SCHEMA  # noq
 
 
 class GridGuardShadowTest(unittest.TestCase):
+    def test_risk_off_normalizes_stale_order_snapshot_to_expected_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "grid.sqlite"
+            database.touch()
+            (root / "live_grid_runtime_state.json").write_text(json.dumps({
+                "trading_pairs": ["BTC-FDUSD", "ETH-FDUSD"],
+                "pair_recovery": {
+                    "BTC-FDUSD": {"phase": "ACTIVE"},
+                    "ETH-FDUSD": {"phase": "ACTIVE"},
+                },
+                "macro_gate": {"paused": False},
+                "order_build_status": {
+                    "BTC-FDUSD": {
+                        "state": "HEALTHY", "reason": "orders_submitted",
+                        "expected_buy_layers": 3, "expected_sell_layers": 4,
+                    },
+                    "ETH-FDUSD": {"state": "HEALTHY", "reason": "orders_submitted"},
+                },
+            }), encoding="utf-8")
+            guard = Guard.__new__(Guard)
+            guard.state = {"xgboost_risk_gate": {
+                "source_healthy": True,
+                "pairs": {
+                    "BTC-FDUSD": {"model_signal": "RISK_OFF", "risk_off_active": True},
+                    "ETH-FDUSD": {"model_signal": "RISK_ON", "risk_off_active": False},
+                },
+            }}
+            value = guard._effective_order_status({"database": str(database)})
+            assert value["BTC-FDUSD"]["state"] == "EXPECTED_EMPTY"
+            assert value["BTC-FDUSD"]["reason"] == "v22_risk_off"
+            assert value["BTC-FDUSD"]["expected_buy_layers"] == 0
+            assert value["BTC-FDUSD"]["trading_expected"] is False
+            assert value["ETH-FDUSD"]["state"] == "HEALTHY"
+            assert value["ETH-FDUSD"]["trading_expected"] is True
+
     def test_runtime_error_active_lookup_is_defensive(self):
         channel = Mock()
         channel.state = {"components": {"v22_contract_refresh": {"active": True}}}

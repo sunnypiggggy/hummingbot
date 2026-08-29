@@ -20,7 +20,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "test" / "support"))
 
 from account_inventory import UnifiedInventoryLedger  # noqa: E402
-from dca_live_guard import ApiClient, BinanceEmergencyClient, Guard  # noqa: E402
+from dca_live_guard import (  # noqa: E402
+    ApiClient, BinanceEmergencyClient, GetOnlyReadClient, Guard,
+)
 from grid_live_guard import Guard as GridGuard  # noqa: E402
 from emergency_execution import (  # noqa: E402
     execute_market_liquidation, verify_market_liquidation,
@@ -533,7 +535,9 @@ def test_public_exchange_filter_change_is_consumed_over_real_http(monkeypatch):
     }]
     with RiskScenarioServer(document) as server:
         enable_scenario(monkeypatch, server, "filter-change")
-        step, minimum = Guard._lot_filter("BTC-USDT")
+        guard = Guard.__new__(Guard)
+        guard.binance_reads = GetOnlyReadClient(binance_api_base())
+        step, minimum = guard._lot_filter("BTC-USDT")
         assert step == Decimal("0.0002")
         assert minimum == Decimal("12")
 

@@ -67,6 +67,7 @@ from live_guard.grid_live_guard import (  # noqa: E402
     fill_pnl,
     peak_drawdown,
 )
+from build_xgboost_v22_shadow_signal import refresh_binance_cache  # noqa: E402
 
 
 class _DisconnectOnceHandler(BaseHTTPRequestHandler):
@@ -158,7 +159,8 @@ class GridGuardHttpRetryTest(unittest.TestCase):
         self.assertTrue(retries[0]["pool_replaced"])
 
     def test_exhausted_adapter_discards_pool_and_uses_one_final_get(self):
-        _DisconnectOnceHandler.disconnect_gets = 3
+        # Initial GET + one pooled retry fail; the final fresh-pool GET wins.
+        _DisconnectOnceHandler.disconnect_gets = 2
         with patch.dict("os.environ", {
             "HUMMINGBOT_API_URL": self.base_url,
             "USERNAME": "test-user",
@@ -167,9 +169,10 @@ class GridGuardHttpRetryTest(unittest.TestCase):
             client = GuardApiClient()
             self.assertEqual({"healthy": True}, client.status())
             retries = client.consume_read_retry_events()
-        self.assertEqual(4, _DisconnectOnceHandler.get_calls)
+        self.assertEqual(3, _DisconnectOnceHandler.get_calls)
         self.assertEqual(1, len(retries))
         self.assertTrue(retries[0]["pool_replaced"])
+        self.assertEqual(2, retries[0]["attempts"])
 
     def test_trading_post_is_not_retried_after_remote_disconnect(self):
         with patch.dict("os.environ", {
@@ -222,6 +225,37 @@ class GridGuardHttpRetryTest(unittest.TestCase):
             retries = client.consume_read_retry_events()
         self.assertEqual("grid-live-fdusd-400", result[0]["name"])
         self.assertEqual(1, len(retries))
+
+    def test_v22_time_and_klines_use_injected_get_only_client(self):
+        class ReadClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, path, **kwargs):
+                self.calls.append((method, path, kwargs.get("params")))
+                if path == "/api/v3/time":
+                    return {"serverTime": 600_000}
+                return [[300_000, "1", "2", "0.5", "1.5", "10", 599_999]]
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            for pair in ("BTC-FDUSD", "ETH-FDUSD"):
+                pd.DataFrame([{
+                    "timestamp": 0, "open": 1, "high": 1,
+                    "low": 1, "close": 1, "volume": 1,
+                }]).to_csv(cache / f"binance_{pair}_5m.csv", index=False)
+            client = ReadClient()
+            with patch("requests.get", side_effect=AssertionError("direct GET forbidden")):
+                refresh_binance_cache(cache, read_client=client)
+            self.assertEqual(
+                [("GET", "/api/v3/time"),
+                 ("GET", "/api/v3/klines"),
+                 ("GET", "/api/v3/klines")],
+                [(method, path) for method, path, _params in client.calls],
+            )
+            for pair in ("BTC-FDUSD", "ETH-FDUSD"):
+                frame = pd.read_csv(cache / f"binance_{pair}_5m.csv")
+                self.assertEqual([0, 300], frame.timestamp.tolist())
 
 
 class GridLiveSafetyTest(unittest.TestCase):

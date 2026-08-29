@@ -142,6 +142,12 @@ class UnifiedInventoryLedger:
                     stability_sha256 TEXT NOT NULL, created_at REAL NOT NULL,
                     updated_at REAL NOT NULL, last_notified_transition TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS dust_rechecks (
+                    asset TEXT PRIMARY KEY, episode_id TEXT NOT NULL,
+                    evidence_sha256 TEXT NOT NULL, tradable_quantity TEXT NOT NULL,
+                    first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+                    cycles INTEGER NOT NULL, updated_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS leases (
                     asset TEXT PRIMARY KEY, holder TEXT NOT NULL,
                     acquired_at REAL NOT NULL, expires_at REAL NOT NULL
@@ -270,6 +276,84 @@ class UnifiedInventoryLedger:
                 "WHERE asset=?",
                 (transition, now, asset),
             )
+
+    def observe_dust_recheck(
+        self, asset: str, *, episode_id: str, evidence_sha256: str,
+        tradable_quantity: Decimal, eligible: bool, now: float | None = None,
+        confirmation_cycles: int = 3, confirmation_seconds: float = 30,
+    ) -> dict[str, Any]:
+        """Persist a possible DUST->tradable transition without reopening it."""
+        now = time.time() if now is None else float(now)
+        with self._connection() as connection:
+            if not eligible:
+                connection.execute("DELETE FROM dust_rechecks WHERE asset=?", (asset,))
+                return {
+                    "active": False, "cycles": 0, "first_seen": now,
+                    "last_seen": now, "confirmed": False,
+                }
+            current = connection.execute(
+                "SELECT * FROM dust_rechecks WHERE asset=?", (asset,)
+            ).fetchone()
+            stable = bool(
+                current is not None
+                and str(current["episode_id"]) == str(episode_id)
+                and str(current["evidence_sha256"]) == str(evidence_sha256)
+                and decimal(current["tradable_quantity"]) == decimal(tradable_quantity)
+            )
+            first_seen = float(current["first_seen"]) if stable else now
+            cycles = int(current["cycles"]) + 1 if stable else 1
+            connection.execute(
+                "INSERT OR REPLACE INTO dust_rechecks"
+                "(asset,episode_id,evidence_sha256,tradable_quantity,first_seen,"
+                "last_seen,cycles,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (asset, episode_id, evidence_sha256, str(decimal(tradable_quantity)),
+                 first_seen, now, cycles, now),
+            )
+            return {
+                "active": True, "cycles": cycles, "first_seen": first_seen,
+                "last_seen": now,
+                "confirmed": bool(
+                    cycles >= max(1, int(confirmation_cycles))
+                    and now - first_seen >= max(0.0, float(confirmation_seconds))
+                ),
+                "episode_id": episode_id,
+                "evidence_sha256": evidence_sha256,
+                "tradable_quantity": str(decimal(tradable_quantity)),
+            }
+
+    def reopen_dust_episode(
+        self, asset: str, *, expected_episode_id: str,
+        evidence_sha256: str, quantity: Decimal, now: float | None = None,
+    ) -> str:
+        """Atomically create a new confirmation episode after stable recheck."""
+        now = time.time() if now is None else float(now)
+        with self._connection() as connection:
+            current = connection.execute(
+                "SELECT * FROM inventory_episodes WHERE asset=?", (asset,)
+            ).fetchone()
+            if (
+                current is None or str(current["phase"]) != "DUST"
+                or str(current["episode_id"]) != str(expected_episode_id)
+            ):
+                raise RuntimeError("dust episode changed during stable recheck")
+            new_episode_id = canonical_sha256({
+                "asset": asset, "previous_episode_id": expected_episode_id,
+                "evidence_sha256": evidence_sha256, "created_at": now,
+            })
+            connection.execute(
+                "UPDATE inventory_episodes SET episode_id=?,phase='DETECTED',"
+                "quantity=?,stability_sha256=?,created_at=?,updated_at=?,"
+                "last_notified_transition='' WHERE asset=?",
+                (new_episode_id, str(decimal(quantity)), evidence_sha256,
+                 now, now, asset),
+            )
+            connection.execute("DELETE FROM confirmations WHERE asset=?", (asset,))
+            connection.execute("DELETE FROM dust_rechecks WHERE asset=?", (asset,))
+            return new_episode_id
+
+    def clear_dust_recheck(self, asset: str) -> None:
+        with self._connection() as connection:
+            connection.execute("DELETE FROM dust_rechecks WHERE asset=?", (asset,))
 
     def write_status(self, payload: Mapping[str, Any]) -> None:
         _atomic_json(self.status_path, payload)
@@ -406,6 +490,7 @@ class UnifiedInventoryLedger:
                 ).fetchone()
                 if unattributed <= 0:
                     connection.execute("DELETE FROM confirmations WHERE asset=?", (asset,))
+                    connection.execute("DELETE FROM dust_rechecks WHERE asset=?", (asset,))
                     if episode is not None and episode["phase"] != "RECOVERED":
                         connection.execute(
                             "UPDATE inventory_episodes SET phase='RECOVERED',quantity='0',"
@@ -457,6 +542,11 @@ class UnifiedInventoryLedger:
                     ).fetchone()
 
                 phase = str(episode["phase"]) if episode is not None else "CLEAR"
+                if phase != "DUST":
+                    connection.execute("DELETE FROM dust_rechecks WHERE asset=?", (asset,))
+                dust_recheck = connection.execute(
+                    "SELECT * FROM dust_rechecks WHERE asset=?", (asset,)
+                ).fetchone()
                 confirmation_eligible = bool(
                     sources_healthy and deficit == 0 and unattributed > 0
                     and phase not in {"DUST", "LIQUIDATING"}
@@ -521,6 +611,18 @@ class UnifiedInventoryLedger:
                         "cycles": cycles, "first_seen": first_seen,
                         "last_seen": now, "confirmed": confirmed,
                     },
+                    "dust_recheck": ({
+                        "active": True,
+                        "episode_id": str(dust_recheck["episode_id"]),
+                        "evidence_sha256": str(dust_recheck["evidence_sha256"]),
+                        "tradable_quantity": str(dust_recheck["tradable_quantity"]),
+                        "cycles": int(dust_recheck["cycles"]),
+                        "first_seen": float(dust_recheck["first_seen"]),
+                        "last_seen": float(dust_recheck["last_seen"]),
+                        "confirmed": False,
+                    } if dust_recheck is not None else {
+                        "active": False, "cycles": 0, "confirmed": False,
+                    }),
                     "deficit_confirmation": {
                         "cycles": deficit_cycles,
                         "first_seen": first_deficit_seen,

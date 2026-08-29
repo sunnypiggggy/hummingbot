@@ -17,8 +17,6 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from grid_live_common import (
     PAIR_DRAWDOWN_LIMIT_PCT, PORTFOLIO_DRAWDOWN_LIMIT_PCT, PORTFOLIOS,
@@ -42,6 +40,7 @@ from risk_recovery import (
     REQUIRED_HEALTHY_CYCLES,
     STRATEGY_COOLDOWN_SECONDS,
     advance_integrity_failure,
+    classify_integrity_failure,
 )
 try:
     from account_inventory import (
@@ -86,25 +85,14 @@ except ImportError:  # Docker image layout
 
 LOG = logging.getLogger("grid-live-guard")
 
+try:
+    from get_only_read_client import GetOnlyReadClient, read_retry_session
+except ModuleNotFoundError:
+    from scripts.get_only_read_client import GetOnlyReadClient, read_retry_session
+
 
 def _read_retry_session(*, retry_total: int = 2) -> requests.Session:
-    """Retry only idempotent reads; trading writes must never be replayed."""
-    session = requests.Session()
-    retry = Retry(
-        total=retry_total,
-        connect=retry_total,
-        read=retry_total,
-        status=retry_total,
-        backoff_factor=0.1,
-        allowed_methods=frozenset({"GET"}),
-        status_forcelist=(429, 500, 502, 503, 504),
-        respect_retry_after_header=True,
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+    return read_retry_session(retry_total=retry_total)
 BINANCE_API = OFFICIAL_BINANCE_API
 SCALE = Decimal("1000000")
 
@@ -155,98 +143,6 @@ def peak_drawdown(current_equity: Decimal, stored_peak: Decimal,
     peak = max(stored_peak, initial_equity, current_equity)
     drawdown = (peak - current_equity) / peak if peak > 0 else Decimal("0")
     return peak, drawdown
-
-
-class GetOnlyReadClient:
-    """Persistent HTTP client whose automatic recovery is limited to GET.
-
-    urllib3 handles two ordinary connection/read/status retries.  If a server
-    closes every socket in the pooled Session, a final GET is made with a
-    fresh, no-retry Session.  Mutating methods never enter either retry path.
-    """
-
-    def __init__(self, base: str, *, auth: tuple[str, str] | None = None):
-        self.base = base.rstrip("/")
-        self.auth = auth
-        self.session = self._new_session()
-        self._read_retry_events: list[dict[str, Any]] = []
-
-    def _new_session(self, *, retry_total: int = 2) -> requests.Session:
-        session = _read_retry_session(retry_total=retry_total)
-        if self.auth is not None:
-            session.auth = self.auth
-        return session
-
-    @staticmethod
-    def _retry_history(response: requests.Response) -> list[Any]:
-        retries = getattr(getattr(response, "raw", None), "retries", None)
-        return list(getattr(retries, "history", ()) or ())
-
-    @staticmethod
-    def _is_remote_disconnect(error: BaseException) -> bool:
-        current: BaseException | None = error
-        while current is not None:
-            if type(current).__name__ == "RemoteDisconnected":
-                return True
-            text = str(current).lower()
-            if "remote end closed connection" in text or "connection aborted" in text:
-                return True
-            current = current.__cause__ or current.__context__
-        return False
-
-    def _replace_session(self) -> None:
-        previous = self.session
-        self.session = self._new_session()
-        previous.close()
-
-    def consume_read_retry_events(self) -> list[dict[str, Any]]:
-        events, self._read_retry_events = self._read_retry_events, []
-        return events
-
-    def request(
-        self, method: str, path: str, payload: Dict[str, Any] | None = None,
-        *, params: Mapping[str, Any] | None = None, timeout: float = 30,
-    ) -> Any:
-        method = method.upper()
-        url = f"{self.base}{path}"
-        try:
-            response = self.session.request(
-                method, url, json=payload, params=params, timeout=timeout,
-            )
-        except requests.exceptions.ConnectionError as exc:
-            if method != "GET" or not self._is_remote_disconnect(exc):
-                raise
-            # urllib3 has exhausted the normal read policy. Discard the entire
-            # stale pool and make exactly one final GET on a no-retry session.
-            self.session.close()
-            one_shot = self._new_session(retry_total=0)
-            started = time.monotonic()
-            try:
-                response = one_shot.request(
-                    method, url, json=payload, params=params, timeout=timeout,
-                )
-            finally:
-                one_shot.close()
-                self.session = self._new_session()
-            self._read_retry_events.append({
-                "path": path, "attempts": 1, "pool_replaced": True,
-                "duration_seconds": max(0.0, time.monotonic() - started),
-                "reason": sanitize_runtime_error(exc),
-            })
-        history = self._retry_history(response) if method == "GET" else []
-        if history:
-            reasons = [sanitize_runtime_error(item.error) for item in history if item.error]
-            self._read_retry_events.append({
-                "path": path, "attempts": len(history), "pool_replaced": True,
-                "duration_seconds": 0.0,
-                "reason": reasons[-1] if reasons else "transient GET retry",
-            })
-            # A successful retry proves that the old connection was unusable.
-            # Recreate the session so later cycles cannot reuse any sibling
-            # sockets from the same stale pool.
-            self._replace_session()
-        response.raise_for_status()
-        return response.json() if response.content else {}
 
 
 class ApiClient(GetOnlyReadClient):
@@ -355,6 +251,7 @@ class Guard:
             "portfolio_drawdown_breaker": os.getenv("GRID_RISK_PORTFOLIO_DRAWDOWN_BREAKER_ENABLED", "true").lower() == "true",
             "position_protection": os.getenv("GRID_RISK_POSITION_PROTECTION_ENABLED", "true").lower() == "true",
         }
+        self.binance_reads = GetOnlyReadClient(binance_api_base())
         if self.v21_in_guard_enabled:
             # Keep the heavyweight XGBoost/joblib dependency inside the Guard
             # container's inference path.  Importing Guard utilities for
@@ -389,6 +286,7 @@ class Guard:
                 runtime_root=Path(os.getenv(
                     "V22_RUNTIME_ROOT", "/workspace/state/v22-runtime",
                 )),
+                read_client=self.binance_reads,
             )
             self.v22_producer.output = self.v22_observation_gate_path
         else:
@@ -399,7 +297,6 @@ class Guard:
             raise RuntimeError("armed Grid Guard requires the in-process v22 producer")
         self.next_technical_refresh = 0.0
         self.api = ApiClient()
-        self.binance_reads = GetOnlyReadClient(binance_api_base())
         secret_path = Path(os.getenv(
             "GRID_BINANCE_EMERGENCY_CREDENTIALS_FILE",
             "/run/secrets/grid_binance_emergency_credentials",
@@ -696,6 +593,7 @@ class Guard:
         self._emit_notification(event, details)
 
     def _record_read_retry_events(self) -> None:
+        telemetry = self.state.setdefault("read_retry_telemetry", {})
         for source, client in (
             ("hummingbot_api", getattr(self, "api", None)),
             ("binance_public", getattr(self, "binance_reads", None)),
@@ -704,11 +602,28 @@ class Guard:
                 continue
             consume = getattr(client, "consume_read_retry_events", lambda: [])
             for retry in consume():
+                row = telemetry.setdefault(source, {
+                    "retry_events": 0, "retry_attempts": 0,
+                    "pool_replacements": 0, "longest_recovery_seconds": 0.0,
+                })
+                row["retry_events"] = int(row.get("retry_events", 0)) + 1
+                row["retry_attempts"] = int(row.get("retry_attempts", 0)) + int(
+                    retry.get("attempts", 1)
+                )
+                row["pool_replacements"] = int(row.get("pool_replacements", 0)) + int(
+                    bool(retry.get("pool_replaced"))
+                )
+                duration = float(retry.get("duration_seconds", 0.0))
+                row["longest_recovery_seconds"] = max(
+                    float(row.get("longest_recovery_seconds", 0.0)), duration,
+                )
+                row["last_recovered_at"] = time.time()
+                row["last_reason"] = str(retry.get("reason") or "transient GET retry")
                 self.runtime_errors.record_transient_recovery(
                     f"guard_read:{source}",
                     retry.get("reason", "transient GET retry"),
                     occurrences=int(retry.get("attempts", 1)),
-                    duration_seconds=float(retry.get("duration_seconds", 0.0)),
+                    duration_seconds=duration,
                 )
 
     def _emit_notification(self, audit_event: str, details: Dict[str, Any]) -> None:
@@ -974,9 +889,13 @@ class Guard:
         observation = self.state.setdefault("v22_observation", {})
         release = str(v22_gate.get("release_sha256", ""))
         if release and observation.get("release_sha256") != release:
+            source_error_total = int(observation.get("source_error_total", 0))
+            integrity_error_total = int(observation.get("integrity_error_total", 0))
             observation.clear()
             observation.update({"release_sha256": release, "started_at": now, "cycles": 0,
-                                "source_errors": 0, "integrity_errors": 0})
+                                "source_errors": 0, "integrity_errors": 0,
+                                "source_error_total": source_error_total,
+                                "integrity_error_total": integrity_error_total})
         observation["last_seen_at"] = now
         observation["cycles"] = int(observation.get("cycles", 0)) + 1
         observation["event_ids"] = {
@@ -984,11 +903,22 @@ class Guard:
         }
         if not v22_runtime.get("runtime_gate_healthy"):
             failure = str(v22_runtime.get("reason", ""))
-            category = "source_errors" if any(
-                marker in failure.lower() for marker in ("timeout", "connection", "temporarily")
-            ) else "integrity_errors"
+            category = (
+                "source_errors"
+                if classify_integrity_failure(failure) == "transient_transport"
+                else "integrity_errors"
+            )
             observation[category] = int(observation.get(category, 0)) + 1
+            total_key = "source_error_total" if category == "source_errors" else "integrity_error_total"
+            observation[total_key] = int(observation.get(total_key, 0)) + 1
             observation["last_error"] = failure
+            observation["current_error_since"] = observation.get(
+                "current_error_since", now,
+            )
+        elif observation.get("last_error"):
+            observation["last_recovered_error"] = observation.pop("last_error")
+            observation["last_recovered_at"] = now
+            observation.pop("current_error_since", None)
         cutover = bool(self.state.get("v22_cutover_complete"))
         if bool(v22_gate.get("execution_authorized")):
             cutover = True
@@ -1040,6 +970,9 @@ class Guard:
                         reason=raw_failure,
                         grace_seconds=self.fail_closed_seconds,
                     )
+                self.next_technical_refresh = min(
+                    self.next_technical_refresh, now + getattr(self, "interval", 2),
+                )
                 if hasattr(self, "runtime_errors"):
                     self.runtime_errors.failure(
                         "v22_contract_refresh",
@@ -1047,6 +980,10 @@ class Guard:
                         trading_impact=(
                             "Transient source failure: keep the last still-valid signed contract; "
                             "retry without forced exit or integrity latch."
+                        ),
+                        now=now,
+                        notify_after_seconds=getattr(
+                            self, "runtime_error_notify_after_seconds", 6,
                         ),
                     )
             else:
@@ -1072,6 +1009,12 @@ class Guard:
                         trading_impact=(
                             "Integrity failure or transport grace expired; publish Fail-Closed "
                             "and let the existing exit/latch path take control."
+                        ),
+                        now=now,
+                        notify_after_seconds=(
+                            getattr(self, "runtime_error_notify_after_seconds", 6)
+                            if failure["classification"] == "transient_transport"
+                            else 0
                         ),
                     )
         else:
@@ -1434,6 +1377,59 @@ class Guard:
                 return True, f"recoverable {pair} exit remained incomplete for {age:.1f}s"
         return False, "no stuck recoverable exit"
 
+    def _effective_order_status(self, snapshot: dict) -> dict[str, dict[str, Any]]:
+        """Normalize executor facts with active gates for status consumers."""
+        if not snapshot.get("database"):
+            return {}
+        runtime_path = Path(snapshot["database"]).parent / "live_grid_runtime_state.json"
+        if not runtime_path.is_file():
+            return {}
+        try:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        gate = dict(self.state.get("xgboost_risk_gate") or {})
+        gate_pairs = gate.get("pairs", {}) if isinstance(gate.get("pairs"), dict) else {}
+        macro = runtime.get("macro_gate", {}) if isinstance(runtime.get("macro_gate"), dict) else {}
+        result: dict[str, dict[str, Any]] = {}
+        pairs = runtime.get("trading_pairs") or list(gate_pairs)
+        for pair in pairs:
+            raw = dict(runtime.get("order_build_status", {}).get(pair, {}))
+            portfolio_recovery = runtime.get("portfolio_recovery", {})
+            pair_recovery = runtime.get("pair_recovery", {}).get(pair, {})
+            recovery = (
+                portfolio_recovery
+                if str(portfolio_recovery.get("phase") or "ACTIVE") != "ACTIVE"
+                else pair_recovery
+            )
+            phase = str(recovery.get("phase") or "ACTIVE")
+            signal = dict(gate_pairs.get(pair, {}))
+            reason = ""
+            if phase != "ACTIVE":
+                mechanism = str(recovery.get("mechanism") or "risk_recovery")
+                reason = f"{mechanism}:{phase}"
+            elif bool(macro.get("paused")):
+                reason = f"fomc_gate:{macro.get('reason') or 'paused'}"
+            elif signal and (
+                bool(signal.get("risk_off_active"))
+                or str(signal.get("model_signal") or "") == "RISK_OFF"
+            ):
+                reason = "v22_risk_off"
+            elif gate and not bool(gate.get("source_healthy", True)):
+                reason = "model_signal_unavailable"
+            if reason:
+                raw.update({
+                    "state": "EXPECTED_EMPTY", "reason": reason,
+                    "expected_buy_layers": 0, "expected_sell_layers": 0,
+                    "actual_buy_layers": 0, "actual_sell_layers": 0,
+                    "trading_expected": False,
+                })
+            else:
+                raw["trading_expected"] = True
+            raw["source"] = "grid_guard_effective_order_status_v1"
+            result[str(pair)] = raw
+        return result
+
     @staticmethod
     def _items(payload: Any) -> list[dict]:
         if isinstance(payload, list):
@@ -1604,6 +1600,8 @@ class Guard:
             })
             bot["peak_equity"] = str(peak)
             bot["latest"] = snapshot
+            if key == "FDUSD":
+                self.state["effective_order_status"] = self._effective_order_status(snapshot)
             stuck, stuck_reason = self._stuck_recoverable_exit(snapshot) if key == "FDUSD" else (False, "")
             if stuck:
                 self.trip(key, stuck_reason, snapshot)

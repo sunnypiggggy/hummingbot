@@ -1101,6 +1101,10 @@ class UnifiedTelegramReporting:
 
     def _dca_cards(self, report: Mapping[str, Any], now: datetime) -> list[dict[str, Any]]:
         guard = self._load(self.dca_state / "guard_state.json")
+        v22_observation = guard.get("v22_observation", {})
+        dca_read_telemetry = guard.get("read_retry_telemetry", {}).get(
+            "binance_public", {}
+        )
         inventory_status = self._load(self.inventory_status_path)
         cutover = self._load(self.grid_state / "v22_cutover_status.json")
         output = []
@@ -1262,6 +1266,18 @@ class UnifiedTelegramReporting:
                 ),
                 "warnings": warnings,
                 "unattributed_dust": dust,
+                "runtime_health": {
+                    "current_error": v22_observation.get("last_error"),
+                    "last_recovered_error": v22_observation.get("last_recovered_error"),
+                    "last_recovered_at": v22_observation.get("last_recovered_at"),
+                    "source_error_total": int(v22_observation.get("source_error_total", 0)),
+                    "integrity_error_total": int(v22_observation.get("integrity_error_total", 0)),
+                    "read_retry_attempts": int(dca_read_telemetry.get("retry_attempts", 0)),
+                    "pool_replacements": int(dca_read_telemetry.get("pool_replacements", 0)),
+                    "longest_read_recovery_seconds": float(
+                        dca_read_telemetry.get("longest_recovery_seconds", 0.0)
+                    ),
+                },
                 "trading_status": trading_status,
             }
             output.append(item)
@@ -1325,6 +1341,8 @@ class UnifiedTelegramReporting:
 
     def _grid_cards(self, now: datetime) -> list[dict[str, Any]]:
         state = self._load(self.grid_state / "guard_state.json")
+        v22_observation = state.get("v22_observation", {})
+        grid_read_telemetry = state.get("read_retry_telemetry", {})
         macro = self._load(self.grid_state / "macro_gate.json")
         bot_name = "grid-live-fdusd-400"
         bot = state.get("bots", {}).get(bot_name, {})
@@ -1374,7 +1392,9 @@ class UnifiedTelegramReporting:
             pair_params = active_pair_parameters.get(pair, {})
             effective_buy_layers = len(pair_order_ids & runtime_buy_ids)
             effective_sell_layers = len(pair_order_ids & runtime_sell_ids)
-            order_build = runtime.get("order_build_status", {}).get(pair, {})
+            order_build = state.get("effective_order_status", {}).get(
+                pair, runtime.get("order_build_status", {}).get(pair, {})
+            )
             order_build_state = str(order_build.get("state") or "UNKNOWN").upper()
             order_build_healthy = order_build_state in {
                 "HEALTHY", "EXPECTED_EMPTY", "INTENTIONAL_IDLE",
@@ -1540,6 +1560,29 @@ class UnifiedTelegramReporting:
                 "warnings": warnings,
                 "unattributed_dust": dust,
                 "runtime_transport": transport_summary,
+                "runtime_health": {
+                    "current_error": v22_observation.get("last_error"),
+                    "last_recovered_error": v22_observation.get("last_recovered_error"),
+                    "last_recovered_at": v22_observation.get("last_recovered_at"),
+                    "source_error_total": int(v22_observation.get("source_error_total", 0)),
+                    "integrity_error_total": int(v22_observation.get("integrity_error_total", 0)),
+                    "read_retry_attempts": sum(
+                        int(row.get("retry_attempts", 0))
+                        for row in grid_read_telemetry.values()
+                        if isinstance(row, Mapping)
+                    ),
+                    "pool_replacements": sum(
+                        int(row.get("pool_replacements", 0))
+                        for row in grid_read_telemetry.values()
+                        if isinstance(row, Mapping)
+                    ),
+                    "longest_read_recovery_seconds": max(
+                        (float(row.get("longest_recovery_seconds", 0.0))
+                         for row in grid_read_telemetry.values()
+                         if isinstance(row, Mapping)),
+                        default=0.0,
+                    ),
+                },
                 "trading_status": trading_status,
             }
             output.append(item)

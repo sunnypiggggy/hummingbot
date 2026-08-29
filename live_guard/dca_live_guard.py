@@ -23,8 +23,6 @@ from urllib.parse import quote, urlencode
 
 import requests
 import yaml
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from dca_live_common import (
     ACCOUNT_NAME,
@@ -67,6 +65,7 @@ from risk_recovery import (
     POSITION_COOLDOWN_SECONDS, PORTFOLIO_COOLDOWN_SECONDS,
     REQUIRED_HEALTHY_CYCLES, STRATEGY_COOLDOWN_SECONDS,
     advance_integrity_failure, advance_recovery, active_state,
+    classify_integrity_failure,
     mark_exit_complete, mark_reentry_complete, normalize_state, trigger_state,
 )
 try:
@@ -86,27 +85,14 @@ V22_PAIR_MAP = V21_PAIR_MAP
 STOP_LOSS_EVENT_CURSOR_SCHEMA = "dca-stop-loss-event-v3"
 
 
+try:
+    from get_only_read_client import GetOnlyReadClient, read_retry_session
+except ModuleNotFoundError:
+    from scripts.get_only_read_client import GetOnlyReadClient, read_retry_session
+
+
 def _read_retry_session() -> requests.Session:
-    """Retry only idempotent reads; trading writes must never be replayed."""
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        connect=2,
-        read=2,
-        status=2,
-        backoff_factor=0.1,
-        allowed_methods=frozenset({"GET"}),
-        status_forcelist=(429, 500, 502, 503, 504),
-        respect_retry_after_header=True,
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-READ_SESSION = _read_retry_session()
+    return read_retry_session(retry_total=2)
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -521,6 +507,7 @@ class Guard:
             ),
         })
         self.interval = max(2, int(os.getenv("DCA_LIVE_GUARD_INTERVAL", "10")))
+        self.binance_reads = GetOnlyReadClient(binance_api_base())
         self.fail_closed_seconds = max(20, int(os.getenv("DCA_LIVE_FAIL_CLOSED_SECONDS", "60")))
         self.v21_gate_path = Path(os.getenv(
             "DCA_V22_GATE_PATH",
@@ -691,6 +678,36 @@ class Guard:
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.state, indent=2, sort_keys=True), encoding="utf-8")
         temporary.replace(self.state_path)
+
+    def _record_read_retry_events(self) -> None:
+        client = getattr(self, "binance_reads", None)
+        if client is None:
+            return
+        telemetry = self.state.setdefault("read_retry_telemetry", {})
+        for retry in client.consume_read_retry_events():
+            row = telemetry.setdefault("binance_public", {
+                "retry_events": 0, "retry_attempts": 0,
+                "pool_replacements": 0, "longest_recovery_seconds": 0.0,
+            })
+            row["retry_events"] = int(row.get("retry_events", 0)) + 1
+            row["retry_attempts"] = int(row.get("retry_attempts", 0)) + int(
+                retry.get("attempts", 1)
+            )
+            row["pool_replacements"] = int(row.get("pool_replacements", 0)) + int(
+                bool(retry.get("pool_replaced"))
+            )
+            duration = float(retry.get("duration_seconds", 0.0))
+            row["longest_recovery_seconds"] = max(
+                float(row.get("longest_recovery_seconds", 0.0)), duration,
+            )
+            row["last_recovered_at"] = time.time()
+            row["last_reason"] = str(retry.get("reason") or "transient GET retry")
+            self.runtime_errors.record_transient_recovery(
+                "guard_read:binance_public",
+                retry.get("reason", "transient GET retry"),
+                occurrences=int(retry.get("attempts", 1)),
+                duration_seconds=duration,
+            )
 
     @staticmethod
     def _read_json(path: Path) -> Dict[str, Any]:
@@ -1232,22 +1249,61 @@ class Guard:
                     "market_data_error": f"{type(exc).__name__}: {exc}",
                 }
             row.update(market)
-            if (
-                row["inventory_phase"] == "DUST"
-                and market.get("market_data_healthy")
-                and market.get("tradable")
-            ):
-                self.inventory_ledger.set_episode_phase(
-                    asset, "DETECTED", reset_confirmation=True,
+            if row["inventory_phase"] == "DUST":
+                transitional_robot = any(
+                    str(value.get("phase") or "ACTIVE") in {EXITING, REENTRY}
+                    for value in runtime.get("robots", {}).values()
                 )
-                self.inventory_ledger.mark_episode_notified(asset, "")
-                row["inventory_phase"] = "DETECTED"
-                row["confirmation_eligible"] = True
-                row["confirmation_block_reason"] = "dust_became_tradable_reconfirm"
-                row["confirmation"] = {
-                    "cycles": 0, "first_seen": status["generated_at"],
-                    "last_seen": status["generated_at"], "confirmed": False,
-                }
+                recheck_eligible = bool(
+                    status.get("sources_healthy")
+                    and Decimal(row["ownership_deficit"]) == 0
+                    and market.get("market_data_healthy")
+                    and market.get("tradable")
+                    and not transitional_robot
+                )
+                recheck_evidence = canonical_sha256({
+                    "episode_id": row.get("episode_id"),
+                    "stability_sha256": row.get("stability_sha256"),
+                    "tradable_quantity": market.get("tradable_quantity"),
+                    "minimum_notional": market.get("minimum_notional"),
+                    "step_size": market.get("step_size"),
+                })
+                recheck = self.inventory_ledger.observe_dust_recheck(
+                    asset, episode_id=str(row.get("episode_id") or ""),
+                    evidence_sha256=recheck_evidence,
+                    tradable_quantity=Decimal(str(market.get("tradable_quantity") or "0")),
+                    eligible=recheck_eligible,
+                    confirmation_cycles=self.inventory_confirmation_cycles,
+                    confirmation_seconds=self.inventory_confirmation_seconds,
+                )
+                row["dust_recheck"] = recheck
+                if recheck.get("confirmed"):
+                    new_episode = self.inventory_ledger.reopen_dust_episode(
+                        asset,
+                        expected_episode_id=str(row.get("episode_id") or ""),
+                        evidence_sha256=str(row.get("stability_sha256") or ""),
+                        quantity=unattributed,
+                    )
+                    row.update({
+                        "episode_id": new_episode,
+                        "inventory_phase": "DETECTED",
+                        "last_notified_transition": "",
+                        "confirmation_eligible": True,
+                        "confirmation_block_reason": "dust_became_tradable_reconfirm",
+                        "confirmation": {
+                            "cycles": 0, "first_seen": status["generated_at"],
+                            "last_seen": status["generated_at"], "confirmed": False,
+                        },
+                        "dust_recheck": {
+                            "active": False, "cycles": 0, "confirmed": False,
+                        },
+                    })
+                else:
+                    row["confirmation_eligible"] = False
+                    row["confirmation_block_reason"] = (
+                        "dust_tradable_recheck_pending"
+                        if recheck_eligible else "already_classified_dust"
+                    )
             phase = str(row.get("inventory_phase") or "CLEAR")
             episode_id = str(row.get("episode_id") or "")
             confirmed_unattributed = self._confirmed_unattributed_alert(row)
@@ -1475,25 +1531,28 @@ class Guard:
         )
         return candidates[0] if candidates else None
 
-    @staticmethod
-    def _price(pair: str) -> Decimal:
-        response = READ_SESSION.get(
-            f"{binance_api_base()}/api/v3/ticker/price",
-            params={"symbol": pair.replace("-", "")},
-            timeout=15,
-        )
-        response.raise_for_status()
-        return Decimal(str(response.json()["price"]))
+    def _public_reads(self) -> GetOnlyReadClient:
+        client = getattr(self, "binance_reads", None)
+        if client is None:
+            client = GetOnlyReadClient(binance_api_base())
+            self.binance_reads = client
+        return client
 
-    @staticmethod
-    def _lot_filter(pair: str) -> tuple[Decimal, Decimal]:
-        response = READ_SESSION.get(
-            f"{binance_api_base()}/api/v3/exchangeInfo",
+    def _price(self, pair: str) -> Decimal:
+        response = self._public_reads().request(
+            "GET", "/api/v3/ticker/price",
             params={"symbol": pair.replace("-", "")},
             timeout=15,
         )
-        response.raise_for_status()
-        filters = {item["filterType"]: item for item in response.json()["symbols"][0]["filters"]}
+        return Decimal(str(response["price"]))
+
+    def _lot_filter(self, pair: str) -> tuple[Decimal, Decimal]:
+        response = self._public_reads().request(
+            "GET", "/api/v3/exchangeInfo",
+            params={"symbol": pair.replace("-", "")},
+            timeout=15,
+        )
+        filters = {item["filterType"]: item for item in response["symbols"][0]["filters"]}
         # MARKET_LOT_SIZE is authoritative for the forced-exit/re-entry market
         # orders. Some symbols expose a different market step than LOT_SIZE.
         lot = filters.get("MARKET_LOT_SIZE") or filters["LOT_SIZE"]
@@ -1923,9 +1982,13 @@ class Guard:
         observation = self.state.setdefault("v22_observation", {})
         release = str(contract.get("release_sha256", ""))
         if release and observation.get("release_sha256") != release:
+            source_error_total = int(observation.get("source_error_total", 0))
+            integrity_error_total = int(observation.get("integrity_error_total", 0))
             observation.clear()
             observation.update({"release_sha256": release, "started_at": now,
-                                "cycles": 0, "source_errors": 0, "integrity_errors": 0})
+                                "cycles": 0, "source_errors": 0, "integrity_errors": 0,
+                                "source_error_total": source_error_total,
+                                "integrity_error_total": integrity_error_total})
         observation["last_seen_at"] = now
         observation["cycles"] = int(observation.get("cycles", 0)) + 1
         observation["event_ids"] = {
@@ -1934,11 +1997,25 @@ class Guard:
         }
         if not contract.get("runtime_gate_healthy"):
             failure = str(contract.get("reason", ""))
-            category = "source_errors" if any(
-                marker in failure.lower() for marker in ("timeout", "connection", "temporarily")
-            ) else "integrity_errors"
+            category = (
+                "source_errors"
+                if classify_integrity_failure(failure) == "transient_transport"
+                else "integrity_errors"
+            )
             observation[category] = int(observation.get(category, 0)) + 1
+            total_key = (
+                "source_error_total"
+                if category == "source_errors" else "integrity_error_total"
+            )
+            observation[total_key] = int(observation.get(total_key, 0)) + 1
             observation["last_error"] = failure
+            observation["current_error_since"] = observation.get(
+                "current_error_since", now,
+            )
+        elif observation.get("last_error"):
+            observation["last_recovered_error"] = observation.pop("last_error")
+            observation["last_recovered_at"] = now
+            observation.pop("current_error_since", None)
 
     def _set_effective_gates(
         self, bot_name: str, snapshot: Dict[str, Any], *, buy_enabled: bool,
@@ -2267,26 +2344,23 @@ class Guard:
                 )
         self.state["gate_aggregate"] = aggregate
 
-    @staticmethod
-    def _market_telemetry(pair: str) -> Dict[str, float]:
+    def _market_telemetry(self, pair: str) -> Dict[str, float]:
         symbol = pair.replace("-", "")
-        book = READ_SESSION.get(
-            f"{binance_api_base()}/api/v3/ticker/bookTicker",
+        read_client = self._public_reads()
+        book_value = read_client.request(
+            "GET", "/api/v3/ticker/bookTicker",
             params={"symbol": symbol},
             timeout=15,
         )
-        book.raise_for_status()
-        book_value = book.json()
         bid = float(book_value["bidPrice"])
         ask = float(book_value["askPrice"])
         mid = (bid + ask) / 2
-        klines = READ_SESSION.get(
-            f"{binance_api_base()}/api/v3/klines",
+        kline_values = read_client.request(
+            "GET", "/api/v3/klines",
             params={"symbol": symbol, "interval": "1m", "limit": 31},
             timeout=15,
         )
-        klines.raise_for_status()
-        closes = [float(item[4]) for item in klines.json()]
+        closes = [float(item[4]) for item in kline_values]
         returns = [
             closes[index] / closes[index - 1] - 1
             for index in range(1, len(closes))
@@ -3295,6 +3369,7 @@ class Guard:
         self.state["last_success_at"] = now
         self.state.pop("last_monitor_error", None)
         self.state.pop("first_failure_at", None)
+        self._record_read_retry_events()
         self._write_macro_telemetry(snapshots)
         self._save()
 
