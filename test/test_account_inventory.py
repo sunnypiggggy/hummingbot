@@ -396,8 +396,10 @@ def test_dca_v22_current_error_is_cleared_but_recovery_history_is_preserved():
             "release_sha256": "a" * 64,
             "last_error": "Connection reset by peer",
             "current_error_since": 90,
-            "source_error_total": 14,
-            "integrity_error_total": 0,
+            # Legacy state only had per-release counters. The first healthy
+            # cycle must promote them into cumulative audit fields.
+            "source_errors": 14,
+            "integrity_errors": 0,
         }}
         healthy = {
             "release_sha256": "a" * 64,

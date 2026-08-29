@@ -1980,10 +1980,16 @@ class Guard:
             max_age_seconds=self.v21_max_age_seconds,
         )
         observation = self.state.setdefault("v22_observation", {})
+        observation.setdefault(
+            "source_error_total", int(observation.get("source_errors", 0))
+        )
+        observation.setdefault(
+            "integrity_error_total", int(observation.get("integrity_errors", 0))
+        )
         release = str(contract.get("release_sha256", ""))
         if release and observation.get("release_sha256") != release:
-            source_error_total = int(observation.get("source_error_total", 0))
-            integrity_error_total = int(observation.get("integrity_error_total", 0))
+            source_error_total = int(observation["source_error_total"])
+            integrity_error_total = int(observation["integrity_error_total"])
             observation.clear()
             observation.update({"release_sha256": release, "started_at": now,
                                 "cycles": 0, "source_errors": 0, "integrity_errors": 0,
