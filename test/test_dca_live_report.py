@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from live_guard.dca_live_report import (
@@ -14,6 +15,7 @@ from live_guard.dca_live_report import (
     calculate_pair_report,
     dca_report_infrastructure_status,
     dust_usdt_text,
+    inventory_exposure_quote,
     healthcheck,
     render_chart,
 )
@@ -70,6 +72,14 @@ def test_dust_report_text_only_contains_usdt_value():
     })
     assert value == "共享账户 Dust：约 3.9833 USDT"
     assert "0.002160" not in value
+
+
+def test_inventory_contract_decimal_is_not_parsed_as_sqlite_fixed_point_integer():
+    owned, tradable = inventory_exposure_quote(
+        "0.000005682327138578196897323272", "78045.99", "0.00000",
+    )
+    assert owned == pytest.approx(0.4435, abs=0.0001)
+    assert tradable == 0
 
 
 def raw(value):

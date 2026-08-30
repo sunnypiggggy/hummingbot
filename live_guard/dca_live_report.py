@@ -136,6 +136,16 @@ def decimal_value(value: Any) -> Decimal:
     return Decimal(int(value or 0)) / SCALE
 
 
+def inventory_exposure_quote(
+    owner_value: Any, mark_price: Any, remaining_value: Any = None,
+) -> tuple[float, float]:
+    """Value human-decimal inventory contract fields in quote currency."""
+    owner = Decimal(str(owner_value))
+    mark = Decimal(str(mark_price))
+    remaining = owner if remaining_value is None else Decimal(str(remaining_value))
+    return float(owner * mark), float(remaining * mark)
+
+
 def normalize_side(value: Any) -> str:
     text = str(value).upper()
     if text in {"1", "BUY", "TRADETYPE.BUY"}:
@@ -1244,12 +1254,13 @@ class UnifiedTelegramReporting:
             owned_notional = None
             tradable_risk = None
             if owner_value is not None and mark_price is not None:
-                owned_notional = float(decimal_value(owner_value) * decimal_value(mark_price))
                 # The Guard persists the exchange-filter result in recovery;
                 # without it, reporting the full owner as exposure is safer
                 # than incorrectly declaring the position dust.
                 remaining = recovery.get("remaining_base", {}).get(pair, owner_value)
-                tradable_risk = float(decimal_value(remaining) * decimal_value(mark_price))
+                owned_notional, tradable_risk = inventory_exposure_quote(
+                    owner_value, mark_price, remaining,
+                )
             risk_exit_trades = len([
                 row for row in state.get("emergency_adjustments", [])
                 if str(row.get("pair")) == pair and str(row.get("side", "")).upper() == "SELL"
