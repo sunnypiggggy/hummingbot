@@ -1598,6 +1598,18 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         ("峰值权益", _number(report.get("peak_equity"), f" {report.get('quote_asset', '')}")),
         ("峰值回撤", _number(report.get("drawdown_pct"), "%")),
         ("归属基础币", str(report.get("owned_base") or "无可信数据")),
+        ("归属库存MTM", (
+            f"{float(report['owned_inventory_mtm_quote']):+.4f} {quote}"
+            if report.get("owned_inventory_mtm_quote") is not None else "无可信数据"
+        )),
+        ("可成交风险敞口", (
+            f"{float(report['tradable_risk_exposure_quote']):+.4f} {quote}"
+            if report.get("tradable_risk_exposure_quote") is not None else "无可信数据"
+        )),
+        ("普通成交 / 风险退出", (
+            f"{int(report.get('ordinary_trade_count') or 0)} / "
+            f"{int(report.get('risk_exit_trades') or 0)}"
+        )),
         ("费用", _number(report.get("fees_quote"), f" {report.get('quote_asset', '')}")),
         ("买/卖成交", f"{report.get('buys', '-')} / {report.get('sells', '-') }"),
         ("恢复状态", phase_display(report.get("phase"))),

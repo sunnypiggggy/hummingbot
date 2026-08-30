@@ -83,6 +83,8 @@ BINANCE_API = OFFICIAL_BINANCE_API
 V21_PAIR_MAP = {"BTC-USDT": "BTC-FDUSD", "ETH-USDT": "ETH-FDUSD"}
 V22_PAIR_MAP = V21_PAIR_MAP
 STOP_LOSS_EVENT_CURSOR_SCHEMA = "dca-stop-loss-event-v3"
+EXIT_FORCE_TAKEOVER_SECONDS = 60
+INVENTORY_OWNERSHIP_MAX_AGE_SECONDS = 30
 
 
 try:
@@ -1423,6 +1425,7 @@ class Guard:
         mapping = {
             "recoverable_breaker_triggered": (["TRIGGERED", "EXITING"], "warning"),
             "integrity_failure_exit_then_latch": (["TRIGGERED", "EXITING"], "critical"),
+            "recoverable_residual_inventory_detected": (["EXITING"], "warning"),
             "recoverable_exit_complete": (["EXIT_COMPLETE"], "info"),
             "recoverable_exit_critical_delay": ("EXIT_DELAY", "critical"),
             "recoverable_reentry_ready": ("REENTRY", "info"),
@@ -1467,6 +1470,16 @@ class Guard:
                 model_sha256=str(contract.get("model_sha256", "")),
                 requires_manual_action=manual_action,
                 correlation_id=correlation,
+                details={
+                    "remaining_base": recovery.get("remaining_base"),
+                    "ownership_source": recovery.get("ownership_source"),
+                    "executor_takeover_stage": recovery.get("executor_takeover_stage"),
+                    "exit_verification": recovery.get("exit_verification"),
+                    "owned_base": details.get("owned_base"),
+                    "tradable_amount": details.get("tradable_amount"),
+                    "notional": details.get("notional"),
+                    "flatten": details.get("flatten"),
+                },
             )
             append_event(path, event)
 
@@ -2485,18 +2498,24 @@ class Guard:
 
     def _flatten(self, snapshot: Dict[str, Any], bot_name: str = "") -> Dict[str, Any]:
         pair = snapshot["pair"]
-        owned = (
-            self._owned_base(bot_name, snapshot)
-            if bot_name else max(Decimal(snapshot["net_base"]), Decimal("0"))
-        )
         step_size, minimum_notional = self._lot_filter(pair)
+        if bot_name:
+            owned, ownership = self._verified_owned_base(
+                bot_name, snapshot, step_size,
+            )
+        else:
+            owned = max(Decimal(snapshot["net_base"]), Decimal("0"))
+            ownership = {
+                "source": "latest_net_base", "computed": str(owned),
+                "contract": str(owned), "difference": "0", "verified": True,
+            }
         mark_price = Decimal(snapshot["mark_price"])
         amount = (owned / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
         if amount <= 0 or amount * mark_price < minimum_notional:
             return {
                 "status": "dust", "side": "SELL", "amount": str(amount),
                 "notional": str(amount * mark_price), "remaining_base": str(owned),
-                "exit_complete": True,
+                "exit_complete": True, "ownership": ownership,
             }
         if self.emergency_exchange is None:
             raise RuntimeError("independent Binance emergency client is unavailable")
@@ -2564,7 +2583,7 @@ class Guard:
                         "order_id": str(job.get("exchange_order_id") or ""),
                         "executed_qty": str(executed), "remaining_base": str(remaining),
                         "exit_complete": remaining * mark_price < minimum_notional,
-                        "client_order_id": client_order_id,
+                        "client_order_id": client_order_id, "ownership": ownership,
                     }
             try:
                 if ledger:
@@ -2641,6 +2660,7 @@ class Guard:
             ),
             "client_order_id": client_order_id,
             "verification": verification,
+            "ownership": ownership,
             **metrics,
         }
 
@@ -2885,24 +2905,76 @@ class Guard:
         return amount
 
     def _owned_base(self, bot_name: str, snapshot: Dict[str, Any]) -> Decimal:
+        """Return DCA-owned base from the single accounting identity.
+
+        ``_snapshot`` already folds every persisted emergency adjustment into
+        ``net_base``.  Adding ``emergency_adjustments`` again here understates
+        a SELL residual (and overstates a BUY residual), which can incorrectly
+        mark an exit complete.  The account-level inventory ledger uses this
+        same target-plus-net identity.
+        """
         bot = self.state["bots"].setdefault(bot_name, {})
         target = Decimal(str(bot.get("managed_base_target", "0")))
         if target <= 0:
             target = self._managed_base_target(str(snapshot["pair"]))
             bot["managed_base_target"] = str(target)
-        adjustments = Decimal("0")
-        for row in bot.get("emergency_adjustments", []):
-            if str(row.get("pair", "")) != str(snapshot["pair"]):
-                continue
-            if row.get("base_delta") is not None:
-                adjustments += Decimal(str(row["base_delta"]))
-            else:
-                executed = Decimal(str(row.get("executed_qty", "0")))
-                adjustments += executed if str(row.get("side", "")).upper() == "BUY" else -executed
         return max(
-            target + Decimal(str(snapshot["net_base"])) + adjustments,
+            target + Decimal(str(snapshot["net_base"])),
             Decimal("0"),
         )
+
+    def _verified_owned_base(
+        self, bot_name: str, snapshot: Dict[str, Any], step_size: Decimal,
+        *, observed_at: Optional[float] = None,
+    ) -> tuple[Decimal, Dict[str, Any]]:
+        """Cross-check DCA ownership against the fresh account contract.
+
+        Tests and old offline tools that do not configure a unified ledger keep
+        the local accounting result.  Production always has the ledger and is
+        fail-closed on stale, deficient, or divergent ownership evidence.
+        """
+        computed = self._owned_base(bot_name, snapshot)
+        ledger = getattr(self, "inventory_ledger", None)
+        if ledger is None:
+            return computed, {
+                "source": "dca_target_plus_latest_net_base",
+                "computed": str(computed), "contract": str(computed),
+                "difference": "0", "verified": True,
+            }
+        status = json.loads(ledger.status_path.read_text(encoding="utf-8"))
+        now = time.time() if observed_at is None else float(observed_at)
+        generated_at = float(status.get("generated_at") or 0)
+        if status.get("schema") != "account-inventory-status-v3":
+            raise RuntimeError("unified inventory contract schema is invalid")
+        if status.get("sources_healthy") is not True:
+            raise RuntimeError("unified inventory ownership sources are unhealthy")
+        if generated_at <= 0 or now - generated_at > INVENTORY_OWNERSHIP_MAX_AGE_SECONDS:
+            raise RuntimeError("unified inventory contract is stale")
+        base_asset = str(snapshot["pair"]).split("-", 1)[0]
+        asset = status.get("assets", {}).get(base_asset)
+        if not isinstance(asset, dict):
+            raise RuntimeError(f"unified inventory contract is missing {base_asset}")
+        deficit = Decimal(str(asset.get("ownership_deficit", "0")))
+        if deficit > 0:
+            raise RuntimeError(f"unified inventory ownership deficit for {base_asset}: {deficit}")
+        owner_key = f"dca:{bot_name}"
+        owners = asset.get("owners", {})
+        if owner_key not in owners:
+            raise RuntimeError(f"unified inventory contract is missing owner {owner_key}")
+        contracted = Decimal(str(owners[owner_key]))
+        difference = abs(contracted - computed)
+        if difference > step_size:
+            raise RuntimeError(
+                f"DCA ownership mismatch for {base_asset}: "
+                f"computed={computed} contract={contracted} step={step_size}"
+            )
+        return min(computed, contracted), {
+            "source": "account_inventory_status",
+            "computed": str(computed), "contract": str(contracted),
+            "difference": str(difference), "verified": True,
+            "generated_at": generated_at, "evidence_sha256": status.get("evidence_sha256", ""),
+            "owner_key": owner_key,
+        }
 
     def _trigger_recoverable(
         self, bot_name: str, snapshot: Dict[str, Any], *, mechanism: str,
@@ -2949,6 +3021,61 @@ class Guard:
         })
         return metrics
 
+    def _exit_runtime_status(
+        self, snapshot: Dict[str, Any], pair: str,
+    ) -> Dict[str, Any]:
+        database = Path(str(snapshot.get("database") or ""))
+        if not database.is_file():
+            raise RuntimeError(f"DCA runtime database is unavailable: {database}")
+        counts = self._executor_counts(database)
+        exchange_orders = self.emergency_exchange.open_orders(pair)
+        active_executors = sum(
+            int(counts.get(key, 0)) for key in (
+                "active_buy_executors", "trading_buy_executors",
+                "active_sell_executors", "trading_sell_executors",
+            )
+        )
+        return {
+            "counts": counts,
+            "exchange_order_count": len(exchange_orders),
+            "active_executors": active_executors,
+            "terminal": active_executors == 0 and len(exchange_orders) == 0,
+        }
+
+    @staticmethod
+    def _exit_verification(
+        *, runtime: Dict[str, Any], flatten: Dict[str, Any],
+        amount: Decimal, mark: Decimal, minimum_notional: Decimal,
+    ) -> Dict[str, Any]:
+        verification = flatten.get("verification")
+        order_verified = bool(
+            flatten.get("status") == "dust"
+            or (isinstance(verification, dict) and verification.get("order_verified"))
+            or flatten.get("order_id")
+        )
+        ownership = flatten.get("ownership", {})
+        return {
+            "order_verified": order_verified,
+            "trade_verified": bool(
+                flatten.get("status") == "dust"
+                or Decimal(str(flatten.get("executed_qty", "0"))) > 0
+            ),
+            "balance_verified": bool(ownership.get("verified")),
+            "runtime_verified": bool(runtime.get("terminal")),
+            "residual_below_exchange_minimum": bool(
+                amount <= 0 or amount * mark < minimum_notional
+            ),
+            "ownership": ownership,
+            "runtime": runtime,
+        }
+
+    @staticmethod
+    def _four_part_exit_verified(verification: Dict[str, Any]) -> bool:
+        return all(bool(verification.get(key)) for key in (
+            "order_verified", "trade_verified", "balance_verified",
+            "runtime_verified", "residual_below_exchange_minimum",
+        ))
+
     def _process_recoverable(
         self, bot_name: str, snapshot: Dict[str, Any], *,
         macro: Dict[str, Any], technical: Dict[str, Any], now: float,
@@ -2977,27 +3104,95 @@ class Guard:
             except Exception as exc:
                 self._audit("exit_snapshot_refresh_failed", bot=bot_name,
                             pair=pair, error=repr(exc))
-            owned = self._owned_base(bot_name, snapshot)
+            elapsed = now - float(state.get("triggered_at") or now)
+            try:
+                runtime = self._exit_runtime_status(snapshot, pair)
+            except Exception as exc:
+                state["executor_takeover_stage"] = "runtime_untrusted"
+                state["last_runtime_check_error"] = repr(exc)
+                bot["recovery"] = state
+                return
+            if not runtime["terminal"]:
+                state["executor_takeover_stage"] = "waiting_for_hummingbot_exit"
+                state["executor_runtime"] = runtime
+                state["executor_wait_started_at"] = state.get(
+                    "executor_wait_started_at"
+                ) or now
+                if elapsed >= EXIT_CRITICAL_SECONDS and not state.get("critical_alerted"):
+                    state["critical_alerted"] = True
+                    self._notify(
+                        f"DCA CRITICAL EXIT DELAY: {bot_name} executor remains active"
+                    )
+                    self._audit(
+                        "recoverable_exit_critical_delay", bot=bot_name,
+                        pair=pair, runtime=runtime,
+                    )
+                if elapsed < EXIT_FORCE_TAKEOVER_SECONDS:
+                    bot["recovery"] = state
+                    return
+                stop = self._secure_stop(bot_name, pair)
+                state["executor_takeover_stage"] = "guard_takeover_after_60s"
+                state["takeover_stop"] = stop
+                state["latch_after_exit"] = True
+                refreshed = self._snapshot(bot_name, pair)
+                if refreshed is None:
+                    state["last_runtime_check_error"] = "post-stop snapshot unavailable"
+                    bot["recovery"] = state
+                    return
+                snapshot = refreshed
+                mark = Decimal(snapshot["mark_price"])
+                runtime = self._exit_runtime_status(snapshot, pair)
+                if not runtime["terminal"]:
+                    state["last_runtime_check_error"] = "runtime remained active after secure stop"
+                    bot["recovery"] = state
+                    return
+            else:
+                state["executor_takeover_stage"] = "guard_reconciliation"
+
+            state["exit_attempts"] = int(state.get("exit_attempts", 0)) + 1
+            try:
+                flatten = self._flatten(snapshot, bot_name)
+            except Exception as exc:
+                state["ownership_reconciliation_pending"] = True
+                state["ownership_reconciliation_error"] = repr(exc)
+                if not state.get("ownership_reconciliation_alerted"):
+                    state["ownership_reconciliation_alerted"] = True
+                    self._audit(
+                        "recoverable_ownership_reconciliation_wait", bot=bot_name,
+                        pair=pair, error=repr(exc), recovery=state,
+                    )
+                bot["recovery"] = state
+                return
+            state.pop("ownership_reconciliation_pending", None)
+            state.pop("ownership_reconciliation_error", None)
+            state["last_flatten_result"] = flatten
+            owned = Decimal(str(flatten.get("remaining_base", "0")))
             amount = (owned / step).to_integral_value(rounding=ROUND_DOWN) * step
             state["remaining_base"] = {pair: str(owned)}
-            state["exit_attempts"] = int(state.get("exit_attempts", 0)) + 1
-            if amount > 0 and amount * mark >= minimum_notional:
+            if flatten.get("status") == "filled":
                 state["first_exit_order_at"] = state.get("first_exit_order_at") or now
-                response = self.emergency_exchange.market_order(pair, "SELL", amount)
-                metrics = self._record_emergency_fill(bot_name, pair, "SELL", response)
-                state["last_exit_fill"] = {"response": response, "metrics": metrics}
-                # A FILLED response is authoritative; subtract only that fill
-                # from the ownership-capped amount rather than reading account balance.
-                owned = max(owned - Decimal(str(response["executedQty"])), Decimal("0"))
-                amount = (owned / step).to_integral_value(rounding=ROUND_DOWN) * step
-            if amount <= 0 or amount * mark < minimum_notional:
+                state["last_exit_fill"] = flatten
+                bot["recovery"] = state
+                self._audit(
+                    "recoverable_residual_inventory_exit_submitted",
+                    bot=bot_name, pair=pair, recovery=state, flatten=flatten,
+                )
+                return
+            verification = self._exit_verification(
+                runtime=runtime, flatten=flatten, amount=amount, mark=mark,
+                minimum_notional=minimum_notional,
+            )
+            state["exit_verification"] = verification
+            if self._four_part_exit_verified(verification):
                 state = mark_exit_complete(
                     state, now=now, remaining_base={pair: owned},
                     execution={"target": "quote_only", "attempts": state["exit_attempts"],
-                               "last_fill": state.get("last_exit_fill", {})},
+                               "last_fill": state.get("last_exit_fill", {}),
+                               "verification": verification,
+                               "ownership_source": flatten.get("ownership", {})},
                 )
                 self._audit("recoverable_exit_complete", bot=bot_name, pair=pair, recovery=state)
-            elif now - float(state.get("triggered_at") or now) >= EXIT_CRITICAL_SECONDS:
+            elif elapsed >= EXIT_CRITICAL_SECONDS:
                 if not state.get("critical_alerted"):
                     state["critical_alerted"] = True
                     self._notify(f"DCA CRITICAL EXIT DELAY: {bot_name} owns {owned} base")
@@ -3025,6 +3220,48 @@ class Guard:
             return
         counts = self._executor_counts(Path(snapshot["database"]))
         no_runtime_risk = all(counts[key] == 0 for key in counts)
+        try:
+            owned, ownership = self._verified_owned_base(
+                bot_name, snapshot, step, observed_at=now,
+            )
+        except Exception as exc:
+            state["ownership_reconciliation_pending"] = True
+            state["ownership_reconciliation_error"] = repr(exc)
+            bot["recovery"] = state
+            return
+        amount = (owned / step).to_integral_value(rounding=ROUND_DOWN) * step
+        if amount > 0 and amount * mark >= minimum_notional:
+            previous_phase = state["phase"]
+            original_triggered_at = state.get("triggered_at")
+            state.update({
+                "phase": EXITING,
+                "original_triggered_at": state.get(
+                    "original_triggered_at", original_triggered_at
+                ),
+                "triggered_at": now,
+                "exit_completed_at": None,
+                "cooldown_until": None,
+                "healthy_cycles": 0,
+                "reentry_allowed": False,
+                "remaining_base": {pair: str(owned)},
+                "residual_reconciliation_started_at": now,
+                "ownership_source": ownership,
+                "executor_takeover_stage": "residual_inventory_detected",
+            })
+            if not state.get("residual_inventory_alerted"):
+                state["residual_inventory_alerted"] = True
+                self._audit(
+                    "recoverable_residual_inventory_detected", bot=bot_name,
+                    pair=pair, phase_from=previous_phase, recovery=state,
+                    owned_base=str(owned), tradable_amount=str(amount),
+                    notional=str(amount * mark), ownership=ownership,
+                )
+            bot["recovery"] = state
+            return
+        state["ownership_source"] = ownership
+        state["remaining_base"] = {pair: str(owned)}
+        state.pop("ownership_reconciliation_pending", None)
+        state.pop("ownership_reconciliation_error", None)
         underlying_healthy = bool(macro["healthy"] and technical.get("buy_enabled"))
         gates_allow = bool(
             self.auto_reentry_enabled and macro["buy_enabled"] and macro["sell_enabled"]

@@ -402,6 +402,9 @@ class DcaLiveSafetyTest(unittest.TestCase):
             "active_sell_executors": 0, "trading_sell_executors": 0,
             "open_orders": 0,
         }
+        guard._verified_owned_base = lambda *args, **kwargs: (
+            Decimal("0"), {"verified": True, "source": "test"},
+        )
         audits = []
         guard._audit = lambda event, **details: audits.append((event, details))
 
@@ -423,6 +426,13 @@ class DcaLiveSafetyTest(unittest.TestCase):
     def test_recoverable_exit_is_capped_by_deployment_owned_base(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            database = root / "bot.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE Executors (is_active INTEGER, is_trading INTEGER, config TEXT)"
+            )
+            connection.commit()
+            connection.close()
             (root / "managed_inventory.json").write_text(json.dumps({
                 "pairs": {"BTC-USDT": {"managed_base": "0.002"}},
             }), encoding="utf-8")
@@ -436,7 +446,10 @@ class DcaLiveSafetyTest(unittest.TestCase):
                 trigger_value=-16, signal_price=65000, reason="loss",
             )}}}
             guard._notify = lambda message: None
-            snapshot = {"pair": "BTC-USDT", "mark_price": "65000", "net_base": "0.001"}
+            snapshot = {
+                "pair": "BTC-USDT", "mark_price": "65000", "net_base": "0.001",
+                "database": str(database),
+            }
             with patch.object(guard, "_lot_filter", return_value=(Decimal("0.000001"), Decimal("5"))):
                 guard._process_recoverable(
                     "bot", snapshot,
@@ -444,7 +457,91 @@ class DcaLiveSafetyTest(unittest.TestCase):
                     technical={"buy_enabled": True}, now=104,
                 )
             self.assertEqual(Decimal("0.003"), guard.emergency_exchange.orders[0][2])
-            self.assertEqual("COOLDOWN", guard.state["bots"]["bot"]["recovery"]["phase"])
+            # A fill is not enough to mark the exit complete. The next cycle
+            # must reconcile the order, trade, balance and runtime evidence.
+            self.assertEqual(EXITING, guard.state["bots"]["bot"]["recovery"]["phase"])
+
+    def test_owned_base_does_not_double_count_emergency_adjustments(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {"bots": {"bot": {
+            "managed_base_target": "0.001499762327138578",
+            "emergency_adjustments": [{
+                "pair": "BTC-USDT", "side": "SELL",
+                "base_delta": "-0.00101",
+            }],
+        }}}
+
+        owned = guard._owned_base("bot", {
+            "pair": "BTC-USDT",
+            # The emergency SELL above is already included here.
+            "net_base": "-0.00114408",
+        })
+
+        self.assertEqual(Decimal("0.000355682327138578"), owned)
+
+    def test_recoverable_exit_waits_for_active_executor_before_guard_sell(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {"bots": {"bot": {"recovery": trigger_state(
+            mechanism="v22_weekly_buy_gate", scope="technical", now=100,
+            trigger_value="risk_off", signal_price=65000, reason="risk_off",
+        )}}}
+        guard.emergency_exchange = FakeEmergencyExchange()
+        guard._lot_filter = lambda pair: (Decimal("0.00001"), Decimal("5"))
+        guard._snapshot = lambda bot, pair: {
+            "pair": pair, "mark_price": "65000", "net_base": "0.00035",
+            "database": "unused",
+        }
+        guard._exit_runtime_status = lambda snapshot, pair: {
+            "counts": {"active_buy_executors": 1},
+            "exchange_order_count": 0, "active_executors": 1, "terminal": False,
+        }
+        guard._notify = lambda message: None
+        guard._audit = lambda *args, **kwargs: None
+
+        guard._process_recoverable(
+            "bot", guard._snapshot("bot", "BTC-USDT"),
+            macro={"healthy": True, "buy_enabled": True, "sell_enabled": True},
+            technical={"buy_enabled": False, "execution_authorized": True},
+            now=106,
+        )
+
+        self.assertEqual([], guard.emergency_exchange.orders)
+        recovery = guard.state["bots"]["bot"]["recovery"]
+        self.assertEqual("waiting_for_hummingbot_exit", recovery["executor_takeover_stage"])
+
+    def test_cooldown_with_tradable_owned_inventory_returns_to_exiting(self):
+        guard = Guard.__new__(Guard)
+        guard.state = {"bots": {"bot": {"recovery": {
+            "phase": COOLDOWN, "mechanism": "v22_weekly_buy_gate",
+            "scope": "technical", "triggered_at": 1,
+            "exit_completed_at": 2, "cooldown_until": 2,
+        }}}}
+        guard.emergency_exchange = FakeEmergencyExchange()
+        guard.auto_reentry_enabled = True
+        guard._lot_filter = lambda pair: (Decimal("0.00001"), Decimal("5"))
+        guard._executor_counts = lambda database: {
+            "active_buy_executors": 0, "trading_buy_executors": 0,
+            "active_sell_executors": 0, "trading_sell_executors": 0,
+            "open_orders": 0,
+        }
+        guard._verified_owned_base = lambda *args, **kwargs: (
+            Decimal("0.000355682327138578"), {"verified": True, "source": "test"},
+        )
+        audits = []
+        guard._audit = lambda event, **details: audits.append((event, details))
+
+        guard._process_recoverable(
+            "bot",
+            {"pair": "BTC-USDT", "mark_price": "78000", "database": "unused"},
+            macro={"healthy": True, "buy_enabled": True, "sell_enabled": True},
+            technical={"buy_enabled": False, "execution_authorized": True},
+            now=200,
+        )
+
+        recovery = guard.state["bots"]["bot"]["recovery"]
+        self.assertEqual(EXITING, recovery["phase"])
+        self.assertEqual("0.00035", audits[0][1]["tradable_amount"])
+        self.assertEqual("recoverable_residual_inventory_detected", audits[0][0])
 
     def test_v21_maps_fdusd_signals_to_usdt_without_recomputing_features(self):
         guard = Guard.__new__(Guard)

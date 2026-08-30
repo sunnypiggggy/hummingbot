@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
@@ -32,7 +33,7 @@ def seed_ownership(ledger, *, btc="0", eth="0", btc_owner="dca:bot", eth_owner="
             "BTC": {btc_owner: btc}, "ETH": {eth_owner: eth},
         },
         evidence_sha256="seed-ownership", open_order_counts={},
-        sources_healthy=True, now=1,
+        sources_healthy=True, now=time.time(),
     )
 
 
@@ -641,6 +642,60 @@ def test_dca_integrity_flatten_includes_managed_inventory_when_net_base_is_zero(
         assert result["exit_complete"]
         assert result["amount"] == "0.0015"
         assert guard.emergency_exchange.orders[0][2] == Decimal("0.0015")
+
+
+def test_live_snapshot_residual_exit_preserves_grid_and_unattributed_inventory():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        managed = root / "managed_inventory.json"
+        managed.write_text(json.dumps({
+            "pairs": {"BTC-USDT": {"managed_base": "0.001499762327138578"}},
+        }), encoding="utf-8")
+        dca_owned = Decimal("0.000355682327138578")
+        grid_owned = Decimal("0.00000715")
+        unattributed = Decimal("0.000001537672861422")
+        exchange_total = dca_owned + grid_owned + unattributed
+        ledger = UnifiedInventoryLedger(root / "shared")
+        ledger.reconcile(
+            account_fingerprint="test-account",
+            balances={
+                "BTC": {"free": exchange_total, "locked": Decimal("0"),
+                        "total": exchange_total},
+                "ETH": {"free": Decimal("0"), "locked": Decimal("0"),
+                        "total": Decimal("0")},
+            },
+            ownership={
+                "BTC": {
+                    "dca:dca-live-btcusdt-200": dca_owned,
+                    "grid:grid-live-fdusd-400": grid_owned,
+                },
+                "ETH": {},
+            },
+            evidence_sha256="live-snapshot", open_order_counts={},
+            sources_healthy=True, now=time.time(),
+        )
+        guard = Guard.__new__(Guard)
+        guard.managed_inventory_path = managed
+        guard.state_path = root / "guard_state.json"
+        guard.state = {"bots": {"dca-live-btcusdt-200": {
+            "managed_base_target": "0.001499762327138578",
+            "tripped_at": 100, "emergency_adjustments": [],
+        }}}
+        guard.inventory_ledger = ledger
+        guard.emergency_exchange = Exchange(str(exchange_total))
+        guard._lot_filter = lambda pair: (Decimal("0.00001"), Decimal("5"))
+        guard._save = lambda: None
+
+        result = guard._flatten({
+            "pair": "BTC-USDT", "net_base": "-0.00114408",
+            "mark_price": "78253",
+        }, "dca-live-btcusdt-200")
+
+        assert result["amount"] == "0.00035"
+        assert guard.emergency_exchange.orders[0][2] == Decimal("0.00035")
+        expected_remaining = grid_owned + unattributed + (dca_owned - Decimal("0.00035"))
+        assert guard.emergency_exchange.btc == expected_remaining
+        assert Decimal(result["remaining_base"]) == Decimal("0.000005682327138578")
 
 
 def test_existing_latch_is_marked_pending_manual_without_order():

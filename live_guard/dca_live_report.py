@@ -1236,6 +1236,24 @@ class UnifiedTelegramReporting:
                 model_week=technical_row.get("model_week"),
                 cutover_phase=self._reported_cutover_phase(cutover, v22_contract, now),
             )
+            base_asset = pair.split("-", 1)[0]
+            asset_status = inventory_status.get("assets", {}).get(base_asset, {})
+            owner_key = f"dca:{bot['bot_name']}"
+            owner_value = asset_status.get("owners", {}).get(owner_key)
+            mark_price = bot.get("mark_price")
+            owned_notional = None
+            tradable_risk = None
+            if owner_value is not None and mark_price is not None:
+                owned_notional = float(decimal_value(owner_value) * decimal_value(mark_price))
+                # The Guard persists the exchange-filter result in recovery;
+                # without it, reporting the full owner as exposure is safer
+                # than incorrectly declaring the position dust.
+                remaining = recovery.get("remaining_base", {}).get(pair, owner_value)
+                tradable_risk = float(decimal_value(remaining) * decimal_value(mark_price))
+            risk_exit_trades = len([
+                row for row in state.get("emergency_adjustments", [])
+                if str(row.get("pair")) == pair and str(row.get("side", "")).upper() == "SELL"
+            ])
             item = {
                 "strategy": "dca", "bot": bot["bot_name"], "pair": pair,
                 "quote_asset": "USDT", "generated_at_bjt": now.astimezone(SHANGHAI).isoformat(),
@@ -1244,11 +1262,26 @@ class UnifiedTelegramReporting:
                                  "dca-live-guard state"],
                 "profit": dict(bot.get("profit", {})), "equity": equity,
                 "peak_equity": peak, "drawdown_pct": drawdown,
-                "owned_base": bot.get("position", {}).get("net_base"),
+                "owned_base": owner_value,
+                "strategy_net_base_delta": bot.get("position", {}).get("net_base"),
+                "owned_inventory_mtm_quote": owned_notional,
+                "tradable_risk_exposure_quote": tradable_risk,
+                "risk_exit_trades": risk_exit_trades,
+                "ordinary_trade_count": max(
+                    0, int(bot.get("trades", {}).get("all_time_buys") or 0)
+                    + int(bot.get("trades", {}).get("all_time_sells") or 0)
+                    - risk_exit_trades,
+                ),
                 "fees_quote": bot.get("profit", {}).get("all_time_fees_quote"),
                 "buys": bot.get("trades", {}).get("all_time_buys"),
                 "sells": bot.get("trades", {}).get("all_time_sells"),
                 "phase": phase,
+                "exit_execution": {
+                    "takeover_stage": recovery.get("executor_takeover_stage"),
+                    "remaining_base": recovery.get("remaining_base", {}).get(pair),
+                    "verification": recovery.get("exit_verification"),
+                    "last_fill": recovery.get("last_exit_fill"),
+                },
                 "active_runtime": {
                     "orders": executor_counts.get("open_orders"),
                     "buy_executors": executor_counts.get("active_buy_executors"),
