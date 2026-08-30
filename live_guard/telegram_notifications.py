@@ -1362,8 +1362,11 @@ def _number(value: Any, suffix: str = "") -> str:
     if value is None or value == "":
         return "无可信数据"
     try:
-        return f"{float(value):+,.4f}{suffix}"
-    except (TypeError, ValueError):
+        number = Decimal(str(value))
+        if not number.is_finite():
+            return "无可信数据"
+        return f"{float(number):+,.4f}{suffix}"
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
         return f"{value}{suffix}"
 
 
@@ -1521,6 +1524,7 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     """Render one strategy/pair card; never combine Grid and DCA equity."""
     image = Image.new("RGB", MOBILE_CARD_SIZE, "#f5f7fa")
     draw = ImageDraw.Draw(image)
+    quote_asset = str(report.get("quote_asset") or "")
     title = f"{str(report.get('strategy', '')).upper()} {report.get('pair')} 策略归属MTM"
     draw.text((70, 55), title, fill="#172033", font=report_font(52, bold=True))
     draw.text((70, 130), f"北京时间：{report.get('generated_at_bjt', '-')}  数据年龄：{report.get('data_age_seconds', '-')}秒",
@@ -1598,13 +1602,11 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
         ("峰值权益", _number(report.get("peak_equity"), f" {report.get('quote_asset', '')}")),
         ("峰值回撤", _number(report.get("drawdown_pct"), "%")),
         ("归属基础币", str(report.get("owned_base") or "无可信数据")),
-        ("归属库存MTM", (
-            f"{float(report['owned_inventory_mtm_quote']):+.4f} {quote}"
-            if report.get("owned_inventory_mtm_quote") is not None else "无可信数据"
+        ("归属库存MTM", _number(
+            report.get("owned_inventory_mtm_quote"), f" {quote_asset}",
         )),
-        ("可成交风险敞口", (
-            f"{float(report['tradable_risk_exposure_quote']):+.4f} {quote}"
-            if report.get("tradable_risk_exposure_quote") is not None else "无可信数据"
+        ("可成交风险敞口", _number(
+            report.get("tradable_risk_exposure_quote"), f" {quote_asset}",
         )),
         ("普通成交 / 风险退出", (
             f"{int(report.get('ordinary_trade_count') or 0)} / "

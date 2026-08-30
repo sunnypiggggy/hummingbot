@@ -82,6 +82,11 @@ def test_inventory_contract_decimal_is_not_parsed_as_sqlite_fixed_point_integer(
     assert tradable == 0
 
 
+@pytest.mark.parametrize("value", [None, "not-a-decimal", "NaN", "Infinity"])
+def test_invalid_inventory_contract_values_degrade_instead_of_breaking_report(value):
+    assert inventory_exposure_quote(value, "78045.99", "0") == (None, None)
+
+
 def raw(value):
     return int(Decimal(str(value)) * SCALE)
 
@@ -299,6 +304,25 @@ class DcaChartAndProviderTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            self.assertTrue(healthcheck(root))
+            runtime_errors = root / "report_runtime_error_state.json"
+            runtime_errors.write_text(json.dumps({
+                "components": {"report_cycle": {"active": True}},
+            }), encoding="utf-8")
+            self.assertFalse(healthcheck(root))
+            runtime_errors.write_text(json.dumps({
+                "components": {
+                    "report_cycle": {"active": False},
+                    "profit_report_generation": {"active": True},
+                },
+            }), encoding="utf-8")
+            self.assertFalse(healthcheck(root))
+            runtime_errors.write_text(json.dumps({
+                "components": {
+                    "report_cycle": {"active": False},
+                    "profit_report_generation": {"active": False},
+                },
+            }), encoding="utf-8")
             self.assertTrue(healthcheck(root))
 
     def test_collector_atomically_writes_report_and_matching_chart(self):

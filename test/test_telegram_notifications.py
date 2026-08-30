@@ -619,6 +619,9 @@ def test_mobile_card_is_one_robot_1440_by_3200_png_with_gate_table():
                        "seven_day_mtm_quote": -1, "all_time_mtm_quote": 8},
             "equity": 208, "peak_equity": 210, "drawdown_pct": 0.95,
             "owned_base": "0.002", "fees_quote": 0, "buys": 3, "sells": 2,
+            "owned_inventory_mtm_quote": "0.4435",
+            "tradable_risk_exposure_quote": 0,
+            "ordinary_trade_count": 5, "risk_exit_trades": 1,
             "phase": "ACTIVE", "v22_gate": "放行", "fomc_gate": "放行",
             "active_runtime": {"orders": 4},
             "trading_status": {
@@ -639,6 +642,117 @@ def test_mobile_card_is_one_robot_1440_by_3200_png_with_gate_table():
         with Image.open(output) as image:
             assert image.size == (1440, 3200)
             assert image.format == "PNG"
+
+
+def test_mobile_card_inventory_values_accept_quote_assets_zero_and_bad_values(tmp_path):
+    base = {
+        "strategy": "dca", "pair": "BTC-USDT",
+        "generated_at_bjt": "2026-08-30T12:00:00+08:00", "data_age_seconds": 1,
+        "profit": {}, "equity": 200, "peak_equity": 200, "drawdown_pct": 0,
+        "owned_base": "0.000005682327138578196897323272",
+        "fees_quote": 0, "buys": 0, "sells": 1,
+        "ordinary_trade_count": 0, "risk_exit_trades": 1,
+        "phase": "COOLDOWN", "active_runtime": {},
+        "trading_status": {
+            "system_health": "HEALTHY", "trade_mode": "COOLDOWN",
+            "trading_normal": False, "phase": "COOLDOWN",
+            "final_permissions": {"buy_enabled": False, "sell_enabled": False},
+            "gate_statuses": [],
+        },
+    }
+    cases = [
+        ("USDT", "0.4435", "0"),
+        ("FDUSD", 0, None),
+        ("USDT", "not-a-number", "NaN"),
+    ]
+    for index, (quote_asset, owned, tradable) in enumerate(cases):
+        report = dict(base)
+        report.update({
+            "quote_asset": quote_asset,
+            "owned_inventory_mtm_quote": owned,
+            "tradable_risk_exposure_quote": tradable,
+        })
+        output = tmp_path / f"card-{index}.png"
+        render_mobile_profit_card(report, output)
+        with Image.open(output) as image:
+            assert image.size == (1440, 3200)
+
+
+def test_profit_png_failure_does_not_block_event_ingest_or_mark_slot(tmp_path):
+    class FakeOutbox:
+        def __init__(self):
+            self.marked = False
+            self.ingested = []
+            self.drains = 0
+
+        def slot_due(self, *, now=None):
+            return not self.marked, "2026-08-30T20:00:00+08:00"
+
+        def mark_slot(self, slot):
+            self.marked = True
+
+        def ingest(self, source, attachment_builder=None):
+            self.ingested.append(Path(source))
+
+        def drain(self, client):
+            self.drains += 1
+            return 0
+
+        def health(self):
+            return {"pending": 0, "retrying": 0, "max_attempts": 0}
+
+    class FakeWorker:
+        schedule = staticmethod(lambda event: [])
+
+        @staticmethod
+        def poll():
+            return {"active": False}
+
+        @staticmethod
+        def finalize_delivery_receipts():
+            return 0
+
+    class FakePublisher:
+        @staticmethod
+        def publish(statuses, now=None):
+            return {"catalog_sha256": "a" * 64}
+
+    reporting = UnifiedTelegramReporting.__new__(UnifiedTelegramReporting)
+    reporting.enabled = True
+    reporting.profit_enabled = True
+    reporting.client = object()
+    reporting.events = tmp_path / "events.jsonl"
+    reporting.grid_state = tmp_path / "grid"
+    reporting.bots_path = tmp_path / "bots"
+    reporting.outbox = FakeOutbox()
+    reporting.parameter_worker = FakeWorker()
+    reporting.management_parameters = FakePublisher()
+    reporting.update_snapshots = lambda report, now: [{"trading_status": {}}]
+    reporting._publish_current_runtime_errors = lambda now: {"errors": []}
+    attempts = []
+
+    def queue(robots, slot, now):
+        attempts.append(slot)
+        if len(attempts) == 1:
+            raise RuntimeError("png render failed")
+
+    reporting._queue_profit_report = queue
+    now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    first = reporting.cycle({}, now=now)
+    assert first["profit_report_error"] == "RuntimeError: png render failed"
+    assert reporting.outbox.marked is False
+    assert reporting.outbox.drains == 1
+    assert len(reporting.outbox.ingested) >= 2
+
+    second = reporting.cycle({}, now=now)
+    assert second["profit_report_error"] == ""
+    assert reporting.outbox.marked is True
+    third = reporting.cycle({}, now=now)
+    assert third["profit_report_error"] == ""
+    assert attempts == [
+        "2026-08-30T20:00:00+08:00",
+        "2026-08-30T20:00:00+08:00",
+    ]
 
 
 def test_mobile_card_dust_text_only_contains_usdt_valuation():

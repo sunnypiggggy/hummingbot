@@ -11,7 +11,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -138,12 +138,21 @@ def decimal_value(value: Any) -> Decimal:
 
 def inventory_exposure_quote(
     owner_value: Any, mark_price: Any, remaining_value: Any = None,
-) -> tuple[float, float]:
+) -> tuple[float | None, float | None]:
     """Value human-decimal inventory contract fields in quote currency."""
-    owner = Decimal(str(owner_value))
-    mark = Decimal(str(mark_price))
-    remaining = owner if remaining_value is None else Decimal(str(remaining_value))
-    return float(owner * mark), float(remaining * mark)
+    try:
+        owner = Decimal(str(owner_value))
+        mark = Decimal(str(mark_price))
+        remaining = owner if remaining_value is None else Decimal(str(remaining_value))
+        if not all(value.is_finite() for value in (owner, mark, remaining)):
+            return None, None
+        owned_quote = owner * mark
+        remaining_quote = remaining * mark
+        if not owned_quote.is_finite() or not remaining_quote.is_finite():
+            return None, None
+        return float(owned_quote), float(remaining_quote)
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
+        return None, None
 
 
 def normalize_side(value: Any) -> str:
@@ -763,13 +772,23 @@ def healthcheck(output_dir: Path) -> bool:
         if generated.tzinfo is None:
             return False
         age = (datetime.now(timezone.utc) - generated).total_seconds()
-        return (
+        base_report_healthy = (
             report.get("schema_version") == 3
             and len(report.get("bots", [])) == len(LIVE_PAIRS)
             and age <= MAX_DATA_AGE_SECONDS
             and hashlib.sha256(chart_path.read_bytes()).hexdigest()
             == report.get("chart_sha256")
         )
+        if not base_report_healthy:
+            return False
+        runtime_error_path = output_dir / "report_runtime_error_state.json"
+        if runtime_error_path.exists():
+            runtime_error_state = json.loads(runtime_error_path.read_text(encoding="utf-8"))
+            components = runtime_error_state.get("components", {})
+            for component in ("report_cycle", "profit_report_generation"):
+                if bool(components.get(component, {}).get("active")):
+                    return False
+        return True
     except Exception:
         return False
 
@@ -1696,9 +1715,15 @@ class UnifiedTelegramReporting:
             [item["trading_status"] for item in robots], now=now,
         )
         due, slot = self.outbox.slot_due(now=now)
+        profit_report_error = ""
         if self.enabled and self.profit_enabled and due:
-            self._queue_profit_report(robots, slot, now)
-            self.outbox.mark_slot(slot)
+            try:
+                self._queue_profit_report(robots, slot, now)
+                self.outbox.mark_slot(slot)
+            except Exception as exc:
+                # A presentation failure must not block risk-event ingestion,
+                # the persistent outbox, or parameter evidence delivery.
+                profit_report_error = f"{type(exc).__name__}: {exc}"
         sources = [self.events, self.grid_state / "telegram_events.jsonl"]
         sources.extend(self.bots_path.glob("instances/*/data/telegram_events.jsonl"))
         for source in sources:
@@ -1710,7 +1735,8 @@ class UnifiedTelegramReporting:
                 "slot": slot, "parameter_worker": worker,
                 "parameter_catalog_sha256": parameter_catalog["catalog_sha256"],
                 "active_runtime_errors": len(current_errors["errors"]),
-                "evidence_receipts_written": evidence_receipts}
+                "evidence_receipts_written": evidence_receipts,
+                "profit_report_error": profit_report_error}
 
 
 def main() -> int:
@@ -1775,6 +1801,19 @@ def main() -> int:
                 runtime_errors.recovered(
                     "telegram_delivery",
                     trading_status="Telegram 持久化队列发送恢复正常；交易始终未受影响",
+                )
+            profit_report_error = str(telegram_status.get("profit_report_error") or "")
+            if profit_report_error:
+                runtime_errors.failure(
+                    "profit_report_generation", profit_report_error,
+                    severity="warning",
+                    trading_impact="四小时收益PNG暂未生成；风控事件和其他频道消息继续发送。",
+                    action="retry_current_profit_slot_without_blocking_outbox",
+                )
+            else:
+                runtime_errors.recovered(
+                    "profit_report_generation",
+                    trading_status="四小时收益PNG生成恢复；未补发多个历史时段",
                 )
             runtime_errors.recovered(
                 "report_cycle", trading_status="报告与通知恢复；交易始终不受报告服务影响",
