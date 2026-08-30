@@ -18,10 +18,62 @@ MODEL_VERSION = "xgboost-grid-long-risk-gate-v22-weekly-250d"
 STALE_AFTER_SECONDS = 150
 FOLD_HANDOVER_SECONDS = 60
 REQUIRED_PAIRS = ("BTC-FDUSD", "ETH-FDUSD")
+CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION = "PREWARMED_PENDING_ACTIVATION"
+CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD = "WARM_ACTIVE_PENDING_FOLD"
+CUTOVER_PHASE_ACTIVE = "ACTIVE"
+CUTOVER_PHASE_ACTIVE_UNAVAILABLE = "ACTIVE_UNAVAILABLE"
+CUTOVER_PHASE_LEGACY_ACTIVE = "LEGACY_ACTIVE"
+CUTOVER_PHASE_POINTER_READ_FALLBACK = "POINTER_READ_FALLBACK"
+CUTOVER_PHASE_WARM_ROLLBACK = "WARM_ROLLBACK_USING_SIGNED_PREDECESSOR"
+LEGACY_CUTOVER_PHASES = {
+    "PREWARMED": CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
+    "WARM_ACTIVE": CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+}
+VALID_CUTOVER_PHASES = frozenset({
+    CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
+    CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+    CUTOVER_PHASE_ACTIVE,
+    CUTOVER_PHASE_ACTIVE_UNAVAILABLE,
+    CUTOVER_PHASE_LEGACY_ACTIVE,
+    CUTOVER_PHASE_POINTER_READ_FALLBACK,
+    CUTOVER_PHASE_WARM_ROLLBACK,
+})
+COMMITTED_CUTOVER_PHASES = frozenset({
+    CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+    CUTOVER_PHASE_ACTIVE,
+    CUTOVER_PHASE_ACTIVE_UNAVAILABLE,
+})
 HASH_FIELDS = (
     "release_sha256", "model_sha256", "feature_schema_sha256",
     "strategy_schema_sha256", "training_data_sha256",
 )
+
+
+def normalize_cutover_phase(value: Any) -> str:
+    """Return the canonical cutover phase, accepting persisted legacy values."""
+    phase = LEGACY_CUTOVER_PHASES.get(str(value or ""), str(value or ""))
+    if phase not in VALID_CUTOVER_PHASES:
+        raise ValueError(f"invalid v22 cutover phase: {value}")
+    return phase
+
+
+def validate_cutover_transition(previous: Any, target: Any) -> tuple[str, str]:
+    """Validate the persisted state-machine transition for one generation."""
+    source = normalize_cutover_phase(previous)
+    destination = normalize_cutover_phase(target)
+    allowed = {
+        CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION: {
+            CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+        },
+        CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD: {
+            CUTOVER_PHASE_ACTIVE, CUTOVER_PHASE_ACTIVE_UNAVAILABLE,
+        },
+        CUTOVER_PHASE_ACTIVE_UNAVAILABLE: {CUTOVER_PHASE_ACTIVE},
+        CUTOVER_PHASE_ACTIVE: {CUTOVER_PHASE_ACTIVE},
+    }
+    if destination not in allowed.get(source, set()):
+        raise ValueError(f"invalid v22 cutover transition: {source} -> {destination}")
+    return source, destination
 
 
 def utc(ts: int | float) -> str:
@@ -142,6 +194,9 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
                 raise ValueError("invalid system_health")
             if payload.get("fold_boundary") is not None:
                 int(payload["fold_boundary"])
+            payload["cutover_phase"] = normalize_cutover_phase(
+                payload.get("cutover_phase")
+            )
         pairs: dict[str, dict[str, Any]] = {}
         source_healthy = payload.get("source_healthy") is True
         if not source_healthy:
@@ -203,7 +258,10 @@ def load_runtime_contract(path: Path, *, now: datetime | None = None,
                 # fail-closed.
                 handover_active = bool(
                     runtime_generation not in {None, "legacy"}
-                    and cutover in {"WARM_ACTIVE_PENDING_FOLD", "ACTIVE"}
+                    and cutover in {
+                        CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+                        CUTOVER_PHASE_ACTIVE,
+                    }
                     and boundary is not None and int(boundary) == week_end
                     and next_start is not None and int(next_start) == week_end
                     and next_end is not None and int(next_end) > int(next_start)

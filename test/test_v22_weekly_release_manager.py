@@ -7,7 +7,11 @@ import pytest
 
 from live_guard.telegram_notifications import build_event, format_event
 from scripts.grid_v22_live_gate import AUTO_CONFIRMATION, _authorization
-from scripts.ethbtc_forced_exit_contract import atomic_json
+from scripts.ethbtc_forced_exit_contract import (
+    CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
+    CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+    atomic_json,
+)
 from scripts.v22_weekly_release_manager import (
     DEFAULT_DELAY_SECONDS,
     DEFAULT_GENERATION_LEAD_SECONDS,
@@ -102,6 +106,7 @@ def test_early_activation_commits_only_runtime_pointer_not_mutable_aliases(tmp_p
         "generation_manifest_sha256": generation,
     })
     state = {
+        "phase": CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
         "candidate_release_sha256": candidate,
         "prepared_pointer_path": str(prepared_pointer),
         "pending_authorization_path": str(pending),
@@ -115,10 +120,12 @@ def test_early_activation_commits_only_runtime_pointer_not_mutable_aliases(tmp_p
     with patch.object(V22LiveGateProducer, "commit_generation", commit):
         activated = value._activate(state, boundary - 1_800)
 
-    assert activated["phase"] == "WARM_ACTIVE_PENDING_FOLD"
-    assert json.loads((value.runtime_root / "current.json").read_text(encoding="utf-8"))[
-        "runtime_generation"
-    ] == generation
+    assert activated["phase"] == CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD
+    pointer = json.loads(
+        (value.runtime_root / "current.json").read_text(encoding="utf-8")
+    )
+    assert pointer["runtime_generation"] == generation
+    assert pointer["cutover_phase"] == CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD
     assert not (value.release_root / "active_deployment.json").exists()
     assert not value.authorization_path.exists()
 
@@ -494,14 +501,22 @@ def test_release_retention_runs_only_after_a_healthy_fold_activation(tmp_path: P
     value = manager(tmp_path, boundary, boundary)
     pending = value.work_root / "pending.json"
     atomic_json(pending, {"model_sha256": MODEL})
+    generation = "c" * 64
+    atomic_json(value.runtime_root / "current.json", {
+        "runtime_generation": generation,
+        "cutover_phase": CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+    })
     base_state = {
-        "candidate_release_sha256": "c" * 64,
+        "phase": CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+        "candidate_release_sha256": generation,
+        "runtime_generation": generation,
         "pending_authorization_path": str(pending),
         "activation_boundary": boundary,
         "approval_mode": "automatic_default_after_12h",
     }
 
     with patch.object(value, "_switch_current"), \
+            patch.object(V22LiveGateProducer, "commit_generation"), \
             patch.object(value, "_apply_release_retention") as retention:
         unavailable = value._finalize_fold(dict(base_state), boundary, generation_healthy=False)
     assert unavailable["phase"] == "ACTIVE_UNAVAILABLE"
@@ -511,9 +526,17 @@ def test_release_retention_runs_only_after_a_healthy_fold_activation(tmp_path: P
         "schema": "ethbtc-forced-exit-release-retention-v1",
         "removed_release_sha256": [],
     }
+    atomic_json(value.runtime_root / "current.json", {
+        "runtime_generation": generation,
+        "cutover_phase": CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+    })
     with patch.object(value, "_switch_current"), \
+            patch.object(V22LiveGateProducer, "commit_generation"), \
             patch.object(value, "_apply_release_retention", return_value=retention_report) as retention:
         active = value._finalize_fold(dict(base_state), boundary, generation_healthy=True)
     assert active["phase"] == "ACTIVE"
     assert active["release_retention"] == retention_report
     retention.assert_called_once()
+    assert "MODEL_FOLD_HANDOVER_STABLE" in value.notification_path.read_text(
+        encoding="utf-8"
+    )

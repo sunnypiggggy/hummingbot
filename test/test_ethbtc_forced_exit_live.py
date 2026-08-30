@@ -4,12 +4,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "live_guard"))
 
 from ethbtc_forced_exit_contract import (  # noqa: E402
+    CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
     EXECUTION_POLICY_VERSION,
     MODEL_VERSION,
     PACKAGE_ID,
@@ -17,6 +20,7 @@ from ethbtc_forced_exit_contract import (  # noqa: E402
     event_id,
     load_runtime_contract,
     utc,
+    validate_cutover_transition,
 )
 from grid_v22_live_gate import V22LiveGateProducer  # noqa: E402
 from risk_recovery import LATCHED, mark_exit_complete, trigger_state  # noqa: E402
@@ -145,6 +149,109 @@ def test_committed_generation_has_bounded_signed_fold_handover(tmp_path: Path) -
     )
     assert expired["runtime_gate_healthy"] is False
     assert all(item["force_exit"] for item in expired["pairs"].values())
+
+
+def test_legacy_warm_active_pointer_is_normalized_without_boundary_gap(
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000
+    boundary = now + 3600
+    payload = contract(now, authorized=True)
+    payload.update({
+        "generated_at": utc(boundary - 10),
+        "valid_until": utc(boundary + 140),
+        "runtime_generation": HASH,
+        "predecessor_release_sha256": "b" * 64,
+        "state_lineage_sha256": "c" * 64,
+        "cutover_phase": "WARM_ACTIVE",
+        "fold_boundary": boundary,
+        "system_health": "HEALTHY",
+    })
+    for item in payload["pairs"].values():
+        item.update({
+            "next_week_start": boundary,
+            "next_week_end": boundary + 7 * 24 * 3600,
+            "next_week_model_sha256": "d" * 64,
+            "model_signal": "RISK_ON",
+        })
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_runtime_contract(
+        path, now=datetime.fromtimestamp(boundary + 3, timezone.utc),
+    )
+    assert loaded["runtime_gate_healthy"] is True
+    assert loaded["cutover_phase"] == CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD
+    assert loaded["fold_handover_active"] is True
+    assert all(not item["force_exit"] for item in loaded["pairs"].values())
+
+
+def test_exact_incident_timeline_stays_healthy_without_scheduler_finalize(
+    tmp_path: Path,
+) -> None:
+    boundary = 1_788_102_000
+    payload = contract(boundary - 3, authorized=True)
+    payload.update({
+        "generated_at": utc(boundary - 3),
+        "valid_until": utc(boundary + 147),
+        "runtime_generation": HASH,
+        "predecessor_release_sha256": "b" * 64,
+        "state_lineage_sha256": "c" * 64,
+        "cutover_phase": CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+        "fold_boundary": boundary,
+        "system_health": "HEALTHY",
+    })
+    for item in payload["pairs"].values():
+        item.update({
+            "week_end": boundary,
+            "next_week_start": boundary,
+            "next_week_end": boundary + 7 * 24 * 3600,
+            "next_week_model_sha256": "d" * 64,
+            "model_signal": "RISK_ON",
+        })
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    at_three_seconds = load_runtime_contract(
+        path, now=datetime.fromtimestamp(boundary + 3, timezone.utc),
+    )
+    assert at_three_seconds["runtime_gate_healthy"] is True
+    assert at_three_seconds["fold_handover_active"] is True
+
+    payload["generated_at"] = utc(boundary + 33)
+    payload["valid_until"] = utc(boundary + 183)
+    for pair, item in payload["pairs"].items():
+        item.update({
+            "signal_ts": boundary,
+            "model_week": 38,
+            "week_start": boundary,
+            "week_end": boundary + 7 * 24 * 3600,
+            "week_model_sha256": "d" * 64,
+            "event_id": event_id(HASH, pair, boundary, "clear"),
+        })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    at_thirty_three_seconds = load_runtime_contract(
+        path, now=datetime.fromtimestamp(boundary + 33, timezone.utc),
+    )
+    assert at_thirty_three_seconds["runtime_gate_healthy"] is True
+    assert at_thirty_three_seconds["fold_handover_active"] is False
+    assert all(
+        item["buy_enabled"] and not item["force_exit"]
+        for item in at_thirty_three_seconds["pairs"].values()
+    )
+
+    payload["cutover_phase"] = "ACTIVE"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    at_fifty_eight_seconds = load_runtime_contract(
+        path, now=datetime.fromtimestamp(boundary + 58, timezone.utc),
+    )
+    assert at_fifty_eight_seconds["runtime_gate_healthy"] is True
+    assert at_fifty_eight_seconds["cutover_phase"] == "ACTIVE"
+
+
+def test_cutover_state_machine_rejects_skipping_warm_activation() -> None:
+    with pytest.raises(ValueError, match="invalid v22 cutover transition"):
+        validate_cutover_transition("PREWARMED_PENDING_ACTIVATION", "ACTIVE")
 
 
 def test_fold_handover_requires_contiguous_next_signed_model(tmp_path: Path) -> None:

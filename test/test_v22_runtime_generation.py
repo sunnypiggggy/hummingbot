@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
 
-from scripts.ethbtc_forced_exit_contract import atomic_json, sha256_file
+from scripts.ethbtc_forced_exit_contract import (
+    CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+    atomic_json,
+    sha256_file,
+)
 from scripts.grid_v22_live_gate import V22LiveGateProducer, _runtime_deployment
 
 
@@ -58,7 +62,11 @@ def test_prepared_generation_is_invisible_until_single_pointer_commit(tmp_path, 
         observed_at=100, live_contract_path=live,
     )
     assert not (producer.runtime_root / "current.json").exists()
-    producer.commit_generation(prepared["pointer"])
+    pointer = {
+        **prepared["pointer"],
+        "cutover_phase": CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+    }
+    producer.commit_generation(pointer)
     resolved = _runtime_deployment(family, producer.runtime_root)
     assert resolved is not None
     assert resolved[0] == release

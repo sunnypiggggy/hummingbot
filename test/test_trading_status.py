@@ -91,3 +91,12 @@ def test_report_marks_isolated_prewarm_without_changing_current_model_semantics(
         datetime.fromtimestamp(100, timezone.utc),
     )
     assert phase == "PREWARMING_CURRENT_MODEL_ACTIVE"
+
+
+def test_report_marks_bounded_fold_handover_as_stable():
+    phase = UnifiedTelegramReporting._reported_cutover_phase(
+        {"phase": "WARM_ACTIVE_PENDING_FOLD", "fold_boundary": 200},
+        {"cutover_phase": "WARM_ACTIVE_PENDING_FOLD", "fold_handover_active": True},
+        datetime.fromtimestamp(203, timezone.utc),
+    )
+    assert phase == "FOLD_HANDOVER_STABLE"

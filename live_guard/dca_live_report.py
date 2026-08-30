@@ -1098,6 +1098,8 @@ class UnifiedTelegramReporting:
     def _reported_cutover_phase(
         cutover: Mapping[str, Any], contract: Mapping[str, Any], now: datetime,
     ) -> str | None:
+        if contract.get("fold_handover_active") is True:
+            return "FOLD_HANDOVER_STABLE"
         phase = str(cutover.get("phase") or "")
         boundary = int(cutover.get("fold_boundary") or 0)
         if (

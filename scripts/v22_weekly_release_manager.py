@@ -20,11 +20,21 @@ import pandas as pd
 import requests
 
 try:
-    from ethbtc_forced_exit_contract import PACKAGE_ID, atomic_json, sha256_file
+    from ethbtc_forced_exit_contract import (
+        CUTOVER_PHASE_ACTIVE, CUTOVER_PHASE_ACTIVE_UNAVAILABLE,
+        CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
+        CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD, PACKAGE_ID, atomic_json,
+        sha256_file, validate_cutover_transition,
+    )
     from grid_v22_live_gate import V22LiveGateProducer
     from telegram_notifications import append_event, build_event
 except ModuleNotFoundError:
-    from scripts.ethbtc_forced_exit_contract import PACKAGE_ID, atomic_json, sha256_file
+    from scripts.ethbtc_forced_exit_contract import (
+        CUTOVER_PHASE_ACTIVE, CUTOVER_PHASE_ACTIVE_UNAVAILABLE,
+        CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
+        CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD, PACKAGE_ID, atomic_json,
+        sha256_file, validate_cutover_transition,
+    )
     from scripts.grid_v22_live_gate import V22LiveGateProducer
     from live_guard.telegram_notifications import append_event, build_event
 
@@ -160,7 +170,7 @@ class WeeklyReleaseManager:
             "activate_at": value.get("activate_at"),
             "current_generation_unaffected": value.get("phase") in {
                 "SCHEDULED", "AWAITING_APPROVAL", "APPROVED_PENDING_PREWARM",
-                "PREWARMED_PENDING_ACTIVATION",
+                CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
             },
             "last_error": value.get("last_error"),
         }
@@ -598,7 +608,10 @@ class WeeklyReleaseManager:
     def _activate(self, state: dict[str, Any], observed: int) -> dict[str, Any]:
         release_sha = str(state["candidate_release_sha256"])
         prepared_pointer = load_json(Path(state["prepared_pointer_path"]), {}) or {}
-        prepared_pointer["cutover_phase"] = "WARM_ACTIVE"
+        _, cutover_phase = validate_cutover_transition(
+            state.get("phase"), CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+        )
+        prepared_pointer["cutover_phase"] = cutover_phase
         producer = V22LiveGateProducer(
             package_dir=self.release_root, cache_dir=self.candle_dir,
             seed_cache_dir=self.candle_dir, state_dir=self.grid_state_path.parent,
@@ -608,7 +621,7 @@ class WeeklyReleaseManager:
         previous_pointer = load_json(self.runtime_root / "current.json", None)
         producer.commit_generation(prepared_pointer)
         state.update({
-            "phase": "WARM_ACTIVE_PENDING_FOLD",
+            "phase": CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
             "warm_activated_at": observed,
             "previous_runtime_pointer": previous_pointer,
             "warm_verified_cycles": 0,
@@ -635,6 +648,22 @@ class WeeklyReleaseManager:
     ) -> dict[str, Any]:
         receipt = load_json(Path(state["pending_authorization_path"]), {}) or {}
         release_sha = str(state["candidate_release_sha256"])
+        runtime_pointer = load_json(self.runtime_root / "current.json", {}) or {}
+        expected_generation = str(state.get("runtime_generation") or "")
+        if (
+            not self._is_release_sha(expected_generation)
+            or runtime_pointer.get("runtime_generation") != expected_generation
+        ):
+            raise RuntimeError(
+                "cannot finalize v22 fold without the committed runtime generation"
+            )
+        target_phase = (
+            CUTOVER_PHASE_ACTIVE if generation_healthy
+            else CUTOVER_PHASE_ACTIVE_UNAVAILABLE
+        )
+        _, runtime_pointer["cutover_phase"] = validate_cutover_transition(
+            runtime_pointer.get("cutover_phase"), target_phase,
+        )
         pointer = {
             "schema": "ethbtc-forced-exit-active-deployment-v1",
             "package_id": PACKAGE_ID, "release_sha256": release_sha,
@@ -645,24 +674,18 @@ class WeeklyReleaseManager:
         atomic_json(target, pointer)
         self._switch_current(release_sha)
         atomic_json(self.authorization_path, receipt)
-        runtime_pointer = load_json(self.runtime_root / "current.json", {}) or {}
-        expected_generation = str(state.get("runtime_generation") or "")
-        if (
-            self._is_release_sha(expected_generation)
-            and runtime_pointer.get("runtime_generation") == expected_generation
-        ):
-            runtime_pointer["cutover_phase"] = (
-                "ACTIVE" if generation_healthy else "ACTIVE_UNAVAILABLE"
-            )
-            producer = V22LiveGateProducer(
-                package_dir=self.release_root, cache_dir=self.candle_dir,
-                seed_cache_dir=self.candle_dir, state_dir=self.grid_state_path.parent,
-                authorization_path=self.authorization_path, refresh_binance=False,
-                runtime_root=self.runtime_root,
-            )
-            producer.commit_generation(runtime_pointer)
+        producer = V22LiveGateProducer(
+            package_dir=self.release_root, cache_dir=self.candle_dir,
+            seed_cache_dir=self.candle_dir, state_dir=self.grid_state_path.parent,
+            authorization_path=self.authorization_path, refresh_binance=False,
+            runtime_root=self.runtime_root,
+        )
+        producer.commit_generation(runtime_pointer)
         state.update({
-            "phase": "ACTIVE" if generation_healthy else "ACTIVE_UNAVAILABLE",
+            "phase": (
+                CUTOVER_PHASE_ACTIVE if generation_healthy
+                else CUTOVER_PHASE_ACTIVE_UNAVAILABLE
+            ),
             "activated_at": observed,
             "active_deployment_sha256": sha256_file(target),
             "last_error": None if generation_healthy else "signed_week_unavailable",
@@ -674,7 +697,7 @@ class WeeklyReleaseManager:
             source="v22-weekly-release-manager", strategy="grid+dca",
             bot="grid-live-fdusd-400,dca-live-btcusdt-200,dca-live-ethusdt-200",
             pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT", mechanism="parameter_update",
-            transition=("MODEL_FOLD_ACTIVATED" if generation_healthy
+            transition=("MODEL_FOLD_HANDOVER_STABLE" if generation_healthy
                         else "MODEL_CUTOVER_PRECHECK_FAILED"),
             reason=("v22 已预热 release 在周边界自然进入新 fold"
                     if generation_healthy else
@@ -762,7 +785,7 @@ class WeeklyReleaseManager:
         pointer_path = self.work_root / f"runtime-pointer-{prepared['generation']}.json"
         atomic_json(pointer_path, prepared["pointer"])
         state.update({
-            "phase": "PREWARMED_PENDING_ACTIVATION",
+            "phase": CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
             "prewarmed_at": observed,
             "runtime_generation": prepared["generation"],
             "prepared_pointer_path": str(pointer_path),
@@ -966,7 +989,7 @@ class WeeklyReleaseManager:
                     "live_generation_unchanged": True,
                 })
                 return state
-        if state.get("phase") == "PREWARMED_PENDING_ACTIVATION":
+        if state.get("phase") == CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION:
             if observed < int(state["activate_at"]):
                 return state
             if (
@@ -981,7 +1004,10 @@ class WeeklyReleaseManager:
                 self._notify_blocked(state, {"approved_before_fold_boundary": False})
                 return state
             return self._activate(state, observed)
-        if state.get("phase") in {"WARM_ACTIVE_PENDING_FOLD", "ACTIVE_UNAVAILABLE"}:
+        if state.get("phase") in {
+            CUTOVER_PHASE_WARM_ACTIVE_PENDING_FOLD,
+            CUTOVER_PHASE_ACTIVE_UNAVAILABLE,
+        }:
             return self._monitor_warm_generation(state, observed)
         if state.get("phase") == "AWAITING_APPROVAL":
             decision = self._decision(str(state["candidate_release_sha256"]))
@@ -1001,7 +1027,9 @@ class WeeklyReleaseManager:
             return self._approve(state, observed, decision)
         production = self._production()
         source_end = int(production["effective_end"])
-        if state.get("source_effective_end") == source_end and state.get("phase") in {"ACTIVE", "REJECTED"}:
+        if state.get("source_effective_end") == source_end and state.get("phase") in {
+            CUTOVER_PHASE_ACTIVE, "REJECTED",
+        }:
             return state
         if state.get("source_effective_end") == source_end and state.get("phase") == "BLOCKED":
             if observed < int(state.get("retry_after", 0)):

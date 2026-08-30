@@ -58,6 +58,7 @@ RUNTIME_ERROR_TRANSITIONS = {"ERROR_OCCURRED", "ERROR_RECOVERED"}
 MODEL_CUTOVER_TRANSITIONS = {
     "MODEL_CUTOVER_PREWARMED", "MODEL_CUTOVER_STABLE",
     "MODEL_CUTOVER_PRECHECK_FAILED", "MODEL_FOLD_ACTIVATED",
+    "MODEL_FOLD_HANDOVER_STABLE",
     "MODEL_RETENTION_PRUNED", "MODEL_RETENTION_FAILED",
 }
 INVENTORY_TRANSITIONS = {
@@ -1569,6 +1570,10 @@ def render_mobile_profit_card(report: Mapping[str, Any], output: Path) -> None:
     cutover_label = (
         "候选预热中，当前模型继续交易"
         if cutover_phase == "PREWARMING_CURRENT_MODEL_ACTIVE" else
+        "候选已热切换，当前模型继续交易"
+        if cutover_phase == "WARM_ACTIVE_PENDING_FOLD" else
+        "模型周平稳切换，交易权限未变化"
+        if cutover_phase == "FOLD_HANDOVER_STABLE" else
         "已生效" if cutover_phase == "ACTIVE" else cutover_phase
     )
     draw.text(

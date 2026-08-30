@@ -20,14 +20,22 @@ if str(SCRIPT_DIR) not in sys.path:
 try:
     from build_xgboost_v22_shadow_signal import produce_once
     from ethbtc_forced_exit_contract import (
-        EXECUTION_POLICY_VERSION, MODEL_VERSION, PACKAGE_ID, REQUIRED_PAIRS,
-        STALE_AFTER_SECONDS, atomic_json, event_id, failed_contract, sha256_file, utc,
+        COMMITTED_CUTOVER_PHASES, CUTOVER_PHASE_ACTIVE,
+        CUTOVER_PHASE_LEGACY_ACTIVE, CUTOVER_PHASE_POINTER_READ_FALLBACK,
+        CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
+        CUTOVER_PHASE_WARM_ROLLBACK, EXECUTION_POLICY_VERSION, MODEL_VERSION,
+        PACKAGE_ID, REQUIRED_PAIRS, STALE_AFTER_SECONDS, atomic_json, event_id,
+        failed_contract, normalize_cutover_phase, sha256_file, utc,
     )
 except ModuleNotFoundError:  # Package import from the repository root/tests.
     from scripts.build_xgboost_v22_shadow_signal import produce_once
     from scripts.ethbtc_forced_exit_contract import (
-        EXECUTION_POLICY_VERSION, MODEL_VERSION, PACKAGE_ID, REQUIRED_PAIRS,
-        STALE_AFTER_SECONDS, atomic_json, event_id, failed_contract, sha256_file, utc,
+        COMMITTED_CUTOVER_PHASES, CUTOVER_PHASE_ACTIVE,
+        CUTOVER_PHASE_LEGACY_ACTIVE, CUTOVER_PHASE_POINTER_READ_FALLBACK,
+        CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
+        CUTOVER_PHASE_WARM_ROLLBACK, EXECUTION_POLICY_VERSION, MODEL_VERSION,
+        PACKAGE_ID, REQUIRED_PAIRS, STALE_AFTER_SECONDS, atomic_json, event_id,
+        failed_contract, normalize_cutover_phase, sha256_file, utc,
     )
 
 
@@ -154,10 +162,15 @@ def _runtime_deployment(
     final_preflight = manifest.get("final_preflight_sha256")
     if final_preflight is not None and not valid_sha256(final_preflight):
         raise ValueError("v22 runtime generation final preflight hash mismatch")
+    cutover_phase = normalize_cutover_phase(
+        pointer.get("cutover_phase", manifest.get("cutover_phase"))
+    )
+    if cutover_phase not in COMMITTED_CUTOVER_PHASES:
+        raise ValueError("uncommitted v22 runtime cutover phase")
     return release, receipt, {
         **manifest,
         "runtime_generation": generation,
-        "cutover_phase": pointer.get("cutover_phase", manifest.get("cutover_phase")),
+        "cutover_phase": cutover_phase,
     }
 
 
@@ -187,7 +200,7 @@ class V22LiveGateProducer:
             "runtime_generation": "legacy",
             "predecessor_release_sha256": None,
             "fold_boundary": None,
-            "cutover_phase": "LEGACY_ACTIVE",
+            "cutover_phase": CUTOVER_PHASE_LEGACY_ACTIVE,
         }
 
     def _generation_paths(self, context: Mapping[str, Any]) -> tuple[Path, Path]:
@@ -254,7 +267,7 @@ class V22LiveGateProducer:
         context = {
             **identity,
             "runtime_generation": staging_id,
-            "cutover_phase": "PREWARMED",
+            "cutover_phase": CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
         }
         contract = self._produce_for(
             observed=int(observed_at), active_package=release,
@@ -308,7 +321,7 @@ class V22LiveGateProducer:
             "schema": RUNTIME_GENERATION_SCHEMA,
             **identity,
             "prepared_at": int(observed_at),
-            "cutover_phase": "PREWARMED",
+            "cutover_phase": CUTOVER_PHASE_PREWARMED_PENDING_ACTIVATION,
             "authorization": receipt,
             "shadow_lock_sha256": sha256_file(lock_path),
             "prepared_state_sha256": sha256_file(staged_state),
@@ -338,7 +351,13 @@ class V22LiveGateProducer:
         manifest = self.runtime_root / "generations" / generation / "manifest.json"
         if not manifest.is_file() or sha256_file(manifest) != generation:
             raise ValueError("cannot commit an unverified v22 runtime generation")
-        atomic_json(self.runtime_root / "current.json", dict(pointer))
+        committed = dict(pointer)
+        committed["cutover_phase"] = normalize_cutover_phase(
+            committed.get("cutover_phase")
+        )
+        if committed["cutover_phase"] not in COMMITTED_CUTOVER_PHASES:
+            raise ValueError("cannot commit a non-live v22 cutover phase")
+        atomic_json(self.runtime_root / "current.json", committed)
 
     def produce(self, observed_at: int | None = None) -> dict[str, Any]:
         observed = int(observed_at if observed_at is not None else time.time())
@@ -355,7 +374,7 @@ class V22LiveGateProducer:
                 "runtime_generation": "legacy",
                 "predecessor_release_sha256": None,
                 "fold_boundary": None,
-                "cutover_phase": "POINTER_READ_FALLBACK",
+                "cutover_phase": CUTOVER_PHASE_POINTER_READ_FALLBACK,
             }
         shadow_output, shadow_state = self._generation_paths(context)
         contract = self._produce_for(
@@ -383,7 +402,7 @@ class V22LiveGateProducer:
                     "runtime_generation": "legacy",
                     "predecessor_release_sha256": None,
                     "fold_boundary": int(boundary),
-                    "cutover_phase": "WARM_ROLLBACK_USING_SIGNED_PREDECESSOR",
+                    "cutover_phase": CUTOVER_PHASE_WARM_ROLLBACK,
                 },
                 shadow_output=self.shadow_output, shadow_state=self.shadow_state,
             )
@@ -507,13 +526,16 @@ class V22LiveGateProducer:
                 "RISK_OFF" if healthy and item.get("risk_off_active") else
                 "RISK_ON" if healthy else "UNAVAILABLE",
             )
+        cutover_phase = normalize_cutover_phase(
+            context.get("cutover_phase", CUTOVER_PHASE_ACTIVE)
+        )
         contract.update({
             "runtime_generation": context.get("runtime_generation", "legacy"),
             "predecessor_release_sha256": context.get("predecessor_release_sha256"),
             "state_lineage_sha256": (
                 sha256_file(state_path) if state_path.is_file() else canonical_sha256({})
             ),
-            "cutover_phase": context.get("cutover_phase", "ACTIVE"),
+            "cutover_phase": cutover_phase,
             "fold_boundary": context.get("fold_boundary"),
             "system_health": "HEALTHY" if healthy else "FAILED",
         })
