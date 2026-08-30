@@ -1261,6 +1261,10 @@ class UnifiedTelegramReporting:
                 owned_notional, tradable_risk = inventory_exposure_quote(
                     owner_value, mark_price, remaining,
                 )
+                if recovery.get("exit_verification", {}).get(
+                    "residual_below_exchange_minimum"
+                ) is True:
+                    tradable_risk = 0.0
             risk_exit_trades = len([
                 row for row in state.get("emergency_adjustments", [])
                 if str(row.get("pair")) == pair and str(row.get("side", "")).upper() == "SELL"
