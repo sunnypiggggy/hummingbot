@@ -9,6 +9,8 @@ import os
 import shutil
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +27,58 @@ BOT_PAIRS = {
     "dca-live-btcusdt-200": "BTC-FDUSD",
     "dca-live-ethusdt-200": "ETH-FDUSD",
 }
+
+
+def live_minimum_notionals() -> dict[str, Decimal]:
+    """Read current Binance minimum notionals for the two Grid pairs.
+
+    Recovery is fail-closed when this public read is unavailable.  It is only
+    used when the short-lived Guard stop snapshot has already been lost after
+    a restart and durable exit evidence must be used instead.
+    """
+    result: dict[str, Decimal] = {}
+    for pair in ("BTC-FDUSD", "ETH-FDUSD"):
+        url = "https://api.binance.com/api/v3/exchangeInfo?" + urllib.parse.urlencode({
+            "symbol": pair.replace("-", ""),
+        })
+        request = urllib.request.Request(url, headers={"User-Agent": "ethbtc-recovery-preflight/1"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        symbols = payload.get("symbols", [])
+        if len(symbols) != 1:
+            raise RuntimeError(f"Binance filters do not contain {pair}")
+        symbol = symbols[0]
+        filters = {row.get("filterType"): row for row in symbol.get("filters", [])}
+        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL")
+        if notional is None or Decimal(str(notional.get("minNotional", "0"))) <= 0:
+            raise RuntimeError(f"Binance minimum notional is unavailable for {pair}")
+        result[pair] = Decimal(str(notional["minNotional"]))
+    if set(result) != {"BTC-FDUSD", "ETH-FDUSD"}:
+        raise RuntimeError("Binance filters do not contain both Grid pairs")
+    return result
+
+
+def durable_grid_exit_verified(
+    *, portfolio: dict[str, Any], grid_bot: dict[str, Any],
+    inventory: dict[str, Any], minimum_notionals: dict[str, Decimal] | None,
+) -> bool:
+    """Verify a completed quote-only exit after ephemeral stop fields expired."""
+    if minimum_notionals is None or portfolio.get("exit_completed_at") is None:
+        return False
+    execution = portfolio.get("execution", {})
+    if execution.get("target") != "quote_only":
+        return False
+    latest_pairs = grid_bot.get("latest", {}).get("pairs", {})
+    for pair in ("BTC-FDUSD", "ETH-FDUSD"):
+        asset = pair.split("-", 1)[0]
+        pair_snapshot = latest_pairs.get(pair, {})
+        asset_status = inventory.get("assets", {}).get(asset, {})
+        owner = asset_status.get("owners", {}).get("grid:grid-live-fdusd-400")
+        if owner is None or pair_snapshot.get("mark") is None:
+            return False
+        if Decimal(str(owner)) * Decimal(str(pair_snapshot["mark"])) >= minimum_notionals[pair]:
+            return False
+    return True
 
 
 def read_object(path: Path) -> dict[str, Any]:
@@ -80,6 +134,8 @@ def cooldown_state(now: float) -> dict[str, Any]:
 def recover(
     root: Path, *, release_sha256: str, runtime_generation: str,
     confirm: str, observed_at: float | None = None,
+    minimum_notionals: dict[str, Decimal] | None = None,
+    apply: bool = True,
 ) -> dict[str, Any]:
     if confirm != CONFIRMATION:
         raise RuntimeError("confirmation mismatch")
@@ -159,10 +215,14 @@ def recover(
         and grid_bot.get("stop", {}).get("verified_no_active_orders") is True
         and grid_bot.get("stop", {}).get("verified_no_live_instances") is True
     )
+    durable_exit_verified = durable_grid_exit_verified(
+        portfolio=portfolio, grid_bot=grid_bot, inventory=inventory,
+        minimum_notionals=minimum_notionals,
+    )
     if (
         portfolio.get("phase") not in {"EXITING", "LATCHED"}
         or not signed_week_reason(portfolio.get("reason"))
-        or not grid_exit_verified
+        or not (grid_exit_verified or durable_exit_verified)
     ):
         raise RuntimeError("Grid is not latched by the reviewed signed-week incident")
     for bot_name in BOT_PAIRS:
@@ -172,9 +232,10 @@ def recover(
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = root / "deploy_backups/signed_week_recovery" / f"recovery-{stamp}"
-    backup.mkdir(parents=True, exist_ok=False)
-    for label in ("grid_guard", "dca_guard", "grid_runtime"):
-        shutil.copy2(paths[label], backup / f"{label}.json")
+    if apply:
+        backup.mkdir(parents=True, exist_ok=False)
+        for label in ("grid_guard", "dca_guard", "grid_runtime"):
+            shutil.copy2(paths[label], backup / f"{label}.json")
 
     grid_runtime["portfolio_recovery"] = active_state()
     grid_runtime["portfolio_tripped"] = False
@@ -244,9 +305,6 @@ def recover(
     dca_guard.pop("integrity_failure_grace", None)
     dca_guard["last_success_at"] = now
 
-    write_atomic(paths["grid_runtime"], grid_runtime)
-    write_atomic(paths["grid_guard"], grid_guard)
-    write_atomic(paths["dca_guard"], dca_guard)
     audit = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": "approved_signed_week_latch_recovered",
@@ -254,18 +312,27 @@ def recover(
         "release_sha256": release_sha256,
         "runtime_generation": runtime_generation,
         "backup": str(backup),
+        "dry_run": not apply,
         "signals": {
             pair: str(signal.get("model_signal"))
             for pair, signal in contract["pairs"].items()
         },
+        "grid_exit_evidence": (
+            "ephemeral_guard_stop_snapshot" if grid_exit_verified
+            else "durable_exit_audit_and_live_exchange_filters"
+        ),
         "reconciled_ledgers": reconciled_ledgers,
     }
-    for audit_path in (
-        root / "grid-live-fdusd-data/risk_audit.jsonl",
-        root / "dca-live-data/risk_audit.jsonl",
-    ):
-        with audit_path.open("a", encoding="utf-8") as output:
-            output.write(json.dumps(audit, ensure_ascii=False) + "\n")
+    if apply:
+        write_atomic(paths["grid_runtime"], grid_runtime)
+        write_atomic(paths["grid_guard"], grid_guard)
+        write_atomic(paths["dca_guard"], dca_guard)
+        for audit_path in (
+            root / "grid-live-fdusd-data/risk_audit.jsonl",
+            root / "dca-live-data/risk_audit.jsonl",
+        ):
+            with audit_path.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(audit, ensure_ascii=False) + "\n")
     return audit
 
 
@@ -275,10 +342,13 @@ def main() -> int:
     parser.add_argument("--release-sha256", required=True)
     parser.add_argument("--runtime-generation", required=True)
     parser.add_argument("--confirm", required=True)
+    parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     print(json.dumps(recover(
         args.root, release_sha256=args.release_sha256,
         runtime_generation=args.runtime_generation, confirm=args.confirm,
+        minimum_notionals=live_minimum_notionals(),
+        apply=args.apply,
     ), ensure_ascii=False))
     return 0
 
