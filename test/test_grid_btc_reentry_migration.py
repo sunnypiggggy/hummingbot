@@ -73,6 +73,9 @@ def test_completed_job_repairs_runtime_after_process_crash(tmp_path):
     runtime = {
         "schema_version": 13,
         "ledgers": {"BTC-FDUSD": value},
+        "pair_recovery": {"BTC-FDUSD": {
+            "phase": "REENTRY", "remaining_base": {"BTC-FDUSD": "0.00125465"},
+        }},
         "accounting_migrations": [{
             "migration_id": "grid-btc-missed-reentry-fill-v1",
             "stage": "LEDGER_CORRECTED",
@@ -113,6 +116,7 @@ def test_completed_job_repairs_runtime_after_process_crash(tmp_path):
     _finalize_runtime_from_completed_job(runtime_path, runtime, job, shared)
     recovered = json.loads(runtime_path.read_text(encoding="utf-8"))
     assert Decimal(recovered["ledgers"]["BTC-FDUSD"]["base"]) == Decimal("0.00000465")
+    assert recovered["pair_recovery"]["BTC-FDUSD"]["remaining_base"]["BTC-FDUSD"] == "0.00000465"
     assert recovered["accounting_migrations"][0]["stage"] == "COMPLETED"
 
     # A second recovery pass is read-only and cannot account the SELL twice.

@@ -272,6 +272,7 @@ def _finalize_runtime_from_completed_job(
     if migration is None:
         raise RuntimeError("completed liquidation exists without Runtime correction evidence")
     metrics = _fill_metrics(_completed_job_response(shared, job))
+    changed = False
     if migration.get("stage") != "COMPLETED":
         ledger = dict(runtime["ledgers"][PAIR])
         _apply_sell(ledger, metrics)
@@ -287,6 +288,15 @@ def _finalize_runtime_from_completed_job(
         })
         runtime["ledgers"][PAIR] = ledger
         runtime["accounting_migrations"] = events
+        changed = True
+    remaining = str(runtime["ledgers"][PAIR]["base"])
+    recovery = runtime.get("pair_recovery", {}).get(PAIR)
+    if isinstance(recovery, dict):
+        remaining_base = recovery.setdefault("remaining_base", {})
+        if remaining_base.get(PAIR) != remaining:
+            remaining_base[PAIR] = remaining
+            changed = True
+    if changed:
         runtime["updated_at"] = time.time()
         _atomic_json(runtime_path, runtime)
     return metrics
