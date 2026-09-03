@@ -919,6 +919,21 @@ class DcaLiveSafetyTest(unittest.TestCase):
         self.assertEqual(Decimal("44.816"), metrics["pnl_quote"])
         self.assertEqual(Decimal("0.184"), metrics["fees_quote"])
 
+    def test_trade_pnl_values_managed_inventory_and_never_creates_synthetic_short(self):
+        rows = [("SELL", 65_000_000_000, 1_495, 97_000, 1)]
+        metrics = trade_pnl_from_rows(
+            rows, Decimal("66000"),
+            managed_base=Decimal("0.001499762327"),
+            managed_base_cost_quote=Decimal("95"),
+        )
+        self.assertEqual(Decimal("0.000004762327"), metrics["owned_base"])
+        self.assertGreaterEqual(metrics["owned_base"], 0)
+        expected = (
+            Decimal("0.001495") * Decimal("65000") - Decimal("0.097")
+            + Decimal("0.000004762327") * Decimal("66000") - Decimal("95")
+        )
+        self.assertEqual(expected, metrics["pnl_quote"])
+
     def test_flatten_restores_only_bot_inventory_delta(self):
         guard = Guard.__new__(Guard)
         guard.api = FakeApi()

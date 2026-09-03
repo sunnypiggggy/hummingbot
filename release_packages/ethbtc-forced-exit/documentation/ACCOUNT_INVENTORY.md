@@ -2,6 +2,8 @@
 
 Grid 与 DCA 共用同一个 Binance 现货账户，因此不能分别把账户余额当作自己的库存。
 生产环境使用共享 SQLite 账本和 `account_inventory_status.json` 合同统一核对 BTC、ETH。
+该合同中的顶层`healthy=false`可能只是存在正常活动订单；交易判断必须分别读取
+`sources_healthy`、逐资产`ownership_deficit`、机器人阶段和实际门控，不能只看顶层布尔值。
 
 ## 归属公式
 
@@ -25,6 +27,11 @@ BTC、ETH 分别使用事务型资产租约。Grid、DCA 或无归属清仓必�
 续租。心跳丢失会停止残余补单并强制重新核对账户；长时间 API 阻塞不能让第二个 Guard
 取得同一资产租约。
 
+同一资产的出售优先级固定为：风险退出关闭普通交易 → 等待现有executor/订单终止 →
+Guard取得机器人归属租约后补充清仓 → 最后才评估无归属库存。任一在途订单、待结算成交
+或有效租约存在时，另一通道不得并发出售。超时或重启必须先按确定性`clientOrderId`查询
+原订单；未知状态下禁止创建第二笔经济订单。
+
 ## DCA 完整性退出
 
 DCA 完整性熔断必须出售 `managed_base_target + net_base - 已确认退出量`，不能因为
@@ -32,8 +39,14 @@ DCA 完整性熔断必须出售 `managed_base_target + net_base - 已确认退�
 无活动订单或 executor、成交与余额复核完成且 `exit_completed_at` 已写入时，才能记录
 `action_complete=true`。
 
-本次迁移保留现有 DCA 归属库存并标记为 `pending_manual_existing_dca_inventory`；不会
-补做历史 DCA 清仓，也不会解除 `LATCHED`。
+`net_base`已经包含的紧急成交不得再次叠加到退出数量。`COOLDOWN/REENTRY`期间若重新发现
+达到交易所最小金额的DCA归属库存，状态必须退回`EXITING`继续处理；只有剩余风险为不可
+成交Dust时，才允许维持退出完成。
+
+Grid 当前归属唯一读取 Runtime schema 13 的 PairLedger `base`；DCA 当前归属读取经成交
+重放核验的 `dca-equity-ledger-v1.owned_base`。历史 `net_base` 只是成交增量，不得单独作为
+当前仓位或权益敞口。三方核对（策略账本、Binance余额、订单及待结算成交）超过一个数量
+步长时进入 `OWNERSHIP_UNRECONCILED`，禁止普通重入和自动清仓，不得借用其他机器人库存补差。
 
 ## 无归属库存
 
@@ -42,8 +55,12 @@ DCA 完整性熔断必须出售 `managed_base_target + net_base - 已确认退�
 部分进入新的确认周期，不会并入首次订单。低于动态 `MARKET_LOT_SIZE` 或
 `MIN_NOTIONAL/NOTIONAL` 的残余记录为 dust。
 
-状态合同为 `account-inventory-status-v2`，Telegram 生命周期事件包括发现、开始清仓、
+状态合同为 `account-inventory-status-v3`，Telegram 生命周期事件包括发现、开始清仓、
 完成、失败、归属缺口和恢复健康。库存清仓不会启动机器人、解除锁存或覆盖其他风控门。
+
+Dust数量在移动端报告中只显示报价币估值，不作为某个机器人独有的仓位。因为Grid与DCA
+共用同一Binance账户，同一资产的共享账户Dust可能同时出现在相关机器人报告中；其作用是
+解释账户级余额差，不改变任何机器人交易权限。
 
 `v2` 将活动挂单纳入顶层 `healthy` 计算。清仓作业只有在订单/成交、余额、活动挂单和
 请求数量四项复核全部通过后才能进入 `COMPLETED`。`liquidation_attempts` 保存主订单与

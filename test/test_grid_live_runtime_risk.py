@@ -1,5 +1,8 @@
 import sys
 import signal
+import json
+import sqlite3
+import tempfile
 import unittest
 from unittest.mock import patch
 from decimal import Decimal, ROUND_DOWN
@@ -63,8 +66,8 @@ class Connector:
 
 
 class GridLiveRuntimeRiskTest(unittest.TestCase):
-    def test_runtime_schema_migration_accepts_every_persisted_version_through_v12(self):
-        self.assertTrue(set(range(2, 13)).issubset(SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS))
+    def test_runtime_schema_migration_accepts_every_persisted_version_through_v13(self):
+        self.assertTrue(set(range(2, 14)).issubset(SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS))
 
     def strategy(self):
         strategy = LivePortfolioGrid.__new__(LivePortfolioGrid)
@@ -825,6 +828,136 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertTrue(submitted)
         self.assertEqual({"ETH-FDUSD"}, {pair for _, pair in submitted})
         self.assertEqual(ACTIVE, strategy.pair_recovery["ETH-FDUSD"]["phase"])
+
+    def test_synchronous_market_fill_before_order_registration_never_resubmits(self):
+        strategy = self.strategy()
+        pair = "ETH-FDUSD"
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.config.min_order_quote = Decimal("5")
+        strategy.ledgers[pair].base = Decimal("0")
+        strategy.ledgers[pair].base_cost_quote = Decimal("0")
+        strategy.pair_recovery[pair] = normalize_state({
+            **active_state(), "phase": REENTRY,
+            "mechanism": "v22_weekly_buy_gate", "scope": "technical",
+            "triggered_at": 900,
+        })
+        submitted = []
+
+        def synchronous_buy(*_args):
+            order_id = "sync-reentry"
+            submitted.append(order_id)
+            strategy.did_fill_order(SimpleNamespace(
+                trading_pair=pair, order_id=order_id,
+                exchange_trade_id="trade-sync", price=Decimal("2000"),
+                amount=Decimal("0.05"), order_type=OrderType.MARKET,
+                trade_type=TradeType.BUY,
+                trade_fee=DeductedFromReturnsTradeFee(percent=Decimal("0.001")),
+            ))
+            strategy.did_complete_buy_order(BuyOrderCompletedEvent(
+                1_000.0, order_id, "ETH", "FDUSD",
+                Decimal("0.05"), Decimal("100"), OrderType.MARKET,
+            ))
+            return order_id
+
+        strategy.buy = synchronous_buy
+        self.assertFalse(strategy._reenter_pair(pair, Decimal("2000")))
+        self.assertEqual(1, len(submitted))
+        self.assertEqual(
+            "TERMINAL_PENDING_RECONCILIATION",
+            strategy.reentry_intents[pair]["state"],
+        )
+        # No database evidence is available yet.  The intent must stay closed
+        # rather than treating an inactive order as permission to buy again.
+        self.assertFalse(strategy._reenter_pair(pair, Decimal("2000")))
+        self.assertEqual(1, len(submitted))
+        self.assertEqual(Decimal("0.04995"), strategy.ledgers[pair].base)
+
+    def test_market_submission_exception_is_unknown_and_never_blindly_retried(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        strategy.ledgers[pair].base = Decimal("0")
+        strategy.ledgers[pair].base_cost_quote = Decimal("0")
+        strategy.pair_recovery[pair] = normalize_state({
+            **active_state(), "phase": REENTRY,
+            "mechanism": "v22_weekly_buy_gate", "scope": "technical",
+            "triggered_at": 900,
+        })
+        submissions = []
+
+        def uncertain_buy(*_args):
+            submissions.append("attempt")
+            raise ConnectionError("response lost after submission boundary")
+
+        strategy.buy = uncertain_buy
+        with self.assertRaises(ConnectionError):
+            strategy._reenter_pair(pair, Decimal("80000"))
+        self.assertEqual("SUBMISSION_UNKNOWN", strategy.reentry_intents[pair]["state"])
+        self.assertFalse(strategy._reenter_pair(pair, Decimal("80000")))
+        self.assertEqual(["attempt"], submissions)
+
+    def test_persisted_completed_reentry_is_reconciled_once_before_completion(self):
+        strategy = self.strategy()
+        pair = "BTC-FDUSD"
+        price = Decimal("80000")
+        strategy.config.side_budget_quote = Decimal("100")
+        strategy.config.min_order_quote = Decimal("5")
+        strategy.ledgers[pair].base = Decimal("0")
+        strategy.ledgers[pair].base_cost_quote = Decimal("0")
+        strategy.pair_recovery[pair] = normalize_state({
+            **active_state(), "phase": REENTRY,
+            "mechanism": "v22_weekly_buy_gate", "scope": "technical",
+            "triggered_at": 900,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_path = Path(directory) / "live_grid_runtime_state.json"
+            strategy.config.runtime_state_file = str(runtime_path)
+            runtime_path.write_text(json.dumps({
+                "schema_version": 12,
+                "trading_pairs": strategy.config.trading_pairs,
+                "ledgers": {
+                    key: {"base": str(value.base), "quote": str(value.quote)}
+                    for key, value in strategy.ledgers.items()
+                },
+            }), encoding="utf-8")
+            database = Path(directory) / "grid.sqlite"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    'CREATE TABLE "Order" '
+                    '(id TEXT, last_status TEXT, exchange_order_id TEXT)'
+                )
+                connection.execute(
+                    "CREATE TABLE TradeFill "
+                    "(order_id TEXT, price INTEGER, amount INTEGER, "
+                    "trade_fee_in_quote INTEGER, trade_fee TEXT, "
+                    "exchange_trade_id TEXT, timestamp INTEGER)"
+                )
+            submitted = []
+            strategy.buy = lambda *_args: submitted.append("durable-reentry") or "durable-reentry"
+            self.assertFalse(strategy._reenter_pair(pair, price))
+            strategy._forget_order("durable-reentry")
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    'INSERT INTO "Order" VALUES(?,?,?)',
+                    ("durable-reentry", "COMPLETED", "exchange-order"),
+                )
+                connection.execute(
+                    "INSERT INTO TradeFill VALUES(?,?,?,?,?,?,?)",
+                    (
+                        "durable-reentry", 80_000_000_000, 1_250,
+                        100_000, json.dumps({"flat_fees": [
+                            {"token": "BTC", "amount": "0.00000125"}
+                        ]}), "exchange-trade", 1_000_000,
+                    ),
+                )
+            self.assertTrue(strategy._reenter_pair(pair, price))
+            self.assertEqual(["durable-reentry"], submitted)
+            self.assertEqual(Decimal("0.00124875"), strategy.ledgers[pair].base)
+            self.assertEqual(1, strategy.ledgers[pair].buys)
+            # A further cycle observes a completed, sufficiently funded
+            # inventory and cannot apply the same exchange trade twice.
+            self.assertTrue(strategy._reenter_pair(pair, price))
+            self.assertEqual(Decimal("0.00124875"), strategy.ledgers[pair].base)
+            self.assertEqual(1, strategy.ledgers[pair].buys)
 
     def test_shutdown_pair_cancellation_is_rate_limited_but_retried(self):
         strategy = self.strategy()

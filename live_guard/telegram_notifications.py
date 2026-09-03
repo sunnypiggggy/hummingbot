@@ -694,6 +694,13 @@ def format_event(event: Mapping[str, Any]) -> str:
             "INVENTORY_RECONCILIATION_RECOVERED": "库存归属恢复健康",
             "INVENTORY_LIQUIDATION_FEE_RECONCILED": "清仓手续费复核完成",
         }
+        ownership_scope = str(details.get("ownership_scope") or "")
+        if ownership_scope.startswith("grid:"):
+            names.update({
+                "INVENTORY_LIQUIDATION_STARTED": "Grid归属库存开始清仓",
+                "INVENTORY_LIQUIDATION_COMPLETED": "Grid归属库存清仓完成",
+                "INVENTORY_LIQUIDATION_FAILED": "Grid归属库存清仓失败",
+            })
         lines = [
             "🔐 统一库存风控事件",
             f"状态：{names.get(transition, transition)}",

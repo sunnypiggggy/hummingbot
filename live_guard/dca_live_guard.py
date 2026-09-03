@@ -221,7 +221,8 @@ class BinanceEmergencyClient:
             raise RuntimeError("Binance emergency key does not have trading permission")
         if self.spot_bnb_burn_enabled():
             raise RuntimeError(
-                "Binance Spot BNB fee deduction must be disabled (spotBNBBurn=true)"
+                "detected spotBNBBurn=true; Binance Spot BNB fee deduction must "
+                "be disabled (spotBNBBurn=false)"
             )
         # Binance's account-level canWithdraw flag does not expose the API
         # key's withdrawal permission, so it must not be used to reject an
@@ -817,9 +818,25 @@ class Guard:
         reservations = self._read_json(self.grid_reservations_path)
         grid_state = self._read_json(self.grid_inventory_state_path)
         managed = self._read_json(self.managed_inventory_path)
+        grid_database = self._database("grid-live-fdusd-400")
+        grid_runtime_path = (
+            grid_database.parent / "live_grid_runtime_state.json"
+            if grid_database is not None else None
+        )
+        grid_runtime = (
+            self._read_json(grid_runtime_path)
+            if grid_runtime_path is not None and grid_runtime_path.exists()
+            else {}
+        )
+        runtime_ledgers = grid_runtime.get("ledgers", {})
+        runtime_healthy = bool(
+            int(grid_runtime.get("schema_version", 0)) >= 12
+            and set(runtime_ledgers) == {"BTC-FDUSD", "ETH-FDUSD"}
+        )
         ownership = ownership_from_documents(
             reservations=reservations, grid_state=grid_state,
             managed_inventory=managed, dca_state=self.state,
+            grid_runtime=grid_runtime,
         )
         running = {}
         for name in ("grid-live-fdusd-400", *[spec.bot_name for spec in LIVE_PAIRS.values()]):
@@ -839,10 +856,17 @@ class Guard:
             (not running[name]) or (timestamps[index] > 0 and now - timestamps[index] < 30)
             for index, name in enumerate(running)
         )
+        sources_healthy = sources_healthy and runtime_healthy
         evidence = {
             "ownership": {
                 asset: {key: str(value) for key, value in owners.items()}
                 for asset, owners in ownership.items()
+            },
+            "grid_runtime": {
+                "healthy": runtime_healthy,
+                "schema_version": grid_runtime.get("schema_version"),
+                "updated_at": grid_runtime.get("updated_at"),
+                "sha256": canonical_sha256(grid_runtime) if grid_runtime else None,
             },
             "reservations_generated_at": reservations.get("generated_at"),
             "managed_source_sha256": managed.get("source_preflight_sha256"),
@@ -1592,7 +1616,11 @@ class Guard:
             return None
         price = self._price(pair)
         rows = self._rows(database, pair)
-        metrics = trade_pnl_from_rows(rows, price)
+        managed_base = self._managed_base_target(pair)
+        metrics = trade_pnl_from_rows(
+            rows, price, managed_base=managed_base,
+            managed_base_cost_quote=side_budget(),
+        )
         for adjustment in self.state.get("bots", {}).get(bot_name, {}).get(
             "emergency_adjustments", []
         ):
@@ -1602,10 +1630,21 @@ class Guard:
             )
             metrics["fees_quote"] += Decimal(str(adjustment.get("fee_quote", 0)))
             metrics["trades"] += Decimal("1")
+        metrics["owned_base"] = managed_base + metrics["net_base"]
         metrics["pnl_quote"] = (
             metrics["quote_cashflow"]
             - metrics["fees_quote"]
-            + metrics["net_base"] * price
+            + metrics["owned_base"] * price
+            - side_budget()
+        )
+        metrics["quote_balance"] = (
+            side_budget() + metrics["quote_cashflow"] - metrics["fees_quote"]
+        )
+        metrics["owned_inventory_mtm_quote"] = metrics["owned_base"] * price
+        metrics["equity"] = metrics["quote_balance"] + metrics["owned_inventory_mtm_quote"]
+        metrics["equity_source"] = "cash_plus_strategy_owned_inventory_mtm_v1"
+        metrics["reconciliation_status"] = (
+            "RECONCILED" if metrics["owned_base"] >= 0 else "EQUITY_UNRECONCILED"
         )
         observed_at = time.time()
         database_event_at = database.stat().st_mtime
@@ -3418,12 +3457,34 @@ class Guard:
                 continue
             snapshots[spec.bot_name] = snapshot
             raw_pnl = Decimal(snapshot["pnl_quote"])
+            if bot_state.get("equity_accounting_version") != "owned-inventory-mtm-v1":
+                bot_state["retired_pnl_offset_quote"] = str(
+                    bot_state.get("pnl_offset_quote", "0")
+                )
+                bot_state["pnl_offset_quote"] = "0"
+                bot_state["pnl_offset_pending"] = False
+                bot_state["equity_accounting_version"] = "owned-inventory-mtm-v1"
             if bot_state.pop("pnl_offset_pending", False):
                 bot_state["pnl_offset_quote"] = str(-raw_pnl)
             pnl = raw_pnl + Decimal(str(bot_state.get("pnl_offset_quote", "0")))
             snapshot["raw_pnl_quote"] = str(raw_pnl)
             snapshot["pnl_quote"] = str(pnl)
             equity = STRATEGY_BUDGET_QUOTE + pnl
+            bot_state["equity_ledger"] = {
+                "schema": "dca-equity-ledger-v1",
+                "capital_baseline_quote": str(STRATEGY_BUDGET_QUOTE),
+                "quote_balance": str(snapshot.get("quote_balance", "0")),
+                "owned_base": str(snapshot.get("owned_base", "0")),
+                "owned_inventory_mtm_quote": str(
+                    snapshot.get("owned_inventory_mtm_quote", "0")
+                ),
+                "equity": str(equity),
+                "fees_quote": str(snapshot.get("fees_quote", "0")),
+                "equity_source": snapshot.get("equity_source"),
+                "reconciliation_status": snapshot.get("reconciliation_status"),
+                "database_event_at": snapshot.get("database_event_at"),
+                "observed_at": snapshot.get("observed_at"),
+            }
             peak = max(
                 STRATEGY_BUDGET_QUOTE,
                 Decimal(str(bot_state.get("peak_equity", STRATEGY_BUDGET_QUOTE))),

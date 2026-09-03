@@ -194,8 +194,18 @@ def extract_balances(payload: Any, account_name: str = ACCOUNT_NAME,
     return balances
 
 
-def trade_pnl_from_rows(rows: Iterable[Sequence[Any]], mark_price: Decimal) -> Dict[str, Decimal]:
-    """Calculate bot-attributable PnL from raw SQLite TradeFill rows."""
+def trade_pnl_from_rows(
+    rows: Iterable[Sequence[Any]], mark_price: Decimal, *,
+    managed_base: Decimal = Decimal("0"),
+    managed_base_cost_quote: Decimal = Decimal("0"),
+) -> Dict[str, Decimal]:
+    """Calculate PnL using the currently owned base, never a synthetic short.
+
+    ``net_base`` is only the cumulative trade delta.  Live DCA starts with a
+    separately managed base inventory, so valuing the delta alone after a
+    liquidation makes the bot look short.  ``owned_base`` is the economic
+    position and is therefore the only quantity exposed to the live mark.
+    """
     quote_cashflow = Decimal("0")
     net_base = Decimal("0")
     fees = Decimal("0")
@@ -216,11 +226,15 @@ def trade_pnl_from_rows(rows: Iterable[Sequence[Any]], mark_price: Decimal) -> D
             continue
         fees += fee
         trades += 1
-    pnl = quote_cashflow - fees + net_base * mark_price
+    owned_base = managed_base + net_base
+    pnl = quote_cashflow - fees + owned_base * mark_price - managed_base_cost_quote
     return {
         "pnl_quote": pnl,
         "quote_cashflow": quote_cashflow,
         "net_base": net_base,
+        "owned_base": owned_base,
+        "managed_base": managed_base,
+        "managed_base_cost_quote": managed_base_cost_quote,
         "fees_quote": fees,
         "trades": Decimal(trades),
     }

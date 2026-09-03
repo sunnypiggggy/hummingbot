@@ -50,19 +50,25 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 def ownership_from_documents(
     *, reservations: Mapping[str, Any], grid_state: Mapping[str, Any],
     managed_inventory: Mapping[str, Any], dca_state: Mapping[str, Any],
+    grid_runtime: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Decimal]]:
     """Derive current strategy ownership without using account-wide balances."""
     result = {asset: {} for asset in ASSETS}
     grid_bot = next(iter(grid_state.get("bots", {}).values()), {})
     grid_pairs = grid_bot.get("latest", {}).get("pairs", {})
     grid_bases = reservations.get("reservations", {}).get("FDUSD", {}).get("base", {})
+    runtime_ledgers = (grid_runtime or {}).get("ledgers", {})
     for asset in ASSETS:
         pair = f"{asset}-FDUSD"
-        # Guard snapshots already fold emergency fills into net_base.
-        quantity = (
-            decimal(grid_bases.get(asset))
-            + decimal(grid_pairs.get(pair, {}).get("net_base"))
-        )
+        if pair in runtime_ledgers:
+            quantity = decimal(runtime_ledgers[pair].get("base"))
+        else:
+            # Compatibility for historical/offline fixtures. Production passes
+            # the persisted Runtime PairLedger and never derives ownership from
+            # cumulative Guard trade deltas.
+            quantity = decimal(grid_bases.get(asset)) + decimal(
+                grid_pairs.get(pair, {}).get("net_base")
+            )
         result[asset]["grid:grid-live-fdusd-400"] = max(quantity, ZERO)
 
     pair_docs = managed_inventory.get("pairs", {})
@@ -71,14 +77,19 @@ def ownership_from_documents(
         pair = f"{asset}-USDT"
         bot_name = f"dca-live-{asset.lower()}usdt-200"
         bot = dca_bots.get(bot_name, {})
-        target = bot.get("managed_base_target")
-        if target is None:
-            target = pair_docs.get(pair, {}).get("managed_base")
-        # Guard snapshots already fold emergency fills into net_base.
-        quantity = (
-            decimal(target)
-            + decimal(bot.get("latest", {}).get("net_base"))
-        )
+        equity_ledger = bot.get("equity_ledger", {})
+        if (
+            equity_ledger.get("schema") == "dca-equity-ledger-v1"
+            and equity_ledger.get("reconciliation_status") == "RECONCILED"
+        ):
+            quantity = decimal(equity_ledger.get("owned_base"))
+        else:
+            target = bot.get("managed_base_target")
+            if target is None:
+                target = pair_docs.get(pair, {}).get("managed_base")
+            # Compatibility until the first new Guard snapshot persists the
+            # explicit DCA equity/ownership ledger.
+            quantity = decimal(target) + decimal(bot.get("latest", {}).get("net_base"))
         result[asset][f"dca:{bot_name}"] = max(quantity, ZERO)
     return result
 
@@ -599,6 +610,12 @@ class UnifiedInventoryLedger:
                     "owned_total": str(owned),
                     "unattributed": str(unattributed),
                     "ownership_deficit": str(deficit),
+                    "reconciliation_status": (
+                        "SOURCES_UNHEALTHY" if not sources_healthy else
+                        "OWNERSHIP_UNRECONCILED" if deficit > 0 else
+                        "RECONCILED"
+                    ),
+                    "three_way_difference": str(total - owned - unattributed),
                     "stability_sha256": stability_sha256,
                     "episode_id": str(episode["episode_id"]) if episode is not None else "",
                     "inventory_phase": phase,
@@ -770,6 +787,14 @@ class UnifiedInventoryLedger:
                 "SELECT * FROM liquidation_jobs WHERE job_id=?", (job_id,)
             ).fetchone()
         return dict(row)
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        """Return an existing liquidation job without creating or changing it."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM liquidation_jobs WHERE job_id=?", (job_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def finish_job(
         self, job_id: str, *, status: str, exchange_order_id: str = "",

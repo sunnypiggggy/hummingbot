@@ -48,9 +48,9 @@ except ModuleNotFoundError:
     from live_guard.management_parameters import ManagementParameterPublisher
 
 try:
-    from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE
+    from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget
 except ModuleNotFoundError:  # Repository import; container copies it to /app.
-    from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE
+    from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget
 
 
 BINANCE_API = OFFICIAL_BINANCE_API
@@ -225,6 +225,8 @@ def calculate_pair_report(
     now: datetime,
     max_public_fills: int = MAX_PUBLIC_FILLS,
     emergency_adjustments: list[dict[str, Any]] | None = None,
+    managed_base: Decimal = Decimal("0"),
+    managed_base_cost_quote: Decimal = Decimal("0"),
 ) -> dict[str, Any]:
     now_ts = now.timestamp()
     window_start = now - timedelta(days=WINDOW_DAYS)
@@ -280,10 +282,26 @@ def calculate_pair_report(
     all_time_mtm = (
         all_metrics["cashflow_quote"]
         - all_metrics["fees_quote"]
-        + all_metrics["net_base"] * mark
+        + (managed_base + all_metrics["net_base"]) * mark
+        - managed_base_cost_quote
         if market_healthy and mark is not None
         else None
     )
+    owned_base = managed_base + all_metrics["net_base"]
+    reconciliation_status = (
+        "RECONCILED" if owned_base >= 0 else "EQUITY_UNRECONCILED"
+    )
+    if managed_base_cost_quote > 0 and owned_base < 0:
+        # A replay that consumes more than the explicitly managed inventory is
+        # not evidence of a short position on Spot. Preserve the audit fields
+        # but withhold equity until ownership is reconciled.
+        all_time_mtm = None
+    cash_balance = (
+        managed_base_cost_quote
+        + all_metrics["cashflow_quote"]
+        - all_metrics["fees_quote"]
+    )
+    inventory_mtm = owned_base * mark if mark is not None else None
     def period_mtm(hours: int) -> tuple[Decimal | None, dict[str, Decimal]]:
         start_ts = now_ts - hours * 3600
         earlier_rows = [row for row in ordered_rows if timestamp_seconds(row[4]) < start_ts]
@@ -301,9 +319,10 @@ def calculate_pair_report(
         if not market_healthy or mark is None or start_candle is None:
             return None, period
         start_mark = Decimal(start_candle["close"])
-        ending_position = earlier["net_base"] + period["net_base"]
+        starting_position = managed_base + earlier["net_base"]
+        ending_position = starting_position + period["net_base"]
         value = (period["cashflow_quote"] - period["fees_quote"]
-                 + ending_position * mark - earlier["net_base"] * start_mark)
+                 + ending_position * mark - starting_position * start_mark)
         return value, period
 
     four_hour_mtm, four_hour_metrics = period_mtm(4)
@@ -362,17 +381,27 @@ def calculate_pair_report(
         "market_data_age_seconds": market_age,
         "database_age_seconds": max(0.0, database_age_seconds),
         "position": {
-            "scope": "strategy_owned_inventory_delta",
+            "scope": "strategy_owned_inventory",
             "net_base": str(all_metrics["net_base"]),
+            "managed_base": str(managed_base),
+            "owned_base": str(managed_base + all_metrics["net_base"]),
+            "tradable_base": str(max(owned_base, Decimal("0"))),
+            "reconciliation_status": reconciliation_status,
             "market_value_quote": (
-                str(all_metrics["net_base"] * mark) if mark is not None else None
+                str((managed_base + all_metrics["net_base"]) * mark)
+                if mark is not None else None
             ),
         },
         "profit": {
-            "valuation": "cashflow + net_base * mark - recorded_fees",
+            "valuation": "cashflow + owned_base * mark - recorded_fees - managed_base_cost",
             "all_time_mtm_quote": (
                 str(all_time_mtm) if all_time_mtm is not None else None
             ),
+            "cash_balance_quote": str(cash_balance),
+            "owned_inventory_mtm_quote": (
+                str(inventory_mtm) if inventory_mtm is not None else None
+            ),
+            "equity_source": "cash_plus_strategy_owned_inventory_mtm_v1",
             "seven_day_mtm_quote": (
                 str(seven_day_mtm) if seven_day_mtm is not None else None
             ),
@@ -659,6 +688,10 @@ class DcaLiveReportCollector:
                 )
                 continue
             try:
+                bot_state = guard_state.get("bots", {}).get(spec.bot_name, {})
+                managed_base = Decimal(str(
+                    bot_state.get("managed_base_target", "0")
+                ))
                 bot = calculate_pair_report(
                     bot_name=spec.bot_name,
                     pair=pair,
@@ -671,6 +704,8 @@ class DcaLiveReportCollector:
                     emergency_adjustments=guard_state.get("bots", {})
                     .get(spec.bot_name, {})
                     .get("emergency_adjustments", []),
+                    managed_base=managed_base,
+                    managed_base_cost_quote=side_budget(),
                 )
                 bots.append(bot)
             except Exception as exc:
@@ -705,7 +740,7 @@ class DcaLiveReportCollector:
                 "start_at_epoch": window_start.timestamp(),
                 "end_at_epoch": now.timestamp(),
             },
-            "position_scope": "strategy_owned_inventory_delta",
+            "position_scope": "strategy_owned_inventory",
             "portfolio": {
                 "all_time_mtm_quote": (
                     str(sum(all_time_values, Decimal("0")))
@@ -1574,7 +1609,20 @@ class UnifiedTelegramReporting:
                                  "grid-live-guard snapshot", "v22 shared contract"],
                 "profit": {"all_time_mtm_quote": pnl}, "equity": equity,
                 "peak_equity": peak, "drawdown_pct": drawdown,
-                "owned_base": values.get("net_base"), "fees_quote": fees,
+                "owned_base": values.get("owned_base"),
+                "strategy_net_base_delta": values.get("net_base"),
+                "cash_balance_quote": values.get("quote_balance"),
+                "owned_inventory_mtm_quote": (
+                    float(values.get("owned_base", 0)) * float(values.get("mark", 0))
+                    if values.get("owned_base") is not None and values.get("mark") is not None
+                    else None
+                ),
+                "equity_source": values.get("equity_source"),
+                "reconciliation_status": (
+                    "RECONCILED" if values.get("owned_base") is not None else
+                    "EQUITY_UNRECONCILED"
+                ),
+                "fees_quote": values.get("fees_quote", fees),
                 "buys": buys, "sells": sells,
                 "phase": phase,
                 "active_runtime": {

@@ -66,11 +66,17 @@ Telegram 消息是审计和通知，不在交易决策链中；频道消息不�
 | v22 实时合同 | `ethbtc-forced-exit-live-contract-v1` | Grid Guard | Grid、DCA Guard | 模型信号、授权和强制退出语义 |
 | v22 授权回执 | `ethbtc-forced-exit-authorization-v1` | OCI 审批 CLI | v22 producer | 将候选、观察、预检与激活时间绑定 |
 | v22 observer 状态 | `ethbtc-forced-exit-observer-status-v1` | Grid/DCA observer | 健康检查、人工审计 | 证明两个消费者看到同一 release/事件 |
+| v22 runtime指针 | `ethbtc-forced-exit-runtime-pointer-v1` | release/cutover流程 | Grid producer、审计 | 原子绑定已提交generation与release |
 | 宏观主状态 | `schema_version=3` | Macro gateway/Hermes 流程 | Grid scheduler、DCA Guard | 宏观租约和 BUY/SELL 方向 |
 | Grid FOMC gate | `grid-fomc-gate-v1` | Grid scheduler | Grid 策略 | 把宏观租约转换为是否暂停新单 |
+| Grid参数合同 | `active_selection.json schema_version=2` | Grid scheduler | Grid、report | BTC/ETH逐对参数及参数哈希 |
+| Grid Runtime State | `schema_version=13` | Grid策略 | Grid重启、Guard、report | PairLedger、重入意图、恢复阶段、预计/实际订单及Maker延迟层 |
+| DCA聚合门状态 | `gate_aggregate` | DCA Guard | DCA controller、report | v22、FOMC、恢复状态及只告警资金观察 |
+| 统一库存状态 | `account-inventory-status-v2` | 归属协调逻辑 | 两个Guard、report | 实际余额、归属、Dust、缺口、任务与健康 |
 | 风控恢复状态 | `ACTIVE/EXITING/COOLDOWN/REENTRY/LATCHED` | Grid/DCA 风控执行层 | 同一策略重启后的状态恢复 | 退出、冷却、重入和人工锁存 |
 | Telegram 事件 | `ethbtc-telegram-event-v1` | Guard、策略、调度器、发布工具 | `dca-live-report` | 标准告警、报告和 Hermes 提示 |
 | Telegram outbox | SQLite 本地表结构 | `dca-live-report` | 同一服务的发送循环 | 幂等、重试、限速和 message ID 审计 |
+| 运行错误episode | `runtime_error` | Guard、策略日志监控、report | report、Telegram | 错误发生/恢复、去重和历史累计 |
 
 ## 4. v22 实时合同
 
@@ -201,10 +207,23 @@ ACTIVE → EXITING → COOLDOWN → REENTRY → ACTIVE
 
 冷却时间：技术门0、持仓保护30分钟、策略熔断6小时、组合熔断12小时；进入重入前还要求连续3个健康周期和其他所有门放行。`LATCHED` 不自动恢复。
 
-当前 Grid runtime 已迁移到 schema 8，持久化逐对与组合恢复状态。旧备份仍可能只有
+当前 Grid runtime 已迁移到 schema 13，除逐对与组合恢复状态外，还持久化逐对参数、
+订单构建预计/实际层数、Maker延迟层、盘口快照、重试和刷新generation。旧备份仍可能只有
 `ledger.halted` 和 `portfolio_tripped`；恢复旧备份时必须走兼容迁移，不能用旧文件
 覆盖当前状态。无论 schema 版本，`ledger.halted=true` 都是真实交易阻塞，不能仅因
 当前盈亏回到阈值内就假定已经解除。
+
+### 8.1 Grid订单状态语义
+
+- `HEALTHY`：预计订单已落地；实际BUY/SELL数量仍可能因预算、成本底线和过滤器而不对称。
+- `HEALTHY_DEFERRED`：已有合法订单，另有少数Maker层等待安全盘口。
+- `EXPECTED_EMPTY`：v22 Risk-Off、FOMC或恢复阶段明确要求0单，不触发自动重建。
+- `MAKER_WAIT`：当前没有安全Maker层或盘口暂不可用，按单层/拓扑恢复策略重试。
+- `RETRYING/RESTRICTED`：门控允许且理论上应挂单，但订单构建或落地持续失败；只限制该对。
+
+理论Grid层数不是实际订单数量合同。BUY会受额外库存额度和最低金额裁剪；SELL会受基础币
+预算、成本利润底线和同价层合并影响。完整计算见
+[GRID_PAIR_PARAMETER_CUTOVER.md](GRID_PAIR_PARAMETER_CUTOVER.md)。
 
 ## 9. Telegram 事件和发送合同
 
@@ -233,17 +252,20 @@ ACTIVE → EXITING → COOLDOWN → REENTRY → ACTIVE
 
 按以下优先级读取真实状态：
 
-1. **策略/执行器状态**：Grid `ledgers.<pair>.halted`、`portfolio_tripped`、活动订单和 `grid_states`；DCA controller 实际 BUY/SELL 开关、executor 和止损状态。
-2. **Guard 恢复状态**：`tripped`、`recovery.phase`、退出是否完成、剩余风险和冷却时间。
-3. **宏观门**：Grid `pause_new_orders`；DCA `desired_gates` 和 `bot_gate_state`。
-4. **技术合同**：先确认容器是 live 还是 observe；只有 live 且已授权的 v22 合同才有执行权。
-5. **健康和完整性**：合同年龄、哈希、事件一致性、行情/API/数据库状态。
-6. **Telegram 事件**：仅用于解释和审计，不能单独证明当前仍阻塞。测试消息更不能作为状态来源。
+1. **Binance经济事实**：实际活动订单、余额和成交；它决定账户当前真实暴露。
+2. **策略/执行器状态**：机器人SQLite订单生命周期；Grid `ledgers.<pair>.halted`、`portfolio_tripped`、活动订单和 `grid_states`；DCA controller 实际 BUY/SELL 开关、executor 和止损状态。
+3. **Guard 恢复状态**：`tripped`、`recovery.phase`、退出是否完成、剩余风险和冷却时间。
+4. **宏观门**：Grid `pause_new_orders`；DCA `desired_gates` 和 `bot_gate_state`。
+5. **技术合同**：先确认容器是 live 还是 observe；只有 live 且已授权的 v22 合同才有执行权。
+6. **健康和完整性**：合同年龄、哈希、事件一致性、行情/API/数据库和库存归属状态。
+7. **Telegram 事件**：仅用于解释和审计，不能单独证明当前仍阻塞。测试消息更不能作为状态来源。
 
 典型判读：
 
 - live 合同 `execution_authorized=false`：授权失效，必须 Fail-Closed；历史 observer 文件不参与当前权限计算；
 - `ledger.halted=true`：该 Grid 交易对真实停止，即使 v22、FOMC均放行；
+- `order_build_status=EXPECTED_EMPTY`：0单符合当前门控；不能当成零订单执行故障；
+- DCA `gate_aggregate.capital.mode=alert_only`：资金不足只告警，不改变普通BUY/SELL聚合结果；
 - `DCA tripped=false`、controller BUY/SELL=true、恢复阶段 ACTIVE：DCA 未被熔断；
 - FOMC无活动租约且合同新鲜：宏观门放行；
 - TEST_ONLY Telegram 事件：永远不改变上述任一状态。

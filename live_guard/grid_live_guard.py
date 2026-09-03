@@ -1127,30 +1127,48 @@ class Guard:
         if database is None:
             return None
         pnl, pairs = Decimal("0"), {}
-        reservations = self.manifest["reservations"][key]["base"]
         bot_state = self.state.get("bots", {}).get(portfolio.bot_name, {})
+        runtime_path = database.parent / "live_grid_runtime_state.json"
+        if not runtime_path.exists():
+            raise RuntimeError("Grid runtime ledger is unavailable")
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        if int(runtime.get("schema_version", 0)) < 12:
+            raise RuntimeError("Grid runtime ledger schema is unsupported")
+        runtime_ledgers = runtime.get("ledgers", {})
+        if set(runtime_ledgers) != set(portfolio.pairs):
+            raise RuntimeError("Grid runtime ledger pair set mismatch")
         for pair in portfolio.pairs:
             mark = self.price(pair)
-            fill_value, net_base = fill_pnl(
-                self.rows(database, pair), mark, base_asset=pair.split("-")[0],
-            )
-            adjustment_pnl = Decimal("0")
+            raw = runtime_ledgers[pair]
+            quote_balance = Decimal(str(raw["quote"]))
+            owned_base = Decimal(str(raw["base"]))
+            if not quote_balance.is_finite() or not owned_base.is_finite() or owned_base < 0:
+                raise RuntimeError(f"Grid runtime ledger ownership is invalid for {pair}")
+            initial_base = Decimal(str(raw["initial_base"]))
+            fees_quote = Decimal(str(raw.get("fees_quote", "0")))
             for adjustment in bot_state.get("emergency_adjustments", []):
                 if adjustment.get("pair") != pair:
                     continue
                 base_delta = Decimal(str(adjustment["base_delta"]))
                 quote_cashflow = Decimal(str(adjustment["quote_cashflow"]))
                 fee_quote = Decimal(str(adjustment.get("fee_quote", 0)))
-                net_base += base_delta
-                adjustment_pnl += quote_cashflow - fee_quote + base_delta * mark
-            fill_value += adjustment_pnl
-            base = pair.split("-")[0]
-            initial_base = Decimal(reservations[base])
-            start_price = Decimal(self.manifest["prices"][pair])
-            holding_pnl = initial_base * (mark - start_price)
-            pair_pnl = fill_value + holding_pnl
+                owned_base += base_delta
+                quote_balance += quote_cashflow - fee_quote
+                fees_quote += fee_quote
+            pair_equity = quote_balance + owned_base * mark
+            pair_pnl = pair_equity - budget_for_quote(key).pair_budget
             pnl += pair_pnl
-            pairs[pair] = {"pnl": str(pair_pnl), "net_base": str(net_base), "mark": str(mark)}
+            pairs[pair] = {
+                "pnl": str(pair_pnl),
+                "equity": str(pair_equity),
+                "quote_balance": str(quote_balance),
+                "owned_base": str(owned_base),
+                "net_base": str(owned_base - initial_base),
+                "fees_quote": str(fees_quote),
+                "mark": str(mark),
+                "equity_source": "grid_runtime_pair_ledger_v1",
+                "runtime_schema_version": int(runtime.get("schema_version", 0)),
+            }
         observed_at = time.time()
         return {
             "pnl": str(pnl),
@@ -1159,6 +1177,8 @@ class Guard:
             "updated_at": observed_at,
             "observed_at": observed_at,
             "database_event_at": database.stat().st_mtime,
+            "runtime_state": str(runtime_path),
+            "runtime_state_sha256": canonical_sha256(runtime),
         }
 
     @staticmethod

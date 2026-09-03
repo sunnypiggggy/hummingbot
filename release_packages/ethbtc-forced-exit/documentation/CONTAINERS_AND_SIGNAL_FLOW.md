@@ -2,7 +2,7 @@
 
 ## 1. 文档范围与事实口径
 
-本文记录 OCI 主机在 **2026-08-21** 的实际运行拓扑，区分以下四种关系：
+本文以 OCI 主机在 **2026-09-02** 的只读核查和当前 `master` 为基线，区分以下四种关系：
 
 1. **启动依赖**：容器能否启动及通过健康检查。
 2. **运行数据依赖**：交易或风控每个周期必须读取的合同、状态和数据库。
@@ -139,6 +139,23 @@ flowchart LR
     REP --> TG
 ```
 
+Grid内部还存在一条逐对订单形成链：
+
+```text
+active_selection参数 + mid/best bid/ask + Grid账本 + 交易所过滤器
+                              │
+                              ▼
+                 理论层 → 预算/库存裁剪 → 成本底线
+                              │
+                              ▼
+                  同价SELL层合并 → Maker安全检查
+                              │
+                              ▼
+                     Binance实际活动订单
+```
+
+因此参数合同中的理论9/9层不是活动订单数量；最终订单数必须回到Binance核验。
+
 美股 Paper Runtime 是旁路：
 
 ```mermaid
@@ -180,7 +197,20 @@ flowchart LR
 4. 当前自动参数优化开关关闭；Scheduler 只维护已批准固定合同，不会自主训练并替换
    Grid 参数。
 
-### 4.4 DCA 聚合门
+### 4.4 Grid订单构建
+
+1. Grid策略从`active_selection.json`读取BTC/ETH逐对参数，并从Runtime State恢复Grid中心、
+   策略账本和恢复阶段。
+2. BUY受现金、每侧预算、组合剩余资金及10 FDUSD额外库存额度共同限制；SELL受策略基础币、
+   启动库存上限和交易所可用余额共同限制。
+3. SELL价格不得低于普通止盈线和移动平均成本利润底线。多个逻辑层落到同一量化价格时，
+   合并为一张订单。
+4. 动态精度、最低金额和Maker盘口检查通过后才发送普通订单；穿价层只进入单层延迟队列。
+5. Runtime State记录预计/实际层数，Guard叠加门控后输出`effective_order_status`；Report只读展示。
+
+完整规则见 [GRID_PAIR_PARAMETER_CUTOVER.md](GRID_PAIR_PARAMETER_CUTOVER.md)。
+
+### 4.5 DCA 聚合门
 
 `dca-live-guard` 是 DCA controller gate 的唯一写入者。最终普通交易权限为：
 
@@ -197,7 +227,7 @@ AND recovery phase=ACTIVE
 资金预算门当前是告警/容量信息，不单独阻塞交易。强制退出、止损和紧急动作不受普通
 BUY 门阻止；在 `EXITING/COOLDOWN/REENTRY` 期间为避免竞态，聚合门可暂时关闭双侧。
 
-### 4.5 统一库存归属
+### 4.6 统一库存归属
 
 两个 Guard 共享账户级 SQLite 账本，按以下证据核对余额：
 

@@ -61,6 +61,59 @@ def test_ownership_combines_grid_and_dca_evidence_without_account_balance():
     assert value["ETH"]["dca:dca-live-ethusdt-200"] == Decimal("0.0505")
 
 
+def test_grid_runtime_ledger_is_the_authoritative_grid_owner():
+    value = ownership_from_documents(
+        reservations={"reservations": {"FDUSD": {"base": {
+            "BTC": "0.00156", "ETH": "0.052",
+        }}}},
+        grid_state={"bots": {"grid": {"latest": {"pairs": {
+            "BTC-FDUSD": {"net_base": "-0.0003"},
+            "ETH-FDUSD": {"net_base": "-0.01"},
+        }}}}},
+        grid_runtime={"schema_version": 13, "ledgers": {
+            "BTC-FDUSD": {"base": "0.00000590"},
+            "ETH-FDUSD": {"base": "0.00003020"},
+        }},
+        managed_inventory={"pairs": {}}, dca_state={"bots": {}},
+    )
+    assert value["BTC"]["grid:grid-live-fdusd-400"] == Decimal("0.00000590")
+    assert value["ETH"]["grid:grid-live-fdusd-400"] == Decimal("0.00003020")
+
+
+def test_dca_explicit_equity_ledger_is_the_authoritative_dca_owner():
+    value = ownership_from_documents(
+        reservations={"reservations": {"FDUSD": {"base": {}}}},
+        grid_state={"bots": {}},
+        grid_runtime={"ledgers": {
+            "BTC-FDUSD": {"base": "0"}, "ETH-FDUSD": {"base": "0"},
+        }},
+        managed_inventory={"pairs": {
+            "BTC-USDT": {"managed_base": "0.1"},
+            "ETH-USDT": {"managed_base": "1"},
+        }},
+        dca_state={"bots": {
+            "dca-live-btcusdt-200": {
+                "latest": {"net_base": "-0.09"},
+                "equity_ledger": {
+                    "schema": "dca-equity-ledger-v1",
+                    "reconciliation_status": "RECONCILED",
+                    "owned_base": "0.00000448",
+                },
+            },
+            "dca-live-ethusdt-200": {
+                "latest": {"net_base": "-0.9"},
+                "equity_ledger": {
+                    "schema": "dca-equity-ledger-v1",
+                    "reconciliation_status": "RECONCILED",
+                    "owned_base": "0.00000762",
+                },
+            },
+        }},
+    )
+    assert value["BTC"]["dca:dca-live-btcusdt-200"] == Decimal("0.00000448")
+    assert value["ETH"]["dca:dca-live-ethusdt-200"] == Decimal("0.00000762")
+
+
 def test_ownership_does_not_double_count_adjustments_already_in_latest_net_base():
     value = ownership_from_documents(
         reservations={"reservations": {"FDUSD": {"base": {

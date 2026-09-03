@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -70,7 +71,7 @@ try:
 except ModuleNotFoundError:
     from live_guard.telegram_notifications import append_event, build_event
 
-RUNTIME_STATE_SCHEMA_VERSION = 12
+RUNTIME_STATE_SCHEMA_VERSION = 13
 SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS = frozenset(range(2, RUNTIME_STATE_SCHEMA_VERSION + 1))
 ORDER_REBUILD_BACKOFF_SECONDS = (5, 15, 30, 60)
 UNEXPECTED_ORDER_GAP_SECONDS = 15
@@ -264,6 +265,10 @@ class LivePortfolioGrid(StrategyV2Base):
         self.pending_flatten: set[str] = set()
         self.flatten_order_ids: Dict[str, str] = {}
         self.reentry_order_ids: Dict[str, str] = {}
+        self.reentry_intents: Dict[str, Dict[str, Any]] = {}
+        self._reentry_submission_pair: Optional[str] = None
+        self._pending_reentry_fill_events: Dict[str, List[OrderFilledEvent]] = {}
+        self._pending_reentry_terminal_events: Dict[str, List[Any]] = {}
         self.pending_inventory_exit: set[str] = set()
         self.inventory_exit_order_ids: Dict[str, str] = {}
         self.excess_inventory_started_at: Dict[str, Optional[float]] = {
@@ -2234,26 +2239,253 @@ class LivePortfolioGrid(StrategyV2Base):
         return portfolio_blocked
 
     def _reenter_pair(self, pair: str, price: Decimal) -> bool:
+        if not hasattr(self, "reentry_intents"):
+            self.reentry_intents = {}
+        if not hasattr(self, "reentry_order_ids"):
+            self.reentry_order_ids = {}
+        if not hasattr(self, "_pending_reentry_fill_events"):
+            self._pending_reentry_fill_events = {}
+        if not hasattr(self, "_pending_reentry_terminal_events"):
+            self._pending_reentry_terminal_events = {}
+        if not hasattr(self, "_reentry_submission_pair"):
+            self._reentry_submission_pair = None
         ledger = self.ledgers[pair]
         # Rebuild the configured quote-sized base inventory at the current
         # market price. The actual fill becomes the new owned risk baseline;
         # cumulative realised PnL is deliberately not reset.
         target = self.config.side_budget_quote / price
         missing = max(target - ledger.base, Decimal("0"))
+        episode_id = self._reentry_episode_id(pair)
+        intent = self.reentry_intents.get(pair)
+        if intent and intent.get("episode_id") == episode_id:
+            outcome = self._reconcile_reentry_intent(pair, intent)
+            if outcome == "pending":
+                return False
+            if outcome == "complete":
+                missing = max(target - ledger.base, Decimal("0"))
+                if missing * price < self.config.min_order_quote:
+                    ledger.peak_equity = ledger.equity(price)
+                    return True
+            sequence = int(intent.get("sequence", 0)) + 1
+        else:
+            sequence = 1
         if missing * price < self.config.min_order_quote:
             ledger.peak_equity = ledger.equity(price)
             return True
-        order_id = self.reentry_order_ids.get(pair)
-        if order_id and order_id in self._owned_order_ids():
-            return False
-        order_id = self.buy(self.config.exchange, pair, missing, OrderType.MARKET)
+        intent = {
+            "episode_id": episode_id,
+            "sequence": sequence,
+            "pair": pair,
+            "state": "SUBMITTING",
+            "requested_amount": str(missing),
+            "submitted_at": float(self.current_timestamp),
+            "order_id": None,
+            "exchange_order_id": None,
+            "applied_trade_ids": [],
+            "applied_fill_fingerprints": [],
+            "applied_gross_amount": "0",
+            "applied_amount": "0",
+        }
+        self.reentry_intents[pair] = intent
+        # Persist the economic intent before submitting the market order.  If
+        # the process dies between submission and receipt of the client order
+        # id, the restored UNKNOWN intent remains fail-closed instead of
+        # blindly issuing a second market BUY.
+        self._persist_reentry_intent_checkpoint()
+        self._reentry_submission_pair = pair
+        try:
+            order_id = self.buy(self.config.exchange, pair, missing, OrderType.MARKET)
+        except Exception as exc:
+            # A synchronous exception does not prove that Binance rejected the
+            # economic order.  Without a client order id it cannot be queried,
+            # so remain fail-closed instead of risking a duplicate BUY.
+            intent["state"] = "SUBMISSION_UNKNOWN"
+            intent["submission_error"] = repr(exc)
+            intent["terminal_observed_at"] = float(self.current_timestamp)
+            self._persist_reentry_intent_checkpoint()
+            raise
+        finally:
+            self._reentry_submission_pair = None
+        if not order_id:
+            intent["state"] = "SUBMISSION_UNKNOWN"
+            intent["submission_error"] = "buy() returned an empty client order id"
+            self._persist_reentry_intent_checkpoint()
+            raise RuntimeError("market reentry did not return a client order id")
         ledger.open_order_ids.add(order_id)
         self.reentry_order_ids[pair] = order_id
+        intent["order_id"] = order_id
+        intent["state"] = "SUBMITTED"
+        self._persist_reentry_intent_checkpoint()
         self.buy_order_ids.add(order_id)
+        for buffered in self._pending_reentry_fill_events.pop(pair, []):
+            if str(buffered.order_id) == str(order_id):
+                self.did_fill_order(buffered)
+        for buffered in self._pending_reentry_terminal_events.pop(pair, []):
+            if str(buffered.order_id) == str(order_id):
+                self.did_complete_buy_order(buffered)
+        # Synchronous connector callbacks can arrive inside buy(), before the
+        # client order id is returned. Persist their ledger and intent effects
+        # immediately after binding; a crash must not lose an already-accounted
+        # fill while retaining its idempotency keys.
+        self._persist_reentry_intent_checkpoint()
         self._record_runtime_event(
             "risk_reentry_market_buy", pair=pair, amount=str(missing), target_quote=str(self.config.side_budget_quote),
         )
         return False
+
+    def _reentry_episode_id(self, pair: str) -> str:
+        pair_state = self.pair_recovery.get(pair, {})
+        portfolio_state = self.portfolio_recovery
+        state = pair_state if pair_state.get("phase") != ACTIVE else portfolio_state
+        return hashlib.sha256(json.dumps({
+            "pair": pair,
+            "triggered_at": state.get("triggered_at"),
+            "mechanism": state.get("mechanism"),
+            "scope": state.get("scope"),
+        }, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _runtime_database(self) -> Optional[Path]:
+        configured = str(getattr(self.config, "runtime_state_file", "") or "").strip()
+        if not configured:
+            return None
+        runtime_path = Path(configured)
+        if not runtime_path.parent.exists():
+            return None
+        candidates = sorted(
+            path for path in runtime_path.parent.glob("*.sqlite")
+            if ".before_" not in path.name and not path.name.endswith(".backup.sqlite")
+        )
+        if not candidates:
+            return None
+        # Hummingbot keeps one active strategy database beside the runtime
+        # state; historical safety copies may also have a .sqlite suffix.
+        # Prefer the exact current strategy name, otherwise require a single
+        # non-backup candidate rather than guessing.
+        expected = runtime_path.parent / "walk_forward_portfolio_grid_live_fdusd_400.sqlite"
+        if expected in candidates:
+            return expected
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _persist_reentry_intent_checkpoint(self) -> None:
+        configured = str(getattr(self.config, "runtime_state_file", "") or "").strip()
+        if not configured:
+            return
+        target = Path(configured)
+        if not target.exists():
+            # The regular end-of-cycle persistence creates the initial state.
+            # Reentry cannot safely be recovered without that baseline, so a
+            # live runtime always reaches this path with an existing file.
+            raise RuntimeError("runtime state must exist before market reentry")
+        state = json.loads(target.read_text(encoding="utf-8"))
+        if set(state.get("ledgers", {})) != set(self.config.trading_pairs):
+            raise RuntimeError("runtime ledger mismatch before market reentry")
+        state["schema_version"] = RUNTIME_STATE_SCHEMA_VERSION
+        state["reentry_intents"] = self.reentry_intents
+        state["reentry_order_ids"] = self.reentry_order_ids
+        state["buy_order_ids"] = sorted(self.buy_order_ids)
+        state["ledgers"] = {
+            pair: {
+                **{
+                    key: str(value) if isinstance(value, Decimal) else value
+                    for key, value in asdict(ledger).items()
+                    if key != "open_order_ids"
+                },
+                "open_order_ids": sorted(ledger.open_order_ids),
+            }
+            for pair, ledger in self.ledgers.items()
+        }
+        state["updated_at"] = float(self.current_timestamp)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent, delete=False,
+        ) as output:
+            json.dump(state, output, indent=2, ensure_ascii=True)
+            temporary = output.name
+        Path(temporary).replace(target)
+
+    def _reconcile_reentry_intent(self, pair: str, intent: Dict[str, Any]) -> str:
+        state = str(intent.get("state", "UNKNOWN")).upper()
+        if state in {
+            "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN",
+            "SUBMISSION_UNKNOWN", "TERMINAL_PENDING_RECONCILIATION",
+        }:
+            order_id = str(intent.get("order_id") or "")
+            if order_id and order_id in self._owned_order_ids():
+                return "pending"
+            database = self._runtime_database()
+            if not order_id or database is None:
+                intent["state"] = "UNKNOWN"
+                return "pending"
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
+            try:
+                rows = connection.execute(
+                    "SELECT price, amount, trade_fee_in_quote, trade_fee, "
+                    "exchange_trade_id FROM TradeFill WHERE order_id=? "
+                    "ORDER BY timestamp, rowid", (order_id,),
+                ).fetchall()
+                order = connection.execute(
+                    'SELECT last_status, exchange_order_id FROM "Order" WHERE id=?',
+                    (order_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            applied = set(str(value) for value in intent.get("applied_trade_ids", []))
+            applied_fingerprints = list(
+                str(value) for value in intent.get("applied_fill_fingerprints", [])
+            )
+            ledger = self.ledgers[pair]
+            for raw_price, raw_amount, raw_fee, raw_trade_fee, trade_id in rows:
+                trade_key = str(trade_id)
+                if trade_key in applied:
+                    continue
+                scale = Decimal("1000000")
+                fill_price = Decimal(raw_price) / scale
+                fill_amount = Decimal(raw_amount) / scale
+                fee_quote = Decimal(raw_fee or 0) / scale
+                fingerprint = f"{fill_price}:{fill_amount}"
+                if fingerprint in applied_fingerprints:
+                    applied_fingerprints.remove(fingerprint)
+                    applied.add(trade_key)
+                    continue
+                base_fee = Decimal("0")
+                try:
+                    fee_doc = json.loads(raw_trade_fee) if isinstance(raw_trade_fee, str) else raw_trade_fee
+                    for item in (fee_doc or {}).get("flat_fees", []):
+                        if str(item.get("token", "")).upper() == pair.split("-")[0]:
+                            base_fee += Decimal(str(item.get("amount", "0")))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+                base_fee_quote = min(fee_quote, base_fee * fill_price)
+                ledger.apply_fill("BUY", fill_price, fill_amount, max(fee_quote - base_fee_quote, Decimal("0")))
+                if base_fee > 0:
+                    ledger.base -= base_fee
+                    ledger.fees_quote += base_fee_quote
+                applied.add(trade_key)
+                intent["applied_amount"] = str(
+                    Decimal(str(intent.get("applied_amount", "0"))) + fill_amount - base_fee
+                )
+                intent["applied_gross_amount"] = str(
+                    Decimal(str(intent.get("applied_gross_amount", "0"))) + fill_amount
+                )
+            intent["applied_trade_ids"] = sorted(applied)
+            if order:
+                intent["exchange_order_id"] = order[1]
+                status = str(order[0]).upper()
+                if "COMPLETED" in status or "FILLED" in status:
+                    intent["state"] = "COMPLETED"
+                    intent["reconciled_at"] = float(self.current_timestamp)
+                    self._persist_reentry_intent_checkpoint()
+                    return "complete"
+                if "FAILED" in status or "CANCEL" in status or "EXPIRED" in status:
+                    intent["state"] = "PARTIAL_TERMINAL" if rows else "FAILED"
+                    self._persist_reentry_intent_checkpoint()
+                    return "complete" if rows else "failed"
+            intent["state"] = "PARTIALLY_FILLED" if rows else "UNKNOWN"
+            self._persist_reentry_intent_checkpoint()
+            return "pending"
+        if state in {"COMPLETED", "PARTIAL_TERMINAL"}:
+            return "complete"
+        return "failed"
 
     def cancel_owned_orders(
         self, exclude: set[str] | None = None, pairs: set[str] | None = None,
@@ -2502,7 +2734,13 @@ class LivePortfolioGrid(StrategyV2Base):
 
     def did_fill_order(self, event: OrderFilledEvent):
         ledger = self.ledgers.get(event.trading_pair)
-        if ledger is None or event.order_id not in ledger.open_order_ids:
+        if ledger is None:
+            return
+        if event.order_id not in ledger.open_order_ids:
+            if getattr(self, "_reentry_submission_pair", None) == event.trading_pair:
+                if not hasattr(self, "_pending_reentry_fill_events"):
+                    self._pending_reentry_fill_events = {}
+                self._pending_reentry_fill_events.setdefault(event.trading_pair, []).append(event)
             return
         try:
             fee = event.trade_fee.fee_amount_in_token(
@@ -2560,6 +2798,25 @@ class LivePortfolioGrid(StrategyV2Base):
             # assigning only the actually received inventory to this robot.
             ledger.base -= base_fee
             ledger.fees_quote += base_fee_quote
+        if getattr(self, "reentry_order_ids", {}).get(event.trading_pair) == event.order_id:
+            intent = getattr(self, "reentry_intents", {}).get(event.trading_pair, {})
+            trade_key = str(getattr(event, "exchange_trade_id", "") or (
+                f"event:{event.order_id}:{event.price}:{event.amount}"
+            ))
+            applied = set(str(value) for value in intent.get("applied_trade_ids", []))
+            applied.add(trade_key)
+            intent["applied_trade_ids"] = sorted(applied)
+            intent.setdefault("applied_fill_fingerprints", []).append(
+                f"{event.price}:{event.amount}"
+            )
+            intent["applied_gross_amount"] = str(
+                Decimal(str(intent.get("applied_gross_amount", "0"))) + event.amount
+            )
+            intent["applied_amount"] = str(
+                Decimal(str(intent.get("applied_amount", "0"))) + event.amount - base_fee
+            )
+            intent["state"] = "PARTIALLY_FILLED"
+            self._persist_reentry_intent_checkpoint()
         flatten_pair = next(
             (pair for pair, order_id in self.flatten_order_ids.items() if order_id == event.order_id),
             None,
@@ -2587,12 +2844,15 @@ class LivePortfolioGrid(StrategyV2Base):
         self.notify(f"{event.trade_type.name} {event.amount:.8f} {event.trading_pair} at {event.price:.8f}")
 
     def did_cancel_order(self, event: OrderCancelledEvent):
+        self._mark_reentry_terminal(event.order_id, "CANCELLED")
         self._forget_order(event.order_id)
 
     def did_expire_order(self, event: OrderExpiredEvent):
+        self._mark_reentry_terminal(event.order_id, "EXPIRED")
         self._forget_order(event.order_id)
 
     def did_fail_order(self, event: MarketOrderFailureEvent):
+        self._mark_reentry_terminal(event.order_id, "FAILED")
         # Failure events do not expose a trading_pair. Resolve ownership and
         # capture the process-local intent before forgetting the order.
         ordinary = self._is_ordinary_grid_order(event.order_id)
@@ -2667,6 +2927,19 @@ class LivePortfolioGrid(StrategyV2Base):
                 self._request_pair_order_refresh(pair, reason=reason)
         self._forget_order(event.order_id)
 
+    def _mark_reentry_terminal(self, order_id: str, state: str) -> None:
+        for pair, intent in getattr(self, "reentry_intents", {}).items():
+            if str(intent.get("order_id") or "") != str(order_id):
+                continue
+            intent["state"] = (
+                "PARTIAL_TERMINAL"
+                if Decimal(str(intent.get("applied_amount", "0"))) > 0
+                else state
+            )
+            intent["reconciled_at"] = float(self.current_timestamp)
+            self._persist_reentry_intent_checkpoint()
+            return
+
     def _owned_order_pair(self, order_id: str) -> str | None:
         pairs = [
             pair for pair, ledger in self.ledgers.items()
@@ -2675,8 +2948,29 @@ class LivePortfolioGrid(StrategyV2Base):
         return pairs[0] if len(pairs) == 1 else None
 
     def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
+        pair = self._completed_order_pair(event)
+        submission_pair = getattr(self, "_reentry_submission_pair", None)
+        if submission_pair is not None and (
+            pair is None or (
+                pair == submission_pair
+                and str(event.order_id) not in getattr(self, "reentry_order_ids", {}).values()
+            )
+        ):
+            pair = submission_pair
+            if not hasattr(self, "_pending_reentry_terminal_events"):
+                self._pending_reentry_terminal_events = {}
+            self._pending_reentry_terminal_events.setdefault(pair, []).append(event)
+            return
+        if pair is not None and getattr(self, "reentry_order_ids", {}).get(pair) == event.order_id:
+            intent = getattr(self, "reentry_intents", {}).get(pair)
+            if intent is not None:
+                # Completion callbacks are transport observations, not final
+                # accounting evidence.  Keep the intent closed to resubmission
+                # until TradeFill + Order persistence has been reconciled.
+                intent["state"] = "TERMINAL_PENDING_RECONCILIATION"
+                intent["terminal_observed_at"] = float(self.current_timestamp)
+                self._persist_reentry_intent_checkpoint()
         if self._is_ordinary_grid_order(event.order_id):
-            pair = self._completed_order_pair(event)
             if pair is not None:
                 self._request_pair_order_refresh(
                     pair, reason="expected_fill_refresh",
@@ -2811,6 +3105,11 @@ class LivePortfolioGrid(StrategyV2Base):
                 for pair, order_id in state.get("reentry_order_ids", {}).items()
                 if pair in restored
             }
+            self.reentry_intents = {
+                pair: dict(intent)
+                for pair, intent in state.get("reentry_intents", {}).items()
+                if pair in restored and isinstance(intent, Mapping)
+            }
             self.pending_inventory_exit = {
                 pair for pair in state.get("pending_inventory_exit", []) if pair in restored
             }
@@ -2933,6 +3232,7 @@ class LivePortfolioGrid(StrategyV2Base):
             "pending_flatten": sorted(self.pending_flatten),
             "flatten_order_ids": self.flatten_order_ids,
             "reentry_order_ids": self.reentry_order_ids,
+            "reentry_intents": self.reentry_intents,
             "pending_inventory_exit": sorted(self.pending_inventory_exit),
             "inventory_exit_order_ids": self.inventory_exit_order_ids,
             "excess_inventory_started_at": self.excess_inventory_started_at,

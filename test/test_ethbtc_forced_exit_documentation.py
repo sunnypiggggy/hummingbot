@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -25,6 +26,7 @@ def test_release_family_contains_complete_utf8_mechanism_documentation() -> None
         "CONTAINERS_AND_SIGNAL_FLOW.md",
         "CONTRACTS_AND_RUNTIME_FLOW.md",
         "TELEGRAM_NOTIFICATIONS.md",
+        "TELEGRAM_MODEL_PARAMETERS.md",
         "ACCOUNT_INVENTORY.md",
         "GRID_PAIR_PARAMETER_CUTOVER.md",
         "NO_BNB_FEE_POLICY.md",
@@ -44,6 +46,22 @@ def test_release_family_contains_complete_utf8_mechanism_documentation() -> None
     assert "# 机制事件数" not in content
 
 
+def test_every_markdown_internal_link_resolves() -> None:
+    link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+\.md)(?:#[^)]+)?\)")
+    missing: list[str] = []
+    for source in DOCUMENTATION.glob("*.md"):
+        if source.name == "train_xgboost_codex_historty.md":
+            # Immutable conversation history contains workspace-root links, not
+            # documentation-relative links. Maintained mechanism docs are checked below.
+            continue
+        content = source.read_text(encoding="utf-8")
+        for target in link_pattern.findall(content):
+            resolved = (source.parent / target).resolve()
+            if not resolved.is_file():
+                missing.append(f"{source.name} -> {target}")
+    assert missing == []
+
+
 def test_contract_document_covers_runtime_schemas_and_observation_boundary() -> None:
     content = (DOCUMENTATION / "CONTRACTS_AND_RUNTIME_FLOW.md").read_text(
         encoding="utf-8"
@@ -59,6 +77,9 @@ def test_contract_document_covers_runtime_schemas_and_observation_boundary() -> 
     assert "execution_authorized=false" in content
     assert "ledger.halted=true" in content
     assert "TEST_ONLY" in content
+    assert "schema_version=13" in content
+    assert "EXPECTED_EMPTY" in content
+    assert "gate_aggregate.capital.mode=alert_only" in content
 
 
 def test_container_flow_document_describes_current_live_execution() -> None:
@@ -84,10 +105,74 @@ def test_container_flow_document_describes_current_live_execution() -> None:
 
 def test_online_model_document_binds_current_release_and_retired_fallbacks() -> None:
     content = (DOCUMENTATION / "ONLINE_MODELS.md").read_text(encoding="utf-8")
-    assert "73f59befa431946889a8d5885d04a05adb43c8e81eeab604f1aa89e31f0e9d60" in content
+    assert "bc3ef0d97bad6fbfaa6e24db1d695defd69ffffaf514a800f280e166bf7e017c" in content
     assert "xgboost-grid-long-risk-gate-v22-weekly-250d" in content
+    assert "fold 41" in content
+    assert "medium_sideways" in content
+    assert "long_volatility" in content
     assert "v21 producer 已关闭" in content
     assert "禁止" in content and "SQZMOM" in content
+
+
+def test_mechanism_authority_covers_all_execution_interlocks() -> None:
+    content = (DOCUMENTATION / "RISK_MECHANISMS.md").read_text(encoding="utf-8")
+    for value in (
+        "infrastructure_integrity_breaker",
+        "EXITING/COOLDOWN/REENTRY/LATCHED",
+        "统一库存归属",
+        "DCA资金观察",
+        "Controller/订单落地",
+        "Grid订单构建与Maker保护",
+        "禁止BNB抵扣",
+        "通知与审计",
+        "EXPECTED_EMPTY",
+    ):
+        assert value in content
+    assert "只告警，不参与普通BUY/SELL聚合" in content
+    assert "mode = alert_only" in content
+    assert "enforced = false" in content
+    assert "GRID_RISK_<MECHANISM>_ENABLED" in content
+    assert "DCA_RISK_<MECHANISM>_ENABLED" in content
+
+
+def test_grid_document_distinguishes_theoretical_and_actual_orders() -> None:
+    content = (DOCUMENTATION / "GRID_PAIR_PARAMETER_CUTOVER.md").read_text(
+        encoding="utf-8"
+    )
+    for value in (
+        "schema 13",
+        "18格只定义候选价格拓扑",
+        "同一执行价格",
+        "0张BUY",
+        "额外库存额度",
+        "EXPECTED_EMPTY",
+        "2026-09-02",
+    ):
+        assert value in content
+
+
+def test_current_docs_do_not_describe_old_grid_runtime_as_current() -> None:
+    current_docs = (
+        "CONTRACTS_AND_RUNTIME_FLOW.md",
+        "GRID_PAIR_PARAMETER_CUTOVER.md",
+        "ONLINE_MODELS.md",
+        "RISK_MECHANISMS.md",
+    )
+    content = "\n".join(
+        (DOCUMENTATION / name).read_text(encoding="utf-8") for name in current_docs
+    )
+    assert "当前 Grid runtime 已迁移到 schema 8" not in content
+    assert "当前 Runtime State 为 schema v9" not in content
+    assert "当前签名周 | fold 37" not in content
+
+
+def test_dca_capital_observation_is_documented_as_non_blocking() -> None:
+    for name in ("RISK_MECHANISMS.md", "RESILIENCE_POLICY.md", "ONLINE_MODELS.md"):
+        content = (DOCUMENTATION / name).read_text(encoding="utf-8")
+        assert "alert_only" in content
+        assert "enforced=false" in content or "enforced = false" in content
+    resilience = (DOCUMENTATION / "RESILIENCE_POLICY.md").read_text(encoding="utf-8")
+    assert "不会关闭 BUY/SELL" in resilience
 
 
 def test_stager_binds_and_copies_documentation() -> None:

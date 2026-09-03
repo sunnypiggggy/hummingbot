@@ -70,6 +70,26 @@ USDT 交易对，因此该扫描不得扩大到账户其他交易对。
 余额不足、重复撤单或退出阶段重新建单。若优雅撤单失败，保持 Grid 停止并由
 `grid-live-guard` 独立 Binance 通道只撤销上述两个 Grid 专属交易对，确认归零后才可重启。
 
+## 订单数量核对
+
+订单数量必须按四层证据核对，不能只读取Telegram或单个Runtime字段：
+
+1. Binance `openOrders` 是当前活动订单、锁定数量和经济暴露的最终事实。
+2. Hummingbot实例SQLite的`Order.last_status`用于确认本地订单生命周期和exchange order ID。
+3. Grid Runtime schema 13的`order_build_status`解释预计/实际BUY、SELL层数、构建原因、
+   Maker延迟层和刷新generation。
+4. Grid Guard的`effective_order_status`叠加v22、FOMC和恢复阶段，区分正常交易、
+   `EXPECTED_EMPTY`和真实订单缺失。
+
+理论18格不保证9 BUY＋9 SELL。实际数量会受逐对门控、100 FDUSD每侧预算、10 FDUSD
+最低金额、额外库存10 FDUSD上限、基础币可用余额、成本利润底线、同价SELL层合并和
+Maker盘口保护影响。详细公式以 [GRID_PAIR_PARAMETER_CUTOVER.md](GRID_PAIR_PARAMETER_CUTOVER.md)
+为准。
+
+核验结论必须同时说明“当前数量”和“为什么是该数量”。例如v22 Risk-Off下0单是
+`EXPECTED_EMPTY`；Risk-On但额外库存接近上限时0张BUY也可能正确；只有门控允许且预算
+足够、理论上应挂单但Binance实际为0时，才进入零订单自恢复。
+
 ## Plotly 审计
 
 Grid/DCA、BTC/ETH 分页展示各自权益，不使用组合权益冒充单对权益。七类机制各有独立阴影、标记、图例和复选框；v22 另有 BTC/ETH 子开关。隐藏机制图层不得隐藏价格、权益、峰值、回撤、概率或阈值。无可信事件显示“无数据”，不推测区间；HTML必须自包含UTF-8且不显示“机制事件数”或原始JSON大块区域。

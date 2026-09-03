@@ -144,19 +144,22 @@ class DcaLiveReportCalculationTests(unittest.TestCase):
             item["side"] for item in report["trades"]["fills_7d"]
         })
 
-    def test_negative_inventory_delta_is_preserved_and_not_account_inventory(self):
+    def test_negative_trade_delta_is_not_reported_as_a_synthetic_short(self):
         report = calculate_pair_report(
             bot_name="dca-live-ethusdt-200",
             pair="ETH-USDT",
             rows=[row("SELL", 120, 1, 0, NOW - timedelta(hours=1))],
             candles=candles(),
-            database_age_seconds=1,
+            database_age_seconds=1, managed_base=Decimal("1"),
+            managed_base_cost_quote=Decimal("100"),
             now=NOW,
         )
         self.assertEqual(
-            "strategy_owned_inventory_delta", report["position"]["scope"]
+            "strategy_owned_inventory", report["position"]["scope"]
         )
         self.assertEqual("-1", report["position"]["net_base"])
+        self.assertEqual("0", report["position"]["owned_base"])
+        self.assertEqual("20", report["profit"]["all_time_mtm_quote"])
 
     def test_stale_market_data_makes_profit_unavailable(self):
         stale = candles()
