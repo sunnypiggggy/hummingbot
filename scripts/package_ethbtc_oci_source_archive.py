@@ -19,6 +19,7 @@ SOURCE_PATHS = (
     "Dockerfile.dca-live-guard",
     "Dockerfile.grid-live-guard",
     "Dockerfile.dca-live-runtime",
+    "Dockerfile.portfolio-grid-runtime",
     "Dockerfile.grid-live-fdusd-scheduler",
     "docker-compose.yml",
     "telegram-notify.env",
@@ -32,6 +33,7 @@ SOURCE_PATHS = (
     "controllers/market_making",
     "conf/controllers",
     "hummingbot/strategy_v2/executors/dca_executor",
+    "hummingbot/connector/exchange/binance/binance_exchange.py",
     "release_packages/ethbtc-forced-exit",
 )
 EXCLUDED_NAMES = {

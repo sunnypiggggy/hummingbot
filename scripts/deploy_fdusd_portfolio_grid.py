@@ -62,7 +62,9 @@ def main() -> None:
         f"{api_url}/bot-orchestration/deploy-v2-script",
         auth=(os.environ["USERNAME"], os.environ["PASSWORD"]), timeout=60,
         json={"instance_name": "walk-forward-portfolio-grid-fdusd", "credentials_profile": PROFILE,
-              "image": "hummingbot/hummingbot:latest", "script": "walk_forward_portfolio_grid",
+              "image": os.getenv(
+                  "PORTFOLIO_RUNTIME_IMAGE", "hummingbot/portfolio-grid-runtime:local"
+              ), "script": "walk_forward_portfolio_grid",
               "script_config": CONFIG_NAME, "headless": True},
     )
     response.raise_for_status()

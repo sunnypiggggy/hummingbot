@@ -74,7 +74,9 @@ class ApiClient:
         return self.request("POST", "/bot-orchestration/deploy-v2-script?use_timestamp=false", {
             "instance_name": PORTFOLIOS["FDUSD"].bot_name,
             "credentials_profile": profile,
-            "image": "hummingbot/hummingbot:latest",
+            "image": os.getenv(
+                "GRID_LIVE_RUNTIME_IMAGE", "hummingbot/portfolio-grid-runtime:local"
+            ),
             "script": "walk_forward_portfolio_grid_live",
             "script_config": config_name,
             "headless": True,

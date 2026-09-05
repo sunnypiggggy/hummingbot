@@ -336,10 +336,37 @@ class GridLiveSafetyTest(unittest.TestCase):
         client.request = lambda method, path, payload: calls.append(
             (method, path, payload)
         ) or {"unique_instance_name": portfolio.bot_name}
-        client.deploy(portfolio.profile_name, portfolio.config_name)
+        with patch.dict("os.environ", {}, clear=True):
+            client.deploy(portfolio.profile_name, portfolio.config_name)
         self.assertEqual(
             "/bot-orchestration/deploy-v2-script?use_timestamp=false",
             calls[0][1],
+        )
+        self.assertEqual(
+            "hummingbot/portfolio-grid-runtime:local",
+            calls[0][2]["image"],
+        )
+
+    def test_live_runtime_images_bundle_binance_new_listing_fix(self):
+        root = SCRIPTS.parent
+        connector_copy = (
+            "COPY hummingbot/connector/exchange/binance/binance_exchange.py "
+            "/home/hummingbot/hummingbot/connector/exchange/binance/binance_exchange.py"
+        )
+        for dockerfile_name in (
+            "Dockerfile.dca-live-runtime",
+            "Dockerfile.portfolio-grid-runtime",
+        ):
+            source = (root / dockerfile_name).read_text(encoding="utf-8")
+            self.assertIn(connector_copy, source)
+
+        compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "PORTFOLIO_RUNTIME_IMAGE: hummingbot/hummingbot:latest", compose
+        )
+        self.assertIn(
+            "PORTFOLIO_RUNTIME_IMAGE: hummingbot/portfolio-grid-runtime:local",
+            compose,
         )
 
     def test_runtime_authority_is_validated_instance_config(self):

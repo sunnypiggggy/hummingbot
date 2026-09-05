@@ -124,7 +124,7 @@ services:
       BOTS_PATH: /workspace/bots
       SCHEDULER_STATE_PATH: /workspace/state
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
-      PORTFOLIO_RUNTIME_IMAGE: hummingbot/hummingbot:latest
+      PORTFOLIO_RUNTIME_IMAGE: hummingbot/portfolio-grid-runtime:local
       PORTFOLIO_INSTANCE_NAME: walk-forward-portfolio-grid
       PORTFOLIO_INITIAL_QUOTE: "10000"
       PORTFOLIO_OPTIMIZATION_WORKERS: "4"
@@ -152,7 +152,7 @@ services:
       BOTS_PATH: /workspace/bots
       SCHEDULER_STATE_PATH: /workspace/state
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
-      PORTFOLIO_RUNTIME_IMAGE: hummingbot/hummingbot:latest
+      PORTFOLIO_RUNTIME_IMAGE: hummingbot/portfolio-grid-runtime:local
       PORTFOLIO_INSTANCE_NAME: walk-forward-portfolio-grid-fdusd
       PORTFOLIO_CREDENTIALS_PROFILE: fdusd_paper
       PORTFOLIO_CONFIG_NAME: walk_forward_portfolio_grid_fdusd.yml

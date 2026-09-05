@@ -254,7 +254,14 @@ class BinanceExchange(ExchangePyBase):
         retval = []
         for rule in filter(binance_utils.is_exchange_information_valid, trading_pair_rules):
             try:
-                trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule.get("symbol"))
+                # Build the Hummingbot pair from the same exchangeInfo snapshot that
+                # contains the rule. The global symbol map is refreshed only after
+                # this method returns, so consulting it here makes a newly listed
+                # Binance symbol fail its first rules refresh with a KeyError.
+                trading_pair = combine_to_hb_trading_pair(
+                    base=rule["baseAsset"],
+                    quote=rule["quoteAsset"],
+                )
                 filters = rule.get("filters")
                 price_filter = [f for f in filters if f.get("filterType") == "PRICE_FILTER"][0]
                 lot_size_filter = [f for f in filters if f.get("filterType") == "LOT_SIZE"][0]

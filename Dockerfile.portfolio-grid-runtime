@@ -1,4 +1,5 @@
 FROM hummingbot/hummingbot:latest
+COPY hummingbot/connector/exchange/binance/binance_exchange.py /home/hummingbot/hummingbot/connector/exchange/binance/binance_exchange.py
 COPY docker/portfolio-grid-entrypoint.sh /usr/local/bin/portfolio-grid-entrypoint.sh
 RUN chmod +x /usr/local/bin/portfolio-grid-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/portfolio-grid-entrypoint.sh"]

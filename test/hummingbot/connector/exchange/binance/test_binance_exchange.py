@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import re
 from decimal import Decimal
@@ -1161,6 +1162,8 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     def test_format_trading_rules__min_notional_present(self):
         trading_rules = [{
             "symbol": "COINALPHAHBOT",
+            "baseAsset": "COINALPHA",
+            "quoteAsset": "HBOT",
             "baseAssetPrecision": 8,
             "status": "TRADING",
             "quotePrecision": 8,
@@ -1194,6 +1197,8 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     def test_format_trading_rules__notional_but_no_min_notional_present(self):
         trading_rules = [{
             "symbol": "COINALPHAHBOT",
+            "baseAsset": "COINALPHA",
+            "quoteAsset": "HBOT",
             "baseAssetPrecision": 8,
             "status": "TRADING",
             "quotePrecision": 8,
@@ -1227,6 +1232,65 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         result = self.async_run_with_timeout(self.exchange._format_trading_rules(exchange_info))
 
         self.assertEqual(result[0].min_notional_size, Decimal("10"))
+
+    def test_format_trading_rules_uses_current_snapshot_for_new_symbols(self):
+        old_exchange_info = copy.deepcopy(self.trading_rules_request_mock_response)
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(old_exchange_info)
+
+        new_symbols = []
+        expected_pairs = set()
+        for quote_asset in ("TRY", "USDT", "USDC"):
+            rule = copy.deepcopy(old_exchange_info["symbols"][0])
+            rule.update({
+                "symbol": f"MARSCOIN{quote_asset}",
+                "baseAsset": "MARSCOIN",
+                "quoteAsset": quote_asset,
+            })
+            new_symbols.append(rule)
+            expected_pairs.add(f"MARSCOIN-{quote_asset}")
+
+        with self.assertRaises(KeyError):
+            self.async_run_with_timeout(
+                self.exchange.trading_pair_associated_to_exchange_symbol("MARSCOINUSDT")
+            )
+
+        result = self.async_run_with_timeout(
+            self.exchange._format_trading_rules({"symbols": new_symbols})
+        )
+
+        self.assertEqual(expected_pairs, {rule.trading_pair for rule in result})
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info({"symbols": new_symbols})
+        mapped_pair = self.async_run_with_timeout(
+            self.exchange.trading_pair_associated_to_exchange_symbol("MARSCOINUSDT")
+        )
+        self.assertEqual("MARSCOIN-USDT", mapped_pair)
+
+    def test_repeated_new_symbol_refreshes_keep_existing_rules(self):
+        listings = (
+            ("PUMPUUSDT", "PUMPU", "USDT"),
+            ("DJTBUSDT", "DJTB", "USDT"),
+            ("STXBUSDT", "STXB", "USDT"),
+            ("MARSCOINUSDT", "MARSCOIN", "USDT"),
+        )
+        snapshot = copy.deepcopy(self.trading_rules_request_mock_response)
+        expected_pairs = {self.trading_pair}
+
+        for symbol, base_asset, quote_asset in listings:
+            rule = copy.deepcopy(snapshot["symbols"][0])
+            rule.update({
+                "symbol": symbol,
+                "baseAsset": base_asset,
+                "quoteAsset": quote_asset,
+            })
+            snapshot["symbols"].append(rule)
+            expected_pairs.add(f"{base_asset}-{quote_asset}")
+
+            parsed = self.async_run_with_timeout(self.exchange._format_trading_rules(snapshot))
+            self.assertEqual(expected_pairs, {item.trading_pair for item in parsed})
+            self.exchange._initialize_trading_pair_symbols_from_exchange_info(snapshot)
+
+        repeated = self.async_run_with_timeout(self.exchange._format_trading_rules(snapshot))
+        self.assertEqual(expected_pairs, {item.trading_pair for item in repeated})
 
     def _validate_auth_credentials_taking_parameters_from_argument(self,
                                                                    request_call_tuple: RequestCall,
