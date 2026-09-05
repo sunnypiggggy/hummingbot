@@ -4,6 +4,7 @@ import json
 from typing import Any, Optional
 
 import requests
+from management_bot.risk_display import RichText
 
 
 class TelegramError(RuntimeError):
@@ -63,6 +64,7 @@ class TelegramAPI:
         return self._call("sendMessage", {
             "chat_id": str(chat_id),
             "text": text[:4096],
+            **({"parse_mode": "HTML"} if isinstance(text, RichText) else {}),
             "reply_markup": self._markup(rows),
         })
 
@@ -72,6 +74,7 @@ class TelegramAPI:
             "chat_id": str(chat_id),
             "message_id": str(message_id),
             "text": text[:4096],
+            **({"parse_mode": "HTML"} if isinstance(text, RichText) else {}),
             "reply_markup": self._markup(rows),
         })
 

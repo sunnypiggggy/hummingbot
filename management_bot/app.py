@@ -19,6 +19,10 @@ from management_bot.config import Settings
 from management_bot.storage import BotStore
 from management_bot.system_metrics import HostSystemMetrics
 from management_bot.telegram_api import TelegramAPI, TelegramError
+from management_bot.risk_display import render_risk
+from management_bot.risk_display import RichText
+from management_bot import scheduled_display
+from html import escape
 
 
 logger = logging.getLogger("trading-management-bot")
@@ -399,33 +403,7 @@ class TradingManagementBot:
             snapshot = self.reports.status()
         except Exception as exc:
             return f"🛡 风控状态\n\n数据不可用：{_safe_text(exc)}"
-        robots = snapshot["robots"]
-        normal = sum(1 for item in robots if item.get("trading_normal"))
-        lines = [
-            "🛡 Grid / DCA 风控状态",
-            f"数据年龄：{int(snapshot['age_seconds'])}秒",
-            f"结论：{'✅' if normal == len(robots) else '🔴'} {normal}/{len(robots)} 正常交易",
-            "",
-        ]
-        for robot in robots:
-            strategy = str(robot.get("strategy", "")).upper()
-            pair = str(robot.get("pair", "未知交易对"))
-            permissions = robot.get("final_permissions", {})
-            buy = "放行" if permissions.get("buy_enabled") else "阻止"
-            sell = "放行" if permissions.get("sell_enabled") else "阻止"
-            alerts = sum(
-                1 for gate in robot.get("gate_statuses", [])
-                if isinstance(gate, dict) and gate.get("applicable", True)
-                and gate.get("state") == "ALERT_ONLY"
-            )
-            state = "正常交易" if robot.get("trading_normal") else "交易受限"
-            suffix = f"｜{alerts}项提醒" if alerts else ""
-            lines.append(
-                f"{'✅' if robot.get('trading_normal') else '🔴'} {strategy} {pair}\n"
-                f"  {state}｜BUY {buy}｜SELL {sell}｜阶段 {_state_cn(robot.get('phase'))}{suffix}"
-            )
-        lines.append("\n点击下方交易对查看全部生效门控。")
-        return "\n".join(lines)
+        return render_risk(snapshot["robots"], snapshot["age_seconds"], _state_cn, _reason_cn)
 
     @staticmethod
     def _risk_rows() -> list[list[tuple[str, str]]]:
@@ -435,7 +413,7 @@ class TradingManagementBot:
             [("🏠 主菜单", "m:home")],
         ]
 
-    def _risk_detail(self, strategy: str, pair: str) -> str:
+    def _risk_detail(self, strategy: str, pair: str, page: int = 0) -> str:
         try:
             snapshot = self.reports.status()
         except Exception as exc:
@@ -446,34 +424,7 @@ class TradingManagementBot:
         ), None)
         if not robot:
             return f"🛡 风控详情\n\n没有找到 {strategy.upper()} {pair} 的状态。"
-        permissions = robot.get("final_permissions", {})
-        buy = "放行" if permissions.get("buy_enabled") else "阻止"
-        sell = "放行" if permissions.get("sell_enabled") else "阻止"
-        lines = [
-            f"🛡 {strategy.upper()} {pair} 风控详情",
-            f"交易状态：{'✅ 正常交易' if robot.get('trading_normal') else '🔴 交易受限'}",
-            f"最终权限：BUY {buy}｜SELL {sell}",
-            f"恢复阶段：{_state_cn(robot.get('phase'))}",
-            "",
-            "全部生效门控：",
-        ]
-        for gate in robot.get("gate_statuses", []):
-            if not isinstance(gate, dict) or not gate.get("applicable", True):
-                continue
-            gate_buy = _permission_cn(gate.get("buy_enabled"))
-            gate_sell = _permission_cn(gate.get("sell_enabled"))
-            lines.append(
-                f"• {gate.get('label', gate.get('mechanism', '未知门控'))}："
-                f"{_state_cn(gate.get('state'))}\n"
-                f"  BUY {gate_buy}｜SELL {gate_sell}｜{_reason_cn(gate.get('reason'))}"
-            )
-        blockers = robot.get("blockers", [])
-        if blockers:
-            lines.extend(("", "当前阻塞原因："))
-            lines.extend(f"• {_safe_text(item, 160)}" for item in blockers)
-        else:
-            lines.append("\n当前没有阻塞交易的风控门。")
-        return "\n".join(lines)
+        return render_risk([robot], snapshot["age_seconds"], _state_cn, _reason_cn, detail=True, page=page)
 
     def _errors(self) -> str:
         blockers: list[str] = []
@@ -986,40 +937,79 @@ class TradingManagementBot:
     def _target_session_cn(target: Any) -> str:
         return "正式开市（RTH）" if str(target) == "MARKET_OPEN" else "盘前起（EXTENDED）"
 
-    def _stock_scheduled_menu(self) -> tuple[str, list]:
-        items = self.stocks.scheduled(active_only=True)
-        lines = ["⏰ 待开市订单", ""]
-        rows: list[list[tuple[str, str]]] = []
-        for item in items[:12]:
-            schedule_id = str(item.get("schedule_id", ""))
-            payload = item.get("request_payload") or {}
-            lines.append(
-                f"• {payload.get('symbol', '-')} {payload.get('side', 'BUY')} / "
-                f"{self._scheduled_status_cn(item.get('status'))} / "
-                f"{self._target_session_cn(item.get('target_session'))}"
-            )
-            rows.append([("查看", f"q:{schedule_id}:view"), ("撤销", f"q:{schedule_id}:cancel")])
+    def _stock_scheduled_menu(self, page: int = 0) -> tuple[str, list]:
+        items = sorted(self.stocks.scheduled(active_only=True),
+                       key=lambda item: (str(item.get("created_at", "")), str(item.get("schedule_id", ""))))
+        pages = max(1, (len(items) + 5) // 6)
+        page = min(max(0, page), pages - 1)
+        lines = ["<b>⏰ 待开市订单</b>", f"共 {len(items)} 笔 · 第 {page + 1}/{pages} 页",
+                 "选择订单，查看入场价、止盈止损或撤销。", ""]
+        rows = []
+        for item in items[page * 6:page * 6 + 6]:
+            title = scheduled_display.label(item)
+            lines += [escape(title), "状态：" + escape(self._scheduled_status_cn(item.get("status"))), ""]
+            rows.append([(title, f"q:{item['schedule_id']}:view")])
         if not items:
             lines.append("当前没有待开市订单。")
-        rows.append([("刷新", "s:scheduled"), ("⬅️ 返回", "m:stock")])
-        return "\n".join(lines), rows
+        if pages > 1:
+            rows.append([("上一页", f"s:scheduled:{(page - 1) % pages}"),
+                         ("下一页", f"s:scheduled:{(page + 1) % pages}")])
+        rows.append([("刷新列表", f"s:scheduled:{page}"), ("⬅️ 返回", "m:stock")])
+        return RichText("\n".join(lines)), rows
 
     def _stock_scheduled_detail(self, schedule_id: str) -> tuple[str, list]:
         item = self.stocks.scheduled_detail(schedule_id)
         payload = item.get("request_payload") or {}
-        budget = item.get("quote_budget")
-        amount_text = f"固定预算 {budget} USDC" if budget is not None else f"冻结股数 {item.get('requested_shares')}"
-        text = (
-            f"⏰ 待开市订单\n计划ID：{schedule_id}\n"
-            f"股票：{payload.get('symbol', '-')} / {payload.get('side', 'BUY')}\n"
-            f"状态：{self._scheduled_status_cn(item.get('status'))}\n"
-            f"目标时段：{self._target_session_cn(item.get('target_session'))}\n"
-            f"数量口径：{amount_text}\n"
-            f"冻结限价：{item.get('frozen_price') or '-'}\n"
-            f"最后阻塞：{_safe_text(item.get('last_block_reason') or '-', 180)}"
-        )
-        return text, [[("刷新", f"q:{schedule_id}:refresh"), ("撤销", f"q:{schedule_id}:cancel")],
-                      [("⬅️ 列表", "s:scheduled")]]
+        try:
+            quote_text, quote = self._stock_quote_context(
+                str(payload.get("symbol", "")), str(payload.get("side", "BUY")))
+        except Exception:
+            quote_text, quote = "行情查询失败；以下已保存的订单参数仍有效。", {}
+        try:
+            mode = str(self.stocks.health().get("runtime_mode") or "未确认")
+        except Exception:
+            mode = "未确认（Runtime状态不可用）"
+        text = scheduled_display.detail(item, self._scheduled_status_cn, self._target_session_cn,
+                                        quote_text=quote_text, quote=quote, mode=mode)
+        rows = [[("刷新详情", f"q:{schedule_id}:view")]]
+        if item.get("status") in scheduled_display.CANCELABLE:
+            rows.append([("撤销这笔订单", f"q:{schedule_id}:cancel")])
+        elif item.get("status") == "ACTIVE":
+            rows.append([("Executor管理", "s:positions")])
+        rows.append([("返回订单列表", "s:scheduled")])
+        return text, rows
+
+    def _stock_scheduled_cancel(self, schedule_id: str, *, confirmed: bool = False) -> tuple[str, list]:
+        item = self.stocks.scheduled_detail(schedule_id)
+        if item.get("status") not in scheduled_display.CANCELABLE:
+            return self._stock_scheduled_detail(schedule_id)
+        if not confirmed:
+            return RichText(
+                "<b>确认撤销这笔待开市订单？</b>\n" + escape(scheduled_display.label(item))
+                + "\n仅在尚未激活时撤销计划并释放对应预留；已激活订单需在Executor中管理。"
+            ), [[("确认撤销", f"q:{schedule_id}:confirm_cancel"),
+                 ("保留订单", f"q:{schedule_id}:view")]]
+        try:
+            result = self.stocks.cancel_scheduled(schedule_id)
+        except ServiceError:
+            # Activation may win the race (HTTP 409), or the cancel response
+            # may be lost. Query authority before describing the outcome.
+            latest = self.stocks.scheduled_detail(schedule_id)
+            result = {"schedule": latest}
+        latest = result.get("schedule") or {}
+        status = str(latest.get("status") or "")
+        if status:
+            self.store.mark_stock_schedule_notified(
+                schedule_id, status, int(latest.get("version") or 0))
+        if status == "CANCELED":
+            return RichText("<b>✅ 待开市订单已撤销</b>\n" + escape(scheduled_display.label(item))
+                            + "\n该订单预留资金/库存已释放。"), [
+                                [("返回订单列表", "s:scheduled"), ("Stock菜单", "m:stock")]]
+        text, rows = self._stock_scheduled_detail(schedule_id)
+        prefix = ("订单已激活，本次未撤销，请进入Executor管理。"
+                  if status == "ACTIVE" or result.get("executor_active")
+                  else "未确认撤销成功，以下为最新查询结果。")
+        return RichText(escape(prefix) + "\n\n" + text), rows
 
     def _notify_stock_schedules(self) -> None:
         for subscription in self.store.stock_schedule_subscriptions():
@@ -1076,7 +1066,7 @@ class TradingManagementBot:
                 f"状态：{self._scheduled_status_cn(status)}\n"
                 f"原因：{_safe_text(item.get('last_block_reason') or '-', 180)}"
             )
-            rows = [[("查看", f"q:{schedule_id}:view")]] if status != "ACTIVE" else [[("Executor管理", "s:positions")]]
+            rows = [[(f"查看 {scheduled_display.identity(item)[0]} #{scheduled_display.short_id(item)}", f"q:{schedule_id}:view")]] if status != "ACTIVE" else [[("Executor管理", "s:positions")]]
             self.telegram.send(int(subscription["chat_id"]), text, rows)
             self.store.mark_stock_schedule_notified(
                 schedule_id, status, version, str(item.get("resulting_executor_id") or "")
@@ -1954,10 +1944,18 @@ class TradingManagementBot:
             elif data == "m:risk":
                 text, rows = self._risk(), self._risk_rows()
             elif data.startswith("r:"):
-                _, strategy, pair = data.split(":", 2)
-                text, rows = self._risk_detail(strategy, pair), [
+                parts = data.split(":")
+                _, strategy, pair = parts[:3]
+                page = max(0, int(parts[3])) if len(parts) > 3 else 0
+                text, rows = self._risk_detail(strategy, pair, page), [
                     [("⬅️ 风控总览", "m:risk"), ("🏠 主菜单", "m:home")]
                 ]
+                pages = getattr(text, "pages", 1)
+                page = getattr(text, "page", 0)
+                rows.insert(0, [("🔄 刷新", f"r:{strategy}:{pair}:{page}")])
+                if pages > 1:
+                    rows.insert(0, [("上一页", f"r:{strategy}:{pair}:{(page-1)%pages}"),
+                                    ("下一页", f"r:{strategy}:{pair}:{(page+1)%pages}")])
             elif data == "m:errors":
                 text, rows = self._errors(), self._back()
             elif data == "m:models":
@@ -1990,8 +1988,9 @@ class TradingManagementBot:
                 text, rows = self._stock_limits(), [[("修改", "s:limits_input"), ("⬅️ 返回", "m:stock")]]
             elif data == "s:positions":
                 text, rows = self._stock_executors_menu(user_id, chat_id, message_id)
-            elif data == "s:scheduled":
-                text, rows = self._stock_scheduled_menu()
+            elif data == "s:scheduled" or data.startswith("s:scheduled:"):
+                page = int(data.rsplit(":", 1)[1]) if data.startswith("s:scheduled:") else 0
+                text, rows = self._stock_scheduled_menu(page)
             elif data == "s:paper_profit":
                 text, rows = self._stock_paper_profit(), [[
                     ("🔄 刷新", "s:paper_profit"), ("⬅️ Stock菜单", "m:stock")
@@ -2060,19 +2059,10 @@ class TradingManagementBot:
                     text, rows = self._stock_position_step(session, action, value)
             elif data.startswith("q:"):
                 _, schedule_id, action = data.split(":", 2)
-                if action == "view":
+                if action in {"view", "refresh"}:
                     text, rows = self._stock_scheduled_detail(schedule_id)
-                elif action == "refresh":
-                    self.stocks.refresh_scheduled(schedule_id)
-                    text, rows = self._stock_scheduled_detail(schedule_id)
-                elif action == "cancel":
-                    result = self.stocks.cancel_scheduled(schedule_id)
-                    item = result.get("schedule") or {}
-                    self.store.mark_stock_schedule_notified(
-                        schedule_id, str(item.get("status") or "CANCELED"), int(item.get("version") or 0)
-                    )
-                    text = f"✅ 待开市订单已撤销\n计划ID：{schedule_id}\n预留资金/库存已原子释放。"
-                    rows = [[("⬅️ 待开市订单", "s:scheduled"), ("Stock菜单", "m:stock")]]
+                elif action in {"cancel", "confirm_cancel"}:
+                    text, rows = self._stock_scheduled_cancel(schedule_id, confirmed=action == "confirm_cancel")
                 else:
                     raise ValueError("未知待开市订单操作")
             elif data.startswith("a:"):

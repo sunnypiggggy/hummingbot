@@ -1302,6 +1302,10 @@ class UnifiedTelegramReporting:
                 model_week=technical_row.get("model_week"),
                 cutover_phase=self._reported_cutover_phase(cutover, v22_contract, now),
             )
+            trading_status["recovery"] = {key: recovery[key] for key in (
+                "mechanism", "phase", "cooldown_until", "healthy_cycles",
+                "exit_completed_at", "reentry_block_reason",
+            ) if key in recovery}
             base_asset = pair.split("-", 1)[0]
             asset_status = inventory_status.get("assets", {}).get(base_asset, {})
             owner_key = f"dca:{bot['bot_name']}"
@@ -1601,6 +1605,10 @@ class UnifiedTelegramReporting:
                 model_week=technical_contract.get("model_week"),
                 cutover_phase=self._reported_cutover_phase(cutover, gate, now),
             )
+            trading_status["recovery"] = {key: recovery[key] for key in (
+                "mechanism", "phase", "cooldown_until", "healthy_cycles",
+                "exit_completed_at", "reentry_block_reason",
+            ) if key in recovery}
             item = {
                 "strategy": "grid", "bot": bot_name, "pair": pair,
                 "quote_asset": "FDUSD", "generated_at_bjt": now.astimezone(SHANGHAI).isoformat(),
