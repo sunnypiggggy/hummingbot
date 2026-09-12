@@ -23,6 +23,7 @@
 | Stock Runtime、PAPER 与订单 | [stocks_runtime/](stocks_runtime/)，重点为 router、ledger、async_orders | [Runtime](docs/BINANCE_STOCKS_RUNTIME.md)、[PAPER](docs/BINANCE_STOCKS_PAPER_TRADING.md) |
 | Telegram 私聊管理 | [management_bot/](management_bot/) | [管理 Bot](docs/TRADING_MANAGEMENT_BOT_V3.md) |
 | 频道报告、统一交易状态 | [报告服务](live_guard/dca_live_report.py)、[通知](live_guard/telegram_notifications.py)、[状态口径](live_guard/trading_status.py) | [通知说明](release_packages/ethbtc-forced-exit/documentation/TELEGRAM_NOTIFICATIONS.md) |
+| Telegram 参数、模型证据与周曲线 | [参数发布](live_guard/management_parameters.py)、[信号历史](live_guard/model_probability_history.py)、[PNG绘图](management_bot/probability_chart.py) | [管理 Bot](docs/TRADING_MANAGEMENT_BOT_V3.md) |
 | FOMC 与人工恢复 | [macro_control/](macro_control/)、[Hermes](hermes/) | [宏观控制运维](ops/dca-macro/README.md)、[恢复审批](hermes/skills/dca-macro-control/references/risk-recovery-approval.md) |
 
 完整生产机制资料见[发布族文档索引](release_packages/ethbtc-forced-exit/documentation/README.md)，容器依赖见[容器与信号链路](release_packages/ethbtc-forced-exit/documentation/CONTAINERS_AND_SIGNAL_FLOW.md)，合同语义见[合同与运行链路](release_packages/ethbtc-forced-exit/documentation/CONTRACTS_AND_RUNTIME_FLOW.md)。文档中的带日期状态也需重新核验。
@@ -34,6 +35,14 @@
 生产执行覆盖层与冻结模型是不同对象。解释实际行为时同时检查当前代码、发布族机制文档、有效运行 generation 和审批合同；发现冲突先报告并查证，不改写历史报告或凭文档修改授权。[CONTRIBUTING.md](CONTRIBUTING.md)描述上游贡献流程，不能机械用于本项目分支合并或 OCI 发布。
 
 ## 开发与交易边界
+
+### 拉取更新与过期文件清理
+
+- `origin` 是本项目仓库，`upstream` 是官方 Hummingbot。普通 `pull` 默认更新当前分支的跟踪分支；合并官方代码或研究分支需明确范围，不能用它替代更新本项目。
+- 先确认工作区与跟踪关系，再 fetch、比较提交和差异，使用 `git pull --ff-only`。分叉或冲突时停下说明；不得自动 reset、stash、rebase 或覆盖本地修改。网络失败时不得根据旧的远端引用声称“已经最新”。
+- 清理依据是“可重建缓存或已确认无引用的残留”，不是文件日期。源码、配置、一次性运维脚本、回测结果及备份需分别检查；历史 Agent 文档仍作证据保留。
+- 优先将缓存移至仓库外的可恢复目录，记录原路径、文件数、大小和恢复位置；不要跟随符号链接或递归清理仓库根目录。缓存权限不足时报告并跳过，不扩大删除权限。
+- 本地拉取、文档整理和清理不等于 OCI 部署；交付分别说明新增提交、文件改动、清理范围以及尚未完成的核验。
 
 - 优先复用已有模块和合同；研究模型、参数实验与正式运行逻辑保持隔离，禁止因回测好看或测试通过自动开启实盘。不要未经任务要求切换分支、合并实验代码或增加容器。
 - Grid、DCA、Stock 分别核算机器人归属库存和收益；FDUSD、USDT、USDC 不直接相加，策略 MTM 不冒充交易所账户总收益。
@@ -49,6 +58,8 @@
 - 按机器人显示“正常交易／交易受限／停止交易／数据不可用”，区分普通订单权限与保护性退出；阻塞提供中文原因、解除条件和可信时间。冷却截止不等于恢复交易时间，模型等待及人工解锁不能伪造倒计时。
 - 使用已有富文本发送方式并转义动态内容；长内容分页。未知参数不补当前默认值，缺少证据不借用旧模型图片，缺少行情不把持仓按零估值。
 - 展示口径优先复用报告服务的状态与收益合同；检查数据年龄、窗口完整性和对账结果。告警但不阻塞的门不能渲染为停止交易，已恢复历史事件不能继续当当前故障。
+- 近一周 PNG 保留价格、预测概率、当时阈值及可信 Risk-Off 阴影，不添加底部说明段落或图片附带描述。价格与概率上下分图共用时间轴，Grid 用 FDUSD 行情、DCA 用 USDT 行情；DCA 模型信号仍映射同资产 FDUSD，不混淆行情与模型来源。
+- 恢复计数读取与当前 generation、信号时间和概率阈值一致的真实状态；缺失不补零，不将离线独立计数实验当作已上线逻辑。历史缺口不重新推理填补，价格只用已完成K线。
 
 ## 本地环境与验证
 
@@ -61,6 +72,9 @@ Windows 工作区使用 PowerShell，OCI 使用 Linux shell；路径、引号和
 ```powershell
 # Telegram 导航、风控详情和待开市订单
 python -m pytest test/test_trading_management_bot.py test/test_management_risk_display.py test/test_management_scheduled_display.py -q
+
+# 参数合同、模型证据与周曲线（测试行情使用模拟源）
+python -m pytest test/test_management_parameters.py test/test_management_probability_chart.py -q
 
 # Grid/DCA 执行、恢复与库存
 python -m pytest test/test_grid_live_safety.py test/test_grid_live_runtime_risk.py test/test_risk_recovery.py test/test_account_inventory.py test/test_dca_live_safety.py -q
