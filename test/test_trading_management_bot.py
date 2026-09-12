@@ -516,6 +516,7 @@ class FakeSystemMetrics:
 class TelegramFlowTests(TestCase):
     def _bot(
         self, root: Path, *, paper_enabled: bool = False, mutations_enabled: bool = False,
+        model_approval_enabled: bool = False,
     ) -> TradingManagementBot:
         token = root / "token"
         token.write_text("123456:test-token", encoding="utf-8")
@@ -541,6 +542,7 @@ class TelegramFlowTests(TestCase):
             approval_evidence_root=root / "evidence",
             approval_decision_root=root / "decisions",
             mutations_enabled=mutations_enabled,
+            model_approval_enabled=model_approval_enabled,
             bots={"grid": {"bot_name": "grid", "script": "grid", "conf": "grid"}},
             stocks_paper_trading_enabled=paper_enabled,
         )
@@ -560,6 +562,63 @@ class TelegramFlowTests(TestCase):
             self.assertIn("Binance真实经济请求计数：0", text)
             bot.store.close()
 
+    def _pending_model(self, root):
+        weekly = root / "weekly"
+        weekly.mkdir(exist_ok=True)
+        release = "a" * 64
+        (weekly / f"approval-request-{release}.json").write_text(json.dumps({
+            "release_sha256": release, "model_sha256": "b" * 64,
+            "review_started_at": 1, "review_deadline": int(time.time()) + 3600,
+        }), encoding="utf-8")
+        (weekly / "automation_state.json").write_text(json.dumps({
+            "phase": "AWAITING_APPROVAL", "candidate_release_sha256": release,
+        }), encoding="utf-8")
+        return release[:16]
+
+    def test_model_approval_independent_of_maintenance_and_duplicate_safe(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            bot = self._bot(root, model_approval_enabled=True)
+            candidate = self._pending_model(root)
+            callback = {"id": "approve-test", "from": {"id": 7},
+                        "message": {"chat": {"id": 7}, "message_id": 10}}
+            self.assertFalse(bot.settings.mutations_enabled)
+            self.assertIn("已启用", bot._approvals_menu()[0])
+            result, _ = bot._handle_model_approval(f"a:{candidate}:approve2", callback, 20)
+            self.assertIn("已批准", result)
+            path = root / "decisions" / "review_decision.json"
+            original = path.read_bytes()
+            decision = json.loads(original)
+            self.assertEqual("approve", decision["decision"])
+            self.assertEqual("a" * 64, decision["release_sha256"])
+            self.assertEqual("20", decision["telegram_update_id"])
+            bot._handle_model_approval(f"a:{candidate}:approve2", callback, 20)
+            self.assertEqual(original, path.read_bytes())
+            bot.store.db.close()
+
+    def test_model_reject_uses_independent_switch_including_stale_confirmation(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                bot = self._bot(root, model_approval_enabled=enabled, mutations_enabled=not enabled)
+                candidate = self._pending_model(root)
+                callback = {"id": "reject-test", "from": {"id": 7},
+                            "message": {"chat": {"id": 7}, "message_id": 10}}
+                session = bot.store.create_session(7, 7, "model_reject", 10)
+                sid = session["session_id"]
+                bot.store.update_session(sid, payload={"candidate_id": candidate, "reason": "证据不足"})
+                result, _ = bot._handle_session_action(f"x:{sid}:reject_confirm", callback, 21)
+                path = root / "decisions" / "review_decision.json"
+                self.assertEqual(enabled, path.exists())
+                if enabled:
+                    self.assertEqual("reject", json.loads(path.read_text())["decision"])
+                else:
+                    self.assertIn("未启用", result)
+                    for action in ("approve", "approve2", "reject"):
+                        self.assertIn("未启用", bot._handle_model_approval(
+                            f"a:{candidate}:{action}", callback, 22)[0])
+                    self.assertFalse(path.exists())
+                bot.store.db.close()
     def test_global_mutation_authorization_enables_stock_whitelist_and_limits(self):
         with tempfile.TemporaryDirectory() as raw:
             bot = self._bot(Path(raw), paper_enabled=True, mutations_enabled=True)

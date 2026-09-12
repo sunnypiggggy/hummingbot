@@ -148,6 +148,30 @@ Stock Runtime提供以下受控接口：
 
 ## 模型审批合同
 
+### 近一周概率与阈值（只读）
+
+“模型与参数”和“当前模型”均提供入口，选择 Grid/DCA、BTC/ETH 后，
+每个机器人发送一张手机 PNG，叠加过去168小时线上概率实线、逐周阈值阶梯虚线。
+图片上方增加同一时间轴的价格曲线：Grid 使用对应 FDUSD 交易对，DCA 使用 USDT 交易对，
+取 Binance 公共接口已完成的1小时收盘价（最多每15分钟刷新，缺口断线）。保留当前恢复计数；
+删除图内底部说明段落和 Telegram 图片附带描述。价格与概率分别使用独立纵轴和上下子图，
+不将价格变化解释为模型状态切换；行情查询失败保留已保存历史及最后收盘时间，不补造数据。
+DCA 仍使用对应 FDUSD 模型信号，不重新计算 USDT 模型。
+Report 将已提交 generation 的真实信号幂等保存到报告目录的
+`model_probability_history.sqlite`（30天保留），输出 `model_probability_history.json`。
+首次采集只导入可验证 generation 身份且概率/阈值同源的 `risk_audit.jsonl` 记录；
+这些事件是稀疏点，不能当作连续采样。无完整证据的旧状态不回填，也不重算历史。
+图显示北京时间、实际记录范围；超过一小时的信号缺口或采集中断均断线。
+当前信号失效仍可查看已保存历史，但明确标记不可用；无记录不发送旧图。
+Risk-Off 阴影只覆盖连续、有效且两端均为 Risk-Off 的记录，不推测缺失区间。
+存储/绘图失败不改变交易门控；仅更新 Report 与管理 Bot，无新容器或挂载。
+概率超过入场阈值不等于立即触发状态切换；连续确认和结构条件仍由原状态机负责。
+
+批准与拒绝使用独立开关 `TRADING_MANAGEMENT_MODEL_APPROVAL_ENABLED`。
+服务 Compose 默认开启，未通过 Compose 配置的进程默认关闭；审批中心显示实际开关状态。
+该开关不开放机器人启停、白名单或限额维护，也不直接批准任何候选。
+所有决定仍由 Scheduler 复核候选身份、证据及硬门槛后处理。
+
 Scheduler将候选请求和脱敏状态原子发布到 `approval_public`。管理 Bot只挂载
 这个目录并扫描 `approval-request-*.json`，展示候选、硬门槛、模型周、
 有效期和证据附件哈希。批准或拒绝写入独立决定目录，决定至少绑定：
@@ -179,7 +203,7 @@ Scheduler只消费与当前待审批release完全匹配的决定，并重新执�
    `STOCKS_LIVE_TELEGRAM_TRADING_ENABLED=true`。异步功能不能绕过这层授权。
 
 OCI生产运维可显式保持`TRADING_MANAGEMENT_MUTATIONS_ENABLED=true`，让管理员私聊中的
-白名单、限额、模型审批和机器人维护操作可用。该设置不等于授权交易：所有操作仍需
+白名单、限额和机器人维护操作可用；模型审批使用上述独立开关。该设置不等于授权交易：所有操作仍需
 二次确认和各自预检，Stocks LIVE仍需Runtime与Telegram两个独立实盘开关同时放行。
 
 Condor迁移记录见 `CONDOR_MIGRATION_ARCHIVE.md`。

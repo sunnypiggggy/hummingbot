@@ -4,8 +4,15 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from live_guard.management_parameters import HISTORY_LIMIT, ManagementParameterPublisher
 from management_bot.clients import ParameterCatalogReader, ServiceError
+
+
+@pytest.fixture(autouse=True)
+def isolate_market_price_reads(monkeypatch):
+    monkeypatch.setattr('live_guard.management_parameters.read_market_prices', lambda pair, now: [])
 
 
 def write(path: Path, value: str | dict) -> None:

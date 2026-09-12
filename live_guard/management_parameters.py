@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
+try:
+    from model_probability_history import collect as collect_probability_history, read_market_prices
+except ImportError:
+    from live_guard.model_probability_history import collect as collect_probability_history, read_market_prices
 
 
 SCHEMA = "management-parameter-catalog-v1"
@@ -497,4 +501,15 @@ class ManagementParameterPublisher:
         } for item in evidence["sets"]]
         catalog["history"] = self._record_history(catalog)
         _atomic_json(self.output.parent / "management_parameter_catalog.json", catalog)
+        try:
+            curve = collect_probability_history(self.grid_state, self.output.parent, now.timestamp(),
+                                                price_reader=read_market_prices)
+        except Exception as exc:
+            curve = {"schema": "management-probability-history-v1", "generated_at": now.timestamp(),
+                     "error": f"历史采集失败：{type(exc).__name__}", "pairs": {}}
+        try:
+            _atomic_json(self.output.parent / "model_probability_history.json", curve)
+        except OSError:
+            # Presentation storage failure must not block notifications or trading.
+            pass
         return catalog

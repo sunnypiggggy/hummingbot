@@ -53,6 +53,7 @@ class Settings:
     approval_decision_root: Path
     mutations_enabled: bool
     bots: dict[str, dict[str, str]]
+    model_approval_enabled: bool = False
     stocks_paper_trading_enabled: bool = False
     stocks_live_trading_enabled: bool = False
     session_ttl_seconds: int = 900
@@ -101,6 +102,7 @@ class Settings:
             approval_evidence_root=Path(os.getenv("MODEL_APPROVAL_EVIDENCE_ROOT", "/approvals/evidence")),
             approval_decision_root=Path(os.getenv("MODEL_APPROVAL_DECISION_ROOT", "/approvals/decisions")),
             mutations_enabled=os.getenv("TRADING_MANAGEMENT_MUTATIONS_ENABLED", "false").lower() == "true",
+            model_approval_enabled=os.getenv("TRADING_MANAGEMENT_MODEL_APPROVAL_ENABLED", "false").lower() == "true",
             bots=bots,
             stocks_paper_trading_enabled=os.getenv(
                 "STOCKS_PAPER_TELEGRAM_TRADING_ENABLED", "false"

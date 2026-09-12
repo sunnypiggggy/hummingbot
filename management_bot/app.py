@@ -533,6 +533,7 @@ class TradingManagementBot:
         rows = [
             [("🟦 Grid 参数", "p:grid"), ("🟩 DCA 参数", "p:dca")],
             [("🛡 风控门参数", "p:risk")],
+            [("📈 近一周概率与阈值", "p:probability")],
             [("🧠 当前模型", "p:model"), ("🆕 候选模型", "p:candidate")],
             [("🕒 历史模型", "p:model_history")],
             [("🔄 刷新", "m:models"), ("🏠 主菜单", "m:home")],
@@ -742,7 +743,8 @@ class TradingManagementBot:
         else:
             lines.append("当前模型精确360天回测：缺失")
             lines.append("不会使用历史图片替代，也不会自动补生成。")
-        rows.extend([[("🆕 候选模型", "p:candidate"), ("🕒 历史模型", "p:model_history")],
+        rows.extend([[("📈 近一周概率与阈值", "p:probability")],
+                     [("🆕 候选模型", "p:candidate"), ("🕒 历史模型", "p:model_history")],
                      [("⬅️ 模型与参数", "m:models"), ("🏠 主菜单", "m:home")]])
         return "\n".join(lines), rows
 
@@ -841,6 +843,22 @@ class TradingManagementBot:
     def _handle_parameters(self, data: str, chat_id: int) -> tuple[str, list]:
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else "home"
+        if action == "probability":
+            rows = [
+                [("Grid BTC", "p:probability:grid:BTC"), ("Grid ETH", "p:probability:grid:ETH")],
+                [("DCA BTC", "p:probability:dca:BTC"), ("DCA ETH", "p:probability:dca:ETH")],
+                [("返回模型与参数", "m:models")],
+            ]
+            if len(parts) == 2:
+                return "📈 近一周概率与阈值\n选择机器人，每次发送一张168小时合并曲线PNG。\n仅使用已保存线上记录，缺失历史不重算。", rows
+            from management_bot.probability_chart import snapshot, render
+            contract_path = self.settings.reports_root / "model_probability_history.json"
+            if not contract_path.is_file():
+                return "历史曲线尚未生成，请等待报告服务采集后刷新。", rows
+            data = snapshot(json.loads(contract_path.read_text(encoding="utf-8")), parts[2], parts[3], time.time())
+            path = render(data, self.settings.state_dir / "charts" / f"v22-{parts[2]}-{parts[3]}.png")
+            self.telegram.send_file(chat_id, str(path))
+            return "✅ 已发送该机器人的近一周曲线。实际覆盖以图中记录时间为准；点击机器人可刷新。", rows
         if action == "grid":
             return self._grid_parameters(parts[2] if len(parts) > 2 else "BTC")
         if action == "dca":
@@ -1606,7 +1624,8 @@ class TradingManagementBot:
 
     def _approvals_menu(self) -> tuple[str, list]:
         pending = [item for item in self.approvals.pending() if item["status"] == "PENDING"]
-        lines = ["🧠 模型审批", f"待审批：{len(pending)}", ""]
+        capability = "已启用（批准/拒绝）" if self.settings.model_approval_enabled else "未启用（仅查询）"
+        lines = ["🧠 模型审批", f"审批操作：{capability}", f"待审批：{len(pending)}", ""]
         rows: list[list[tuple[str, str]]] = []
         for index, item in enumerate(pending[:10], 1):
             deadline = item.get("review_deadline")
@@ -1672,6 +1691,8 @@ class TradingManagementBot:
         candidate = self.approvals.find(candidate_id)
         if not candidate or candidate.get("status") != "PENDING":
             return "候选已不再等待审批。", self._back("m:approvals")
+        if action in {"approve", "approve2", "reject"} and not self.settings.model_approval_enabled:
+            return "🔒 模型审批操作当前未启用，未写入审批决定。", self._back("m:approvals")
         if action == "evidence":
             evidence = self.approvals.evidence(candidate)
             attachments = [
@@ -1702,8 +1723,6 @@ class TradingManagementBot:
             self.store.update_session(session["session_id"], step="reason", payload={"candidate_id": candidate_id})
             return "请输入拒绝原因：", [[("取消", "m:approvals")]]
         if action == "approve2":
-            if not self.settings.mutations_enabled:
-                return "🔒 模型审批操作当前未启用，未写入审批决定。", self._back("m:approvals")
             key = f"approval:{candidate['release_sha256']}:approve"
             claimed, existing = self.store.claim_action(key)
             if claimed:
@@ -1821,7 +1840,7 @@ class TradingManagementBot:
             self.store.delete_session(sid)
             return f"✅ 限额已更新\n{_safe_text(result)}", self._back("m:stock")
         if action == "reject_confirm":
-            if not self.settings.mutations_enabled:
+            if not self.settings.model_approval_enabled:
                 return "🔒 模型审批操作当前未启用，未写入拒绝决定。", self._back("m:approvals")
             candidate = self.approvals.find(session["payload"]["candidate_id"])
             if not candidate:
@@ -2125,6 +2144,7 @@ class TradingManagementBot:
             "schema": "trading-management-bot-health-v2",
             "generated_at": time.time(),
             "mutations_enabled": self.settings.mutations_enabled,
+            "model_approval_enabled": self.settings.model_approval_enabled,
             "admin_configured": self.settings.admin_user_id > 0,
             "last_error": error,
         }
