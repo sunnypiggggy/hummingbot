@@ -35,6 +35,10 @@ from dca_live_common import (
     trade_pnl_from_rows,
 )
 from grid_xgboost_risk_gate import load_runtime_xgboost_gate
+try:
+    from dca_reentry import DcaReentryMixin
+except ModuleNotFoundError:
+    from live_guard.dca_reentry import DcaReentryMixin
 from ethbtc_forced_exit_contract import (
     SCHEMA as V22_CONTRACT_SCHEMA,
     load_runtime_contract as load_runtime_v22_contract,
@@ -66,7 +70,7 @@ from risk_recovery import (
     REQUIRED_HEALTHY_CYCLES, STRATEGY_COOLDOWN_SECONDS,
     advance_integrity_failure, advance_recovery, active_state,
     classify_integrity_failure,
-    mark_exit_complete, mark_reentry_complete, normalize_state, trigger_state,
+    mark_exit_complete, normalize_state, trigger_state,
 )
 try:
     from telegram_notifications import (
@@ -263,6 +267,14 @@ class BinanceEmergencyClient:
             value["fills"] = self.order_trades(pair, str(value.get("orderId", "")))
         return value
 
+    def order_by_id(self, pair: str, order_id: str) -> dict:
+        value = self._signed("GET", "/api/v3/order", {
+            "symbol": self.symbol(pair), "orderId": order_id,
+        })
+        if Decimal(str(value.get("executedQty", "0"))) > 0:
+            value["fills"] = self.order_trades(pair, str(value["orderId"]))
+        return value
+
     def order_trades(self, pair: str, order_id: str) -> list[dict]:
         if not order_id:
             return []
@@ -273,6 +285,8 @@ class BinanceEmergencyClient:
         if not isinstance(value, list):
             return []
         return [{
+            **({"tradeId": str(row.get("id", row.get("tradeId")))}
+               if row.get("id", row.get("tradeId")) is not None else {}),
             "price": str(row.get("price", "0")),
             "qty": str(row.get("qty", "0")),
             "commission": str(row.get("commission", "0")),
@@ -453,7 +467,7 @@ class ApiClient:
         )
 
 
-class Guard:
+class Guard(DcaReentryMixin):
     def __init__(self):
         self.bots_path = Path(os.getenv("BOTS_PATH", "/workspace/bots"))
         self.state_dir = Path(os.getenv("DCA_LIVE_STATE_PATH", "/workspace/state"))
@@ -1454,6 +1468,8 @@ class Guard:
             "recoverable_exit_critical_delay": ("EXIT_DELAY", "critical"),
             "recoverable_reentry_ready": ("REENTRY", "info"),
             "recoverable_reentry_complete": ("RECOVERED", "info"),
+            "recoverable_reentry_leg_filled": ("REENTRY", "info"),
+            "recoverable_reentry_wait": ("REENTRY", "warning"),
             "portfolio_reentry_committed": ("RECOVERED", "info"),
             "circuit_breaker_complete": ("LATCHED", "critical"),
             "circuit_breaker_action_failed": ("ACTION_FAILED", "critical"),
@@ -1471,6 +1487,8 @@ class Guard:
             else details.get("mechanism") or "infrastructure_integrity_breaker"
         ))
         final_phase = str(recovery.get("phase") or "")
+        if audit_event == "recoverable_reentry_wait" and final_phase:
+            transitions = [final_phase]
         if audit_event == "recoverable_reentry_complete" and final_phase == "REENTRY":
             transitions = ["REENTRY"]
         if audit_event == "recoverable_exit_complete" and final_phase in {"COOLDOWN", "LATCHED"}:
@@ -1488,7 +1506,9 @@ class Guard:
                 mechanism=mechanism, transition=transition, reason=reason,
                 severity=severity, phase_from="ACTIVE" if transition == "TRIGGERED" else "",
                 phase_to=phase_to,
-                action="cancel_orders_and_flatten" if transition in {"TRIGGERED", "EXITING", "LATCHED"} else audit_event,
+                action=("wait_for_reentry_verification" if audit_event == "recoverable_reentry_wait"
+                        else "cancel_orders_and_flatten" if transition in {"TRIGGERED", "EXITING", "LATCHED"}
+                        else audit_event),
                 trigger_value=recovery.get("trigger_value"),
                 release_sha256=str(contract.get("release_sha256", "")),
                 model_sha256=str(contract.get("model_sha256", "")),
@@ -2234,17 +2254,13 @@ class Guard:
             spec.bot_name for pair, spec in LIVE_PAIRS.items()
             if v22_contract.get("pairs", {}).get(pair, {}).get("buy_enabled")
         }
-        pending = set()
+        # Filled or partially filled legs need only their outstanding quote.
+        pending_quote = Decimal("0")
         for bot_name in risk_on:
-            phase = normalize_state(
-                self.state.get("bots", {}).get(bot_name, {}).get("recovery")
-            )["phase"]
-            if phase == REENTRY:
-                pending.add(bot_name)
-        pending.add(current_bot)
-        # Every Risk-On bot retains one BUY-side budget. Every pending bot
-        # additionally needs one side budget to rebuild base inventory.
-        return side_budget() * Decimal(len(risk_on) + len(pending & risk_on))
+            state = normalize_state(self.state.get("bots", {}).get(bot_name, {}).get("recovery"))
+            if state["phase"] in {COOLDOWN, REENTRY} or bot_name == current_bot:
+                pending_quote += self._reentry_remaining_quote(state)
+        return side_budget() * Decimal(len(risk_on)) + pending_quote
 
     def _apply_aggregate_gates(
         self, snapshots: Dict[str, Dict[str, Any]], *, risk_actions_enabled: bool,
@@ -3021,12 +3037,18 @@ class Guard:
     ) -> None:
         bot = self.state["bots"].setdefault(bot_name, {})
         current = normalize_state(bot.get("recovery"))
-        if current["phase"] != ACTIVE:
+        pending_reentry = bool(current.get("reentry") or current.get("reentry_filled"))
+        if current["phase"] != ACTIVE and not (
+            current["phase"] == REENTRY and pending_reentry
+            and (mechanism != current.get("mechanism") or mechanism == "v22_weekly_buy_gate")
+        ):
             return
-        bot["recovery"] = trigger_state(
+        replacement = trigger_state(
             mechanism=mechanism, scope=scope, now=time.time(),
             trigger_value=trigger_value, signal_price=snapshot["mark_price"], reason=reason,
         )
+        self._preserve_reentry_for_exit(bot_name, replacement)
+        bot["recovery"] = replacement
         self._audit("recoverable_breaker_triggered", bot=bot_name,
                     pair=snapshot["pair"], recovery=bot["recovery"])
         self._save()
@@ -3035,11 +3057,13 @@ class Guard:
         bot = self.state["bots"].setdefault(bot_name, {})
         if normalize_state(bot.get("recovery"))["phase"] in {EXITING, LATCHED}:
             return
-        bot["recovery"] = trigger_state(
+        replacement = trigger_state(
             mechanism="infrastructure_integrity_breaker", scope="infrastructure",
             now=time.time(), trigger_value=reason, signal_price=snapshot["mark_price"],
             reason=reason, latch_after_exit=True,
         )
+        self._preserve_reentry_for_exit(bot_name, replacement)
+        bot["recovery"] = replacement
         self._audit("integrity_failure_exit_then_latch", bot=bot_name,
                     pair=snapshot["pair"], reason=reason)
         # The integrity latch is a safety boundary.  Persist it immediately so
@@ -3128,6 +3152,16 @@ class Guard:
         step, minimum_notional = self._lot_filter(pair)
         mark = Decimal(snapshot["mark_price"])
         if state["phase"] == EXITING:
+            if (state.get("reentry") or state.get("reentry_filled")) and not state.get("reentry_abort_pending"):
+                # Older releases could leave a filled marker in EXITING.
+                # Do not treat that marker as evidence authorizing another SELL.
+                state["reentry_abort_pending"] = True
+                state["legacy_reentry_pending"] = not bool(state.get("reentry"))
+                bot["recovery"] = state
+                self._save()
+            if not self._settle_reentry_before_exit(bot_name, pair):
+                return
+            state = normalize_state(bot.get("recovery"))
             # Give the in-process executor one short window to complete its
             # market close. The independent channel takes over only after the
             # persisted deadline, preventing a stale double-close race.
@@ -3240,6 +3274,14 @@ class Guard:
             bot["recovery"] = state
             return
 
+        if state.get("reentry") or state.get("reentry_filled"):
+            if state["phase"] != REENTRY:
+                self._reentry_wait(bot_name, "reentry_evidence_in_wrong_phase")
+                return
+            allowed = self._reentry_permitted(state, macro, technical, portfolio_all_gates)
+            self._run_reentry(bot_name, snapshot, allow_submit=allowed, now=now)
+            return
+
         # A restarted bot can restore connector-tracked orders from its
         # database even though the persisted aggregate controller gate is
         # already closed.  COOLDOWN/REENTRY are quote-only phases: actively
@@ -3274,6 +3316,7 @@ class Guard:
             original_triggered_at = state.get("triggered_at")
             state.update({
                 "phase": EXITING,
+                "reentry_filled": False,
                 "original_triggered_at": state.get(
                     "original_triggered_at", original_triggered_at
                 ),
@@ -3302,12 +3345,7 @@ class Guard:
         state.pop("ownership_reconciliation_pending", None)
         state.pop("ownership_reconciliation_error", None)
         underlying_healthy = bool(macro["healthy"] and technical.get("buy_enabled"))
-        gates_allow = bool(
-            self.auto_reentry_enabled and macro["buy_enabled"] and macro["sell_enabled"]
-            and technical.get("buy_enabled") and technical.get("execution_authorized")
-        )
-        if state.get("scope") == "portfolio":
-            gates_allow = gates_allow and portfolio_all_gates
+        gates_allow = self._reentry_permitted(state, macro, technical, portfolio_all_gates)
         previous_phase = state["phase"]
         state = advance_recovery(
             state, now=now, healthy=underlying_healthy and no_runtime_risk,
@@ -3316,48 +3354,9 @@ class Guard:
         if state["phase"] == REENTRY and previous_phase != REENTRY:
             self._audit("recoverable_reentry_ready", bot=bot_name, pair=pair,
                         recovery=state)
-        if state.get("reentry_allowed"):
-            target_quote = side_budget()
-            v22_contract = self.state.get("gate_aggregate", {}).get("v22", {})
-            required_quote = self._reentry_quote_requirement(bot_name, v22_contract)
-            capital = self._quote_budget_status(
-                required_quote, now=now, force_refresh=True,
-            )
-            if not capital["buy_ready"]:
-                previous_reason = str(state.get("reentry_block_reason", ""))
-                state["reentry_allowed"] = False
-                state["reentry_block_reason"] = str(capital["reason"])
-                state["reentry_capital"] = capital
-                if previous_reason != state["reentry_block_reason"]:
-                    self._audit(
-                        "recoverable_reentry_capital_wait",
-                        bot=bot_name, pair=pair, recovery=state,
-                        free_quote=capital.get("free_quote"),
-                        required_quote=capital.get("required_quote"),
-                        action="wait_without_liquidation_or_latch",
-                    )
-                bot["recovery"] = state
-                return
-            state.pop("reentry_block_reason", None)
-            state.pop("reentry_capital", None)
-            amount = ((target_quote / mark) / step).to_integral_value(rounding=ROUND_DOWN) * step
-            if amount <= 0 or amount * mark < minimum_notional:
-                raise RuntimeError(f"DCA reentry amount is below exchange minimum for {pair}")
-            response = self.emergency_exchange.market_order(pair, "BUY", amount)
-            metrics = self._record_emergency_fill(bot_name, pair, "BUY", response)
-            baseline = {"base": response["executedQty"], "target_quote": target_quote,
-                        "mark_price": mark}
-            if state.get("scope") == "portfolio":
-                state["reentry_filled"] = True
-                state["reentry_baseline"] = {key: str(value) for key, value in baseline.items()}
-                state["reentry_allowed"] = False
-            else:
-                state = mark_reentry_complete(state, now=now, baseline=baseline)
-            bot["peak_equity"] = str(STRATEGY_BUDGET_QUOTE)
-            bot["pnl_offset_pending"] = True
-            self._audit("recoverable_reentry_complete", bot=bot_name, pair=pair,
-                        response=response, metrics=metrics, recovery=state)
         bot["recovery"] = state
+        if state.get("reentry_allowed"):
+            self._run_reentry(bot_name, snapshot, allow_submit=True, now=now)
 
     def _trip(self, bot_name: str, reason: str, snapshot: Optional[Dict[str, Any]]) -> None:
         bot_state = self.state["bots"].setdefault(bot_name, {})
@@ -3367,6 +3366,7 @@ class Guard:
             return
         observed = time.time()
         signal_price = snapshot.get("mark_price", "") if snapshot else ""
+        previous_recovery = bot_state.get("recovery", {})
         bot_state.update({
             "tripped": True, "trip_reason": reason, "tripped_at": observed,
             "recovery": trigger_state(
@@ -3375,12 +3375,18 @@ class Guard:
                 reason=reason, latched=True,
             ),
         })
+        replacement = bot_state["recovery"]
+        bot_state["recovery"] = previous_recovery
+        self._preserve_reentry_for_exit(bot_name, replacement)
+        bot_state["recovery"] = replacement
         self._save()
         try:
             pair = snapshot["pair"] if snapshot is not None else next(
                 pair for pair, spec in LIVE_PAIRS.items() if spec.bot_name == bot_name
             )
             stop_response = self._secure_stop(bot_name, pair)
+            if not self._settle_reentry_before_exit(bot_name, pair):
+                raise RuntimeError("reentry order remains unverified before infrastructure exit")
             # Reconcile after bot-side closes, exchange cancellations and
             # process termination. Never flatten from the pre-stop snapshot:
             # doing so can double-close and create the opposite exposure.
@@ -3643,7 +3649,9 @@ class Guard:
             v21 = v21_contract
             portfolio_all_gates = bool(
                 macro["healthy"] and macro["buy_enabled"] and macro["sell_enabled"]
-                and all(item.get("buy_enabled") for item in v21["pairs"].values())
+                and len(snapshots) == len(LIVE_PAIRS)
+                and all(item.get("buy_enabled") and item.get("execution_authorized")
+                        and not item.get("force_exit") for item in v21["pairs"].values())
             )
             for bot_name, snapshot in snapshots.items():
                 self._process_recoverable(
@@ -3651,25 +3659,9 @@ class Guard:
                     technical=v21["pairs"][snapshot["pair"]], now=now,
                     portfolio_all_gates=portfolio_all_gates,
                 )
-            portfolio_states = [
-                normalize_state(self.state["bots"][name].get("recovery"))
-                for name in snapshots
-            ]
-            if (
-                len(portfolio_states) == len(LIVE_PAIRS)
-                and all(state.get("scope") == "portfolio" for state in portfolio_states)
-                and all(state.get("reentry_filled") for state in portfolio_states)
-            ):
-                for bot_name, snapshot in snapshots.items():
-                    state = normalize_state(self.state["bots"][bot_name]["recovery"])
-                    committed = mark_reentry_complete(
-                        state, now=now, baseline=state["reentry_baseline"],
-                    )
-                    self.state["bots"][bot_name]["recovery"] = committed
-                    self._audit(
-                        "portfolio_reentry_committed", bot=bot_name,
-                        pair=snapshot["pair"], recovery=committed,
-                    )
+            self._commit_reentries(
+                snapshots, macro=macro, technical=v21["pairs"], now=now,
+            )
         self.state["last_success_at"] = now
         self.state.pop("last_monitor_error", None)
         self.state.pop("first_failure_at", None)

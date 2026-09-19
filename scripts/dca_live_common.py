@@ -3,8 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import math
 from decimal import Decimal
 from typing import Any, Dict, Iterable, Mapping, Sequence
+
+
+def adjustment_timestamp_seconds(value: Any) -> float:
+    """Read historical ISO or Unix-second accounting timestamps without guessing now."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError("invalid adjustment recorded_at")
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        result = parsed.timestamp()
+    if not math.isfinite(result):
+        raise ValueError("non-finite adjustment recorded_at")
+    return result
 
 
 CONNECTOR = "binance"

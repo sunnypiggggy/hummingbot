@@ -48,9 +48,9 @@ except ModuleNotFoundError:
     from live_guard.management_parameters import ManagementParameterPublisher
 
 try:
-    from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget
+    from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget, adjustment_timestamp_seconds
 except ModuleNotFoundError:  # Repository import; container copies it to /app.
-    from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget
+    from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget, adjustment_timestamp_seconds
 
 
 BINANCE_API = OFFICIAL_BINANCE_API
@@ -262,14 +262,14 @@ def calculate_pair_report(
     before_adjustments = [
         item
         for item in emergency_adjustments
-        if datetime.fromisoformat(str(item["recorded_at"])).timestamp()
+        if adjustment_timestamp_seconds(item["recorded_at"])
         < window_start_ts
     ]
     window_adjustments = [
         item
         for item in emergency_adjustments
         if window_start_ts
-        <= datetime.fromisoformat(str(item["recorded_at"])).timestamp()
+        <= adjustment_timestamp_seconds(item["recorded_at"])
         <= now_ts
     ]
     all_metrics = row_metrics(ordered_rows)
@@ -307,9 +307,9 @@ def calculate_pair_report(
         earlier_rows = [row for row in ordered_rows if timestamp_seconds(row[4]) < start_ts]
         period_rows = [row for row in ordered_rows if start_ts <= timestamp_seconds(row[4]) <= now_ts]
         earlier_adjustments = [item for item in emergency_adjustments
-                               if datetime.fromisoformat(str(item["recorded_at"])).timestamp() < start_ts]
+                               if adjustment_timestamp_seconds(item["recorded_at"]) < start_ts]
         period_adjustments = [item for item in emergency_adjustments
-                              if start_ts <= datetime.fromisoformat(str(item["recorded_at"])).timestamp() <= now_ts]
+                              if start_ts <= adjustment_timestamp_seconds(item["recorded_at"]) <= now_ts]
         earlier = row_metrics(earlier_rows)
         period = row_metrics(period_rows)
         apply_emergency_adjustments(earlier, earlier_adjustments)
@@ -351,9 +351,7 @@ def calculate_pair_report(
         quote = abs(Decimal(str(adjustment.get("quote_cashflow", "0"))))
         fills.append(
             {
-                "timestamp": datetime.fromisoformat(
-                    str(adjustment["recorded_at"])
-                ).timestamp(),
+                "timestamp": adjustment_timestamp_seconds(adjustment["recorded_at"]),
                 "side": str(adjustment["side"]).upper(),
                 "price": str(quote / amount if amount > 0 else Decimal("0")),
                 "amount": str(amount),
@@ -366,7 +364,7 @@ def calculate_pair_report(
     truncated = len(fills) > max_public_fills
     public_fills = fills[-max_public_fills:]
     all_timestamps = [timestamp_seconds(row[4]) for row in ordered_rows] + [
-        datetime.fromisoformat(str(item["recorded_at"])).timestamp()
+        adjustment_timestamp_seconds(item["recorded_at"])
         for item in emergency_adjustments
     ]
     first_fill = min(all_timestamps) if all_timestamps else None

@@ -409,3 +409,34 @@ class DcaChartAndProviderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("stamp", [1789523935.294364, 1789523935.758684])
+def test_adjustment_formats_and_window_boundaries(stamp):
+    import copy
+    now = datetime.fromtimestamp(stamp + 3600, timezone.utc)
+    times = [stamp] + [now.timestamp() - h * 3600 + delta
+                       for h in (4, 24, 168) for delta in (-1, 0, 1)]
+    rows = [{"recorded_at": datetime.fromtimestamp(t, timezone.utc).isoformat(),
+             "side": "BUY", "executed_qty": "0.001", "base_delta": "0.000999",
+             "quote_cashflow": "-75", "fee_quote": "0.075"} for t in times]
+    def report(adjustments):
+        return calculate_pair_report(bot_name="test", pair="BTC-USDT", rows=[],
+            candles=[{"timestamp": now.timestamp() - h * 3600, "close": "75000"}
+                     for h in (168, 24, 4, 0)], database_age_seconds=1, now=now,
+            emergency_adjustments=adjustments)
+    expected = report(rows)
+    for mode in ("numeric", "string", "offset", "mixed"):
+        changed = copy.deepcopy(rows)
+        for i, (r, t) in enumerate(zip(changed, times)):
+            formats = [t, str(t), datetime.fromtimestamp(t, timezone(timedelta(hours=8))).isoformat()]
+            r["recorded_at"] = formats[i % 3 if mode == "mixed" else
+                                       ("numeric", "string", "offset").index(mode)]
+        assert report(changed) == expected
+
+
+@pytest.mark.parametrize("value", [None, True, "bad", "", float("nan"), float("inf"), "-inf"])
+def test_invalid_adjustment_time_is_not_silently_dropped(value):
+    with pytest.raises(ValueError):
+        calculate_pair_report(bot_name="test", pair="BTC-USDT", rows=[], candles=candles(),
+            database_age_seconds=1, now=NOW, emergency_adjustments=[{"recorded_at": value}])

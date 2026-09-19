@@ -389,6 +389,15 @@ class DcaLiveSafetyTest(unittest.TestCase):
                 "ETH-USDT": {"buy_enabled": False},
             }}},
         }
+        from account_inventory import UnifiedInventoryLedger
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        guard.state_path = Path(directory.name) / "guard.json"
+        guard.inventory_ledger = UnifiedInventoryLedger(Path(directory.name) / "inventory")
+        guard.state["gate_aggregate"]["bots"] = {bot_name: {
+            "controller_applied": True, "controller_actual_buy_enabled": False,
+            "controller_actual_sell_enabled": False,
+        }}
         guard.auto_reentry_enabled = True
         guard.quote_budget_buffer_pct = Decimal("0.002")
         guard.quote_balance_cache_seconds = 30
@@ -421,7 +430,7 @@ class DcaLiveSafetyTest(unittest.TestCase):
         self.assertFalse(recovery["reentry_allowed"])
         self.assertEqual("insufficient_quote_budget", recovery["reentry_block_reason"])
         self.assertEqual([], guard.emergency_exchange.orders)
-        self.assertEqual("recoverable_reentry_capital_wait", audits[-1][0])
+        self.assertEqual("recoverable_reentry_wait", audits[-1][0])
 
     def test_recoverable_exit_is_capped_by_deployment_owned_base(self):
         with tempfile.TemporaryDirectory() as directory:

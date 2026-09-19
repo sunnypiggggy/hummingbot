@@ -184,6 +184,10 @@ class ScenarioHandler(BaseHTTPRequestHandler):
             if not self._signed():
                 return
             key = (params.get("symbol"), params.get("origClientOrderId"))
+            if params.get("orderId"):
+                key = next((k for k, v in self.state.orders.items()
+                            if k[0] == params.get("symbol")
+                            and str(v["orderId"]) == params["orderId"]), key)
             misses = int(self.state.order_visibility_misses.get(key, 0))
             if misses > 0:
                 self.state.order_visibility_misses[key] = misses - 1
@@ -283,6 +287,12 @@ class ScenarioHandler(BaseHTTPRequestHandler):
                     self.state.balances[base]["free"] -= executed
                     self.state.balances.setdefault(quote_asset, {"free": _d(0), "locked": _d(0)})
                     self.state.balances[quote_asset]["free"] += quote
+                elif params["side"] == "BUY":
+                    if self.state.balances[quote_asset]["free"] < quote:
+                        return self._json(400, {"code": -2010, "msg": "insufficient balance"})
+                    self.state.balances[quote_asset]["free"] -= quote
+                    self.state.balances.setdefault(base, {"free": _d(0), "locked": _d(0)})
+                    self.state.balances[base]["free"] += executed
                 self.state.next_order_id += 1
                 order_id = self.state.next_order_id
                 commission = _d(fault.get("commission", "0"))
@@ -291,6 +301,7 @@ class ScenarioHandler(BaseHTTPRequestHandler):
                     self.state.balances.setdefault(commission_asset, {"free": _d(0), "locked": _d(0)})
                     self.state.balances[commission_asset]["free"] -= commission
                 trade = {
+                    "id": order_id,
                     "symbol": symbol, "orderId": order_id, "price": str(price),
                     "qty": str(executed), "commission": str(commission),
                     "commissionAsset": commission_asset,
@@ -298,6 +309,7 @@ class ScenarioHandler(BaseHTTPRequestHandler):
                 }
                 self.state.trades.append(trade)
                 order = {
+                    "side": params["side"],
                     "symbol": symbol, "orderId": order_id,
                     "clientOrderId": client_id,
                     "status": fault.get("status", "FILLED"),
@@ -305,6 +317,7 @@ class ScenarioHandler(BaseHTTPRequestHandler):
                     "cummulativeQuoteQty": str(quote),
                     "transactTime": int(time.time() * 1000),
                     "fills": [{
+                        "tradeId": order_id,
                         "price": str(price), "qty": str(executed),
                         "commission": str(commission),
                         "commissionAsset": commission_asset,
