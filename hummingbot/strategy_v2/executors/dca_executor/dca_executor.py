@@ -58,6 +58,7 @@ class DCAExecutor(ExecutorBase):
         self._open_orders: List[TrackedOrder] = []
         self._close_orders: List[TrackedOrder] = []  # for now will be just one order but we can have multiple
         self._failed_orders: List[TrackedOrder] = []
+        self._management_level_orders = {}
         self._trailing_stop_trigger_pct: Optional[Decimal] = None
 
         # used to track the total amount filled that is updated by the event in case that the InFlightOrder is
@@ -325,7 +326,9 @@ class DCAExecutor(ExecutorBase):
                                     side=self.config.side, amount=amount, price=price,
                                     position_action=PositionAction.OPEN)
         if order_id:
-            self._open_orders.append(TrackedOrder(order_id=order_id))
+            tracked = TrackedOrder(order_id=order_id)
+            self._open_orders.append(tracked)
+            self._management_level_orders[order_id] = (level, tracked)
 
     def control_barriers(self):
         """
@@ -614,7 +617,13 @@ class DCAExecutor(ExecutorBase):
         self.update_tracked_orders_with_order_id(event.order_id)
 
     def get_custom_info(self) -> Dict:
+        try:
+            from scripts.management_trading_snapshot import dca_progress
+            management_progress = dca_progress(self)
+        except Exception:
+            management_progress = None
         return {
+            "management_progress": management_progress,
             "side": self.config.side,
             "current_position_average_price": self.current_position_average_price,
             "target_position_average_price": self.target_position_average_price,

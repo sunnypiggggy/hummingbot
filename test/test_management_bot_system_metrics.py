@@ -1,6 +1,8 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
+from types import SimpleNamespace
 
 from management_bot.system_metrics import HostSystemMetrics
 
@@ -39,6 +41,32 @@ class HostSystemMetricsTests(TestCase):
             self.assertEqual(0.2, metrics["load"]["five"])
             self.assertEqual(1024**3, metrics["memory"]["total_bytes"])
             self.assertEqual(90000.0, metrics["uptime_seconds"])
-            self.assertIn("root", metrics["disks"])
-            self.assertIn("extra", metrics["disks"])
-            self.assertEqual([], metrics["errors"])
+            self.assertEqual({}, metrics["disks"])
+            self.assertIn("同一文件系统", metrics["errors"][0])
+
+    def test_disk_percent_excludes_reserved_space_like_df(self):
+        with TemporaryDirectory() as raw, patch("shutil.disk_usage", return_value=SimpleNamespace(
+            total=100, used=30, free=60,
+        )):
+            self.assertAlmostEqual(100 / 3, HostSystemMetrics._disk(Path(raw))["used_pct"])
+
+    def test_guest_time_not_counted_twice(self):
+        with TemporaryDirectory() as raw:
+            path = Path(raw) / "stat"
+            path.write_text("cpu 100 20 30 40 5 6 7 8 50 10\ncpu0 1 2 3 4\n")
+            self.assertEqual((216, 45, 1), HostSystemMetrics._cpu_sample(path))
+
+    def test_contract_atomic_replacement_and_staleness(self):
+        import json
+        import os
+        import time
+        from management_bot.clients import ContractReader
+        with TemporaryDirectory() as raw:
+            path = Path(raw) / "contract.json"
+            path.write_text(json.dumps({"last_success_at": 1, "generated_at": 1}))
+            reader = ContractReader(path, path, path)
+            self.assertEqual(3, len(reader.snapshot()["errors"]))
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps({"last_success_at": time.time(), "generated_at": time.time()}))
+            os.replace(temp, path)
+            self.assertEqual([], reader.snapshot()["errors"])

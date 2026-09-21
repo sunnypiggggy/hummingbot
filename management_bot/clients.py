@@ -213,6 +213,18 @@ class ContractReader:
             result["sources"][name] = value
             if error:
                 result["errors"].append(error)
+            else:
+                stamp = value.get("generated_at") if name == "inventory" else value.get("last_success_at")
+                try:
+                    try:
+                        timestamp = float(stamp)
+                    except (TypeError, ValueError):
+                        timestamp = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+                    age = time.time() - timestamp
+                    if not -30 <= age <= 180:
+                        raise ValueError("stale")
+                except (TypeError, ValueError, OverflowError):
+                    result["errors"].append(f"{name}：时间缺失、过期或异常")
         return result
 
     @staticmethod

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -48,9 +49,9 @@ except ModuleNotFoundError:
     from live_guard.management_parameters import ManagementParameterPublisher
 
 try:
-    from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget, adjustment_timestamp_seconds
+    from dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget, adjustment_timestamp_seconds, base_fee_correction
 except ModuleNotFoundError:  # Repository import; container copies it to /app.
-    from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget, adjustment_timestamp_seconds
+    from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget, adjustment_timestamp_seconds, base_fee_correction
 
 
 BINANCE_API = OFFICIAL_BINANCE_API
@@ -171,7 +172,8 @@ def row_metrics(rows: Iterable[tuple[Any, ...]]) -> dict[str, Decimal]:
     trades = Decimal("0")
     buys = Decimal("0")
     sells = Decimal("0")
-    for side, raw_price, raw_amount, raw_fee, *_ in rows:
+    for row in rows:
+        side, raw_price, raw_amount, raw_fee, *_ = row
         price = decimal_value(raw_price)
         amount = decimal_value(raw_amount)
         fee = decimal_value(raw_fee)
@@ -186,6 +188,9 @@ def row_metrics(rows: Iterable[tuple[Any, ...]]) -> dict[str, Decimal]:
             sells += 1
         else:
             continue
+        base_fee, quote_rebate = base_fee_correction(row)
+        net_base -= base_fee
+        cashflow += quote_rebate
         fees += fee
         trades += 1
     return {
@@ -624,7 +629,7 @@ class DcaLiveReportCollector:
         connection.execute("PRAGMA busy_timeout=30000")
         try:
             return connection.execute(
-                "SELECT trade_type, price, amount, trade_fee_in_quote, timestamp "
+                "SELECT trade_type, price, amount, trade_fee_in_quote, timestamp, trade_fee, symbol "
                 "FROM TradeFill WHERE symbol = ? ORDER BY timestamp, rowid",
                 (pair,),
             ).fetchall()
@@ -1734,6 +1739,32 @@ class UnifiedTelegramReporting:
             json.dumps(status_contract, ensure_ascii=False, indent=2), encoding="utf-8",
         )
         os.replace(temporary, self.output / "trading_status.json")
+        # Directory-mounted exports follow atomic replacements; single-file bind
+        # mounts pin an obsolete inode. Preserve original source timestamps.
+        contract_dir = self.output / "guard_contracts"
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        for name, source in (
+            ("grid_guard_state.json", self.grid_state / "guard_state.json"),
+            ("dca_guard_state.json", self.dca_state / "guard_state.json"),
+            ("account_inventory_status.json", self.inventory_status_path),
+        ):
+            try:
+                value = json.loads(source.read_text(encoding="utf-8"))
+                if not isinstance(value, dict):
+                    raise ValueError("invalid contract")
+                temp = contract_dir / (name + ".tmp")
+                temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+                os.replace(temp, contract_dir / name)
+            except Exception:
+                logging.getLogger(__name__).warning("Management contract export unavailable: %s", name)
+        try:
+            try:
+                from management_trading import publish
+            except ModuleNotFoundError:
+                from live_guard.management_trading import publish
+            publish(self.bots_path, self.output, status_contract, now.timestamp())
+        except Exception:
+            logging.getLogger(__name__).warning("Read-only management trading summary unavailable")
         return robots
 
     def _queue_profit_report(self, robots: list[dict[str, Any]], slot: str,
@@ -1766,6 +1797,22 @@ class UnifiedTelegramReporting:
     def cycle(self, report: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
         robots = self.update_snapshots(report, now)
+        try:
+            if not hasattr(self, "simple_audit"):
+                try:
+                    from simple_audit import SimpleAudit
+                except ModuleNotFoundError:
+                    from live_guard.simple_audit import SimpleAudit
+                self.simple_audit = SimpleAudit(self.output)
+            self.simple_audit.cycle(
+                grid=self._load(self.grid_state / "guard_state.json"),
+                dca=self._load(self.dca_state / "guard_state.json"),
+                inventory=self._load(self.inventory_status_path),
+                history_connection=self.outbox.connection, api_base=binance_api_base(),
+                now=now.timestamp(),
+            )
+        except Exception:
+            logging.getLogger(__name__).warning("Read-only simple audit unavailable")
         current_errors = self._publish_current_runtime_errors(now)
         parameter_catalog = self.management_parameters.publish(
             [item["trading_status"] for item in robots], now=now,
@@ -1810,7 +1857,7 @@ def main() -> int:
     parser.add_argument(
         "--interval",
         type=int,
-        default=int(os.getenv("DCA_LIVE_REPORT_INTERVAL", "300")),
+        default=int(os.getenv("DCA_LIVE_REPORT_INTERVAL", "60")),
     )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--healthcheck", action="store_true")

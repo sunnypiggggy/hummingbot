@@ -361,6 +361,13 @@ class LivePortfolioGrid(StrategyV2Base):
         return self.connectors[self.config.exchange]
 
     def on_tick(self):
+        if getattr(self, "_is_stop_triggered", False):
+            return
+        try:
+            from scripts.management_trading_snapshot import publish_grid
+            publish_grid(self)
+        except Exception:
+            pass  # Optional read-only telemetry must never affect trading.
         # StrategyV2Base.on_stop() sets this flag before its asynchronous
         # executor cleanup. This custom on_tick must honor it explicitly;
         # otherwise the clock can recreate orders after shutdown cancellation

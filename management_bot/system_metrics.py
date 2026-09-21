@@ -40,7 +40,8 @@ class HostSystemMetrics:
             raise ValueError("host /proc/stat CPU row is incomplete")
         idle = values[3] + (values[4] if len(values) > 4 else 0)
         cores = sum(1 for line in lines[1:] if line.startswith("cpu") and line[3:4].isdigit())
-        return sum(values), idle, cores
+        # Linux guest counters are already included in user/nice.
+        return sum(values[:8]), idle, cores
 
     @staticmethod
     def _disk(path: Path) -> dict[str, Any]:
@@ -52,7 +53,8 @@ class HostSystemMetrics:
             "total_bytes": total,
             "used_bytes": used,
             "available_bytes": available,
-            "used_pct": used / total * 100 if total else 0.0,
+            "used_pct": used / (used + available) * 100 if used + available else 0.0,
+            "device": path.stat().st_dev,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -107,4 +109,8 @@ class HostSystemMetrics:
                 result.setdefault("disks", {})[name] = self._disk(path)
             except Exception as exc:
                 result["errors"].append(f"disk_{name}:{type(exc).__name__}")
+        disks = result.get("disks", {})
+        if len(disks) == 2 and disks["root"]["device"] == disks["extra"]["device"]:
+            result["errors"].append("两块磁盘挂载指向同一文件系统，请检查挂载配置")
+            result["disks"] = {}
         return result

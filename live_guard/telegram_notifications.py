@@ -598,7 +598,9 @@ def _format_inventory_impact(details: Mapping[str, Any]) -> str:
         running = bool(row.get("running"))
         states.append(f"{name}={phase}/{'运行中' if running else '未运行'}")
     state_text = "，".join(states) if states else "无可信运行状态"
-    if any(
+    if Decimal(str(details.get("ownership_deficit") or "0")) > 0:
+        effect = "库存归属核验未通过，禁止按此账本执行无归属清仓；ACTIVE仅表示恢复阶段，不代表全部交易门放行，实际权限须核对控制器"
+    elif any(
         isinstance(row, Mapping) and str(row.get("phase")) == "LATCHED"
         for row in robots.values()
     ):

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
+import json
 from decimal import Decimal
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
@@ -212,6 +213,32 @@ def extract_balances(payload: Any, account_name: str = ACCOUNT_NAME,
     return balances
 
 
+def base_fee_correction(row: Sequence[Any]) -> tuple[Decimal, Decimal]:
+    """Actual base fee and rebate of its legacy quote expense (not new cash).
+
+    Extended TradeFill rows append trade_fee JSON and symbol after timestamp.
+    Legacy rows retain their original accounting; never infer a fee asset.
+    """
+    if len(row) < 7:
+        return Decimal("0"), Decimal("0")
+    payload = json.loads(row[5]) if isinstance(row[5], str) else row[5]
+    if not isinstance(payload, Mapping):
+        raise ValueError("TradeFill fee evidence is unavailable")
+    if Decimal(str(payload.get("percent", "0"))) != 0:
+        raise ValueError("Unresolved percentage fee cannot establish inventory")
+    base = str(row[6]).split("-")[0]
+    entries = payload.get("flat_fees", [])
+    amounts = [(str(f["token"]), Decimal(str(f["amount"]))) for f in entries]
+    if any(not a.is_finite() or a < 0 for _, a in amounts):
+        raise ValueError("Invalid TradeFill fee amount")
+    quantity = sum((a for token, a in amounts if token == base), Decimal("0"))
+    rebate = quantity * Decimal(row[1]) / Decimal("1000000")
+    if quantity and all(token == base for token, a in amounts if a):
+        # TradeFill's display valuation is rounded to micro quote units.
+        rebate = Decimal(row[3] or 0) / Decimal("1000000")
+    return quantity, rebate
+
+
 def trade_pnl_from_rows(
     rows: Iterable[Sequence[Any]], mark_price: Decimal, *,
     managed_base: Decimal = Decimal("0"),
@@ -229,7 +256,8 @@ def trade_pnl_from_rows(
     fees = Decimal("0")
     trades = 0
     scale = Decimal("1000000")
-    for trade_type, raw_price, raw_amount, raw_fee, *_ in rows:
+    for row in rows:
+        trade_type, raw_price, raw_amount, raw_fee, *_ = row
         price = Decimal(raw_price) / scale
         amount = Decimal(raw_amount) / scale
         fee = Decimal(raw_fee or 0) / scale
@@ -242,6 +270,9 @@ def trade_pnl_from_rows(
             net_base -= amount
         else:
             continue
+        base_fee, quote_rebate = base_fee_correction(row)
+        net_base -= base_fee
+        quote_cashflow += quote_rebate
         fees += fee
         trades += 1
     owned_base = managed_base + net_base

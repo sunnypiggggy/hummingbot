@@ -1222,6 +1222,17 @@ class Guard(DcaReentryMixin):
             pair: len(self.emergency_exchange.open_orders(pair)) for pair in pairs
         }
         balances = self.emergency_exchange.account_balances()
+        # Optional presentation telemetry; no extra query and no risk-state writes.
+        try:
+            try:
+                from simple_audit import balance_snapshot
+            except ModuleNotFoundError:
+                from live_guard.simple_audit import balance_snapshot
+            self.state["simple_audit_balance"] = balance_snapshot(
+                balances, self.inventory_account_fingerprint, time.time(),
+            )
+        except Exception:
+            LOG.warning("Simple audit balance snapshot unavailable")
         self.state["quote_balance_source"] = {
             "free_quote": str(balances.get("USDT", {}).get("free", Decimal("0"))),
             "observed_at": time.time(), "source": "account_reconciliation",
@@ -1623,7 +1634,7 @@ class Guard(DcaReentryMixin):
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10)
         try:
             return connection.execute(
-                "SELECT trade_type, price, amount, trade_fee_in_quote, timestamp "
+                "SELECT trade_type, price, amount, trade_fee_in_quote, timestamp, trade_fee, symbol "
                 "FROM TradeFill WHERE symbol = ? ORDER BY timestamp, rowid",
                 (pair,),
             ).fetchall()

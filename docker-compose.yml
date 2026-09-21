@@ -496,9 +496,9 @@ services:
       STOCKS_LIVE_TELEGRAM_TRADING_ENABLED: "${STOCKS_LIVE_TELEGRAM_TRADING_ENABLED:-false}"
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
       STOCKS_API_URL: http://binance-stocks-runtime:8000
-      GRID_GUARD_CONTRACT_PATH: /contracts/grid_guard_state.json
-      DCA_GUARD_CONTRACT_PATH: /contracts/dca_guard_state.json
-      INVENTORY_CONTRACT_PATH: /contracts/account_inventory_status.json
+      GRID_GUARD_CONTRACT_PATH: /reports/guard_contracts/grid_guard_state.json
+      DCA_GUARD_CONTRACT_PATH: /reports/guard_contracts/dca_guard_state.json
+      INVENTORY_CONTRACT_PATH: /reports/guard_contracts/account_inventory_status.json
       TRADING_STATUS_PATH: /reports/trading_status.json
       PROFIT_SNAPSHOT_DB_PATH: /reports/telegram_outbox.sqlite
       CURRENT_RUNTIME_ERRORS_PATH: /reports/current_runtime_errors.json
@@ -517,9 +517,6 @@ services:
       MODEL_APPROVAL_DECISION_ROOT: /approvals/decisions
     volumes:
       - ./telegram-management-data:/state
-      - ./grid-live-fdusd-data/guard_state.json:/contracts/grid_guard_state.json:ro
-      - ./dca-live-data/guard_state.json:/contracts/dca_guard_state.json:ro
-      - ./account-inventory-data/account_inventory_status.json:/contracts/account_inventory_status.json:ro
       - ./results/ethbtc_forced_exit_weekly/approval_public:/approvals/weekly:ro
       - ./dca-live-data/telegram:/approvals/evidence:ro
       - ./dca-live-data/telegram:/reports:ro
@@ -528,7 +525,7 @@ services:
       - ${HOST_PROC_MEMINFO_SOURCE:-/proc/meminfo}:/host-metrics/proc/meminfo:ro
       - ${HOST_PROC_LOADAVG_SOURCE:-/proc/loadavg}:/host-metrics/proc/loadavg:ro
       - ${HOST_PROC_UPTIME_SOURCE:-/proc/uptime}:/host-metrics/proc/uptime:ro
-      - ${HOST_ROOT_DISK_ANCHOR:-./host-metrics/root-disk}:/host-metrics/root-disk:ro
+      - ${HOST_ROOT_DISK_ANCHOR:-/var/lib/hummingbot-host-metrics/root-disk}:/host-metrics/root-disk:ro
       - ${HOST_EXTRA_DISK_ANCHOR:-./host-metrics/extra-disk}:/host-metrics/extra-disk:ro
     secrets:
       - telegram_management_bot_token

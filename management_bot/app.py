@@ -22,6 +22,8 @@ from management_bot.telegram_api import TelegramAPI, TelegramError
 from management_bot.risk_display import render_risk
 from management_bot.risk_display import RichText
 from management_bot import scheduled_display
+from management_bot import trading_view
+from management_bot import simple_audit_view
 from html import escape
 
 
@@ -36,11 +38,12 @@ HOME_ROWS = [
     [("📈 Stock", "m:stock"), ("🛡 风控状态", "m:risk")],
     [("🧠 模型审批", "m:approvals"), ("⚠️ 当前异常", "m:errors")],
     [("⚙️ 模型与参数", "m:models"), ("🔧 系统维护", "m:maintenance")],
+    [("🔎 简单稽核", "m:simple_audit")],
 ]
 
 BOT_COMMANDS = [
     {"command": "start", "description": "打开管理主菜单"},
-    {"command": "status", "description": "查看系统与交易状态"},
+    {"command": "status", "description": "查看OCI主机资源状态"},
     {"command": "profit", "description": "查看 Grid / DCA / Stock 盈亏"},
 ]
 
@@ -237,26 +240,9 @@ class TradingManagementBot:
         return f"• {name}：{chinese}"
 
     def _overview(self) -> str:
-        lines = ["📊 系统总览", ""]
-        try:
-            bots = self._api_bots()
-            wanted = {v["bot_name"] for v in self.settings.bots.values()}
-            for name in sorted(wanted):
-                lines.append(self._bot_line(name, bots.get(name, {})))
-        except Exception as exc:
-            lines.append(f"• Grid/DCA运行状态：不可用（{type(exc).__name__}）")
-        try:
-            stock = self.stocks.health()
-            stock_ok = stock.get("status") == "healthy"
-            lines.append(f"• Stock Runtime：{'健康' if stock_ok else '降级'} / {stock.get('runtime_mode', '-')}")
-        except Exception as exc:
-            lines.append(f"• Stock Runtime：不可用（{type(exc).__name__}）")
-        try:
-            contracts = self.contracts.snapshot()
-            lines.append(f"• 风控合同：{'正常' if not contracts['errors'] else '存在缺失'}")
-        except Exception as exc:
-            lines.append(f"• 风控合同：不可用（{type(exc).__name__}）")
-        lines.extend(("", "🖥 OCI宿主机资源"))
+        lines = ["📊 系统总览 · OCI主机", "",
+                 datetime.now(BEIJING_TZ).strftime("查询时间：%Y-%m-%d %H:%M:%S（北京时间）"),
+                 "", "🖥 OCI宿主机资源"]
         try:
             metrics = self.system_metrics.snapshot()
         except Exception as exc:
@@ -881,6 +867,9 @@ class TradingManagementBot:
         return self._models()
 
     def _bot_menu(self, key: str) -> tuple[str, list[list[tuple[str, str]]]]:
+        return trading_view.page(self.settings.reports_root, 'grid' if key=='grid' else 'dca', reason_cn=_reason_cn)
+
+    def _maintenance_menu(self, key: str) -> tuple[str, list[list[tuple[str, str]]]]:
         definition = self.settings.bots[key]
         name = definition["bot_name"]
         try:
@@ -889,18 +878,14 @@ class TradingManagementBot:
         except Exception as exc:
             status = f"{name}：数据不可用（{type(exc).__name__}）"
         rows = [
-            [("⏸ 停止并撤单", f"b:{key}:stop"), ("▶️ 恢复", f"b:{key}:start")],
-            [("🔄 安全重启", f"b:{key}:restart"), ("刷新", f"b:{key}:view")],
-            [("🏠 主菜单", "m:home")],
+            [("⏸ 停止并撤单", f"mt:{key}:stop"), ("▶️ 恢复", f"mt:{key}:start")],
+            [("🔄 安全重启", f"mt:{key}:restart"), ("刷新", f"m:maint:{key}")],
+            [("返回系统维护", "m:maintenance"), ("🏠 主菜单", "m:home")],
         ]
         return f"🤖 机器人管理\n\n{status}\n\n变更前会再次预检并要求确认。", rows
 
     def _dca_menu(self) -> tuple[str, list[list[tuple[str, str]]]]:
-        rows = [
-            [("BTC-USDT", "m:bot:dca_btc"), ("ETH-USDT", "m:bot:dca_eth")],
-            [("🏠 主菜单", "m:home")],
-        ]
-        return "🟩 DCA\n\n请选择机器人：", rows
+        return trading_view.page(self.settings.reports_root, 'dca', reason_cn=_reason_cn)
 
     def _stock_menu(self) -> tuple[str, list[list[tuple[str, str]]]]:
         health: dict[str, Any] = {}
@@ -1903,25 +1888,31 @@ class TradingManagementBot:
     def _maintenance_action(self, key: str, action: str) -> tuple[str, list]:
         definition = self.settings.bots[key]
         if action == "view":
-            return self._bot_menu(key)
+            return self._maintenance_menu(key)
         if action in {"stop", "start", "restart"}:
             allowed, reason = ContractReader.resume_allowed(
                 "grid" if key == "grid" else "dca", self.contracts.snapshot()
             )
             if action in {"start", "restart"} and not allowed:
-                return f"⛔ 当前不能恢复/重启交易\n原因：{reason}", self._back(f"m:bot:{key}")
+                return f"⛔ 当前不能恢复/重启交易\n原因：{reason}", self._back(f"m:maint:{key}")
             label = {"stop": "停止并撤单", "start": "恢复交易", "restart": "安全重启"}[action]
             return (
                 f"确认{label} {definition['bot_name']}？\n风控预检：{reason}",
-                [[("确认执行", f"c:{key}:{action}"), ("取消", f"m:bot:{key}")]],
+                [[("确认执行", f"c:{key}:{action}"), ("取消", f"m:maint:{key}")]],
             )
         raise ValueError("未知机器人动作")
 
-    def _confirm_maintenance(self, key: str, action: str) -> tuple[str, list]:
+    def _confirm_maintenance(self, key: str, action: str, *, request_id: str) -> tuple[str, list]:
+        if action not in {"stop","start","restart"}:
+            raise ValueError("未知维护动作")
+        if action in {"start","restart"}:
+            allowed, reason = ContractReader.resume_allowed("grid" if key=="grid" else "dca", self.contracts.snapshot())
+            if not allowed:
+                return "⛔ 当前风控阻止恢复／重启："+reason, self._back("m:maintenance")
         if not self.settings.mutations_enabled:
-            return "🔒 机器人维护操作当前未启用，未执行任何变更。", self._back(f"m:bot:{key}")
+            return "🔒 机器人维护操作当前未启用，未执行任何变更。", self._back(f"m:maint:{key}")
         definition = self.settings.bots[key]
-        idempotency = f"bot:{definition['bot_name']}:{action}:{int(time.time()) // 30}"
+        idempotency = f"bot-maintenance:{request_id}:{definition['bot_name']}:{action}"
         claimed, existing = self.store.claim_action(idempotency)
         if claimed:
             try:
@@ -1937,7 +1928,7 @@ class TradingManagementBot:
                 raise
         else:
             result = existing or {}
-        return f"✅ 操作已执行\n机器人：{definition['bot_name']}\n结果：{_safe_text(result)}", self._back(f"m:bot:{key}")
+        return f"维护请求结果\n机器人：{definition['bot_name']}\n结果：{_safe_text(result)}", self._back(f"m:maint:{key}")
 
     def _handle_callback(self, update_id: int, callback: dict) -> None:
         user_id = int(callback.get("from", {}).get("id", 0))
@@ -1960,6 +1951,17 @@ class TradingManagementBot:
                 self.store.clear_sessions(user_id, chat_id)
             if data in {"m:home", "m:overview", "m:profit"}:
                 text, rows = self._command_route(data)
+            elif data == "m:simple_audit":
+                text, rows = simple_audit_view.page(self.settings.reports_root)
+            elif data in {"sa:account", "sa:robots"}:
+                try:
+                    path = simple_audit_view.chart(self.settings.reports_root, data.split(":")[1])
+                    self.telegram.send_file(chat_id, str(path), caption="")
+                    text, rows = simple_audit_view.page(self.settings.reports_root)
+                except Exception:
+                    text, rows = "图片尚未生成、校验失败或发送失败，请稍后重试。", simple_audit_view.ROWS
+            elif data == "m:audit" or data.startswith("au:"):
+                text, rows = "账户稽核功能已撤回；交易和原有收益报告不受影响。", self._back("m:home")
             elif data == "m:risk":
                 text, rows = self._risk(), self._risk_rows()
             elif data.startswith("r:"):
@@ -1988,15 +1990,31 @@ class TradingManagementBot:
             elif data == "m:dca":
                 text, rows = self._dca_menu()
             elif data == "m:maintenance":
-                text, rows = "🔧 系统维护\n\n所有变更都需二次确认；恢复不会绕过风控门。", [[("Grid", "m:bot:grid"), ("DCA", "m:dca")], [("🏠 主菜单", "m:home")]]
+                text, rows = "🔧 系统维护\n\n所有变更都需二次确认；恢复不会绕过风控门。", [[("Grid", "m:maint:grid")],[("DCA BTC", "m:maint:dca_btc"),("DCA ETH", "m:maint:dca_eth")], [("🏠 主菜单", "m:home")]]
+            elif data.startswith("m:maint:"):
+                text, rows = self._maintenance_menu(data.split(":",2)[2])
             elif data.startswith("m:bot:"):
                 text, rows = self._bot_menu(data.split(":", 2)[2])
-            elif data.startswith("b:"):
-                _, key, action = data.split(":", 2)
-                text, rows = self._maintenance_action(key, action)
-            elif data.startswith("c:"):
-                _, key, action = data.split(":", 2)
-                text, rows = self._confirm_maintenance(key, action)
+            elif data.startswith("tv:"):
+                _,strategy,index=data.split(":")
+                text,rows=trading_view.page(self.settings.reports_root,strategy,int(index),reason_cn=_reason_cn)
+            elif data.startswith(("b:","c:")):
+                text,rows="旧控制按钮已停用；请进入系统维护重新选择并确认。",self._back("m:maintenance")
+            elif data.startswith("mt:"):
+                _,key,action=data.split(":")
+                text,rows=self._maintenance_action(key,action)
+                if any(callback.startswith('c:') for row in rows for _,callback in row):
+                    self.store.clear_sessions(user_id,chat_id)
+                    session=self.store.create_session(user_id,chat_id,'maintenance',message_id)
+                    self.store.update_session(session['session_id'],step='confirm',payload={'key':key,'action':action})
+                    rows=[[("确认执行",'mc:'+session['session_id']),("取消",'m:maintenance')]]
+            elif data.startswith("mc:"):
+                session=self.store.get_session(data.split(":",1)[1])
+                if not session or session['flow']!='maintenance' or session['step']!='confirm' or session['user_id']!=user_id or session['chat_id']!=chat_id or session['message_id']!=message_id:
+                    text,rows="维护确认已失效，请从系统维护重新发起。",self._back("m:maintenance")
+                else:
+                    self.store.update_session(session['session_id'],step='consumed')
+                    text,rows=self._confirm_maintenance(session['payload']['key'],session['payload']['action'],request_id=session['session_id'])
             elif data == "s:new:order":
                 text, rows = self._new_stock_session("stock_order", user_id, chat_id, message_id)
             elif data == "s:new:position":

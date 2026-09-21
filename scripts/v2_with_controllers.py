@@ -40,6 +40,11 @@ class V2WithControllers(StrategyV2Base):
 
     def on_tick(self):
         super().on_tick()
+        try:
+            from scripts.management_trading_snapshot import publish_dca
+            publish_dca(self)
+        except Exception:
+            pass  # Optional read-only telemetry must never affect trading.
         if not self._is_stop_triggered:
             self.check_manual_kill_switch()
             self.control_max_drawdown()

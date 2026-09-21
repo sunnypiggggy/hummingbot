@@ -523,7 +523,7 @@ class TelegramFlowTests(TestCase):
         guard = root / "guard.json"
         guard.write_text(json.dumps({"last_success_at": time.time(), "phase": "ACTIVE"}), encoding="utf-8")
         inventory = root / "inventory.json"
-        inventory.write_text(json.dumps({"healthy": True}), encoding="utf-8")
+        inventory.write_text(json.dumps({"healthy": True, "generated_at": time.time()}), encoding="utf-8")
         settings = Settings(
             token_file=token,
             admin_user_id=7,
@@ -878,6 +878,25 @@ class TelegramFlowTests(TestCase):
             self.assertIn("数据盘 extra_drive：80.0/100.0 GiB （80.0%）", text)
             self.assertIn("宿主机运行：1天1小时", text)
             bot.store.close()
+
+    def test_overview_is_host_only_without_trading_dependencies(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            try:
+                bot.system_metrics = FakeSystemMetrics()
+                bot.hummingbot = Mock()
+                bot.stocks = Mock()
+                bot.reports = Mock()
+                bot.contracts = Mock()
+                text = bot._overview()
+                for forbidden in ("Grid", "DCA", "Stock", "机器人", "风控", "交易"):
+                    self.assertNotIn(forbidden, text)
+                self.assertIn("查询时间", text)
+                for client in (bot.hummingbot, bot.stocks, bot.reports, bot.contracts):
+                    self.assertEqual([], client.mock_calls)
+            finally:
+                bot.store.close()
 
     def test_stock_paper_profit_positions_and_trades_are_clear(self):
         with tempfile.TemporaryDirectory() as raw:
