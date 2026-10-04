@@ -951,6 +951,25 @@ class TelegramFlowTests(TestCase):
         self.assertNotIn("滚动历史", line)
         self.assertNotIn("当前错误", line)
 
+    def test_current_grid_execution_failure_is_not_a_nonblocking_reminder(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw))
+            bot.reports = FakeReports()
+            bot.hummingbot = FakeHummingbot()
+            bot.reports.current_errors = lambda: {"errors": [{
+                "component": "grid_order_execution:ETH-FDUSD", "pair": "ETH-FDUSD",
+                "summary": "网格重建未完成", "first_seen_at": time.time() - 70,
+                "residual_orders": [{"side": "SELL", "price": "2828.68",
+                                     "origQty": "0.0104", "executedQty": "0.003"}],
+            }]}
+            text = bot._errors()
+            self.assertIn("交易阻塞：", text)
+            self.assertIn("正常交易 3/4", text)
+            self.assertIn("2828.68", text)
+            self.assertIn("0.0074", text)
+            self.assertIn("解除条件", text)
+            bot.store.close()
+
     def test_fixed_commands_map_to_the_same_inline_pages(self):
         with tempfile.TemporaryDirectory() as raw:
             bot = self._bot(Path(raw))

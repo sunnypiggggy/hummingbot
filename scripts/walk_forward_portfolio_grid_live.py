@@ -8,6 +8,7 @@ reserved quote and base inventory.
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 import hashlib
 import json
 import logging
@@ -95,6 +96,10 @@ class ParameterBuildError(ValueError):
     def __init__(self, pair: str, reason: str):
         super().__init__(f"{pair}: {reason}")
         self.pair = pair
+
+
+class OrderReconciliationPending(ParameterBuildError):
+    """Execution evidence is pending, not a rejected parameter/model candidate."""
 
 
 class LivePortfolioGridConfig(StrategyV2ConfigBase):
@@ -399,7 +404,9 @@ class LivePortfolioGrid(StrategyV2Base):
                 raise RuntimeError("A live reference price is unavailable.")
             self.last_market_success = self.current_timestamp
             self._control_risk(prices)
-            active = self.get_active_orders(self.config.exchange)
+            active = self._reconcile_order_ownership(
+                self.get_active_orders(self.config.exchange),
+            )
             # The selection is one atomic BTC/ETH contract.  Commit it before
             # evaluating runtime gates so Risk-Off/FOMC/cooldown can delay only
             # ordinary order creation, never the parameter state itself.
@@ -490,9 +497,12 @@ class LivePortfolioGrid(StrategyV2Base):
                 self.first_cycle_failure_at = None
                 return
             if self._owned_active_orders(active):
-                self.cancel_owned_orders()
+                for pair in self.config.trading_pairs:
+                    if self._pair_owned_active_orders(pair, active):
+                        self._request_pair_order_refresh(pair, reason="scheduled_order_refresh")
+                self._advance_pair_order_refreshes(prices, active)
                 self.awaiting_cancellation = True
-                self.next_refresh = self.current_timestamp + 5
+                self.next_refresh = self.current_timestamp + self.config.order_refresh_time
             else:
                 # Cancellation callbacks can be lost across a fast parameter
                 # cutover or process restart even though the connector has
@@ -509,6 +519,9 @@ class LivePortfolioGrid(StrategyV2Base):
             self.next_risk_persist = self.current_timestamp + self.config.risk_state_persist_seconds
             self.first_cycle_failure_at = None
         except Exception as exc:
+            if isinstance(exc, OrderReconciliationPending):
+                self._wait_for_order_reconciliation(exc.pair, str(exc))
+                return
             self.logger().error("Live grid cycle failed: %s", exc)
             if isinstance(exc, ParameterBuildError):
                 self.parameter_blocked_pairs[exc.pair] = str(exc)
@@ -1369,6 +1382,18 @@ class LivePortfolioGrid(StrategyV2Base):
             minimum_amount=minimum_amount,
         )
 
+    def _wait_for_order_reconciliation(self, pair: str, reason: str) -> None:
+        """Preserve the grid and cancel cursor while waiting for exchange proof."""
+        status = self._order_status(pair)
+        now = float(self.current_timestamp)
+        if status.get("refresh_requested_at") is None:
+            status["refresh_requested_at"] = now
+        if now - float(status["refresh_requested_at"]) >= PAIR_REFRESH_WARNING_SECONDS:
+            self._record_order_build_failure(pair, reason)
+        # A prolonged wait is reported as an execution fault, but retries must
+        # stay on this asynchronous path without resetting the cancel cursor.
+        status.update(state="REBUILDING", reason=reason)
+
     def _record_order_build_failure(self, pair: str, reason: str) -> None:
         status = self._order_status(pair)
         now = float(self.current_timestamp)
@@ -1454,6 +1479,7 @@ class LivePortfolioGrid(StrategyV2Base):
         )
 
     def _pair_owned_active_orders(self, pair: str, active_orders: list) -> list:
+        active_orders = self._reconcile_order_ownership(active_orders)
         owned = self._owned_order_ids()
         return [
             order for order in active_orders
@@ -1475,14 +1501,16 @@ class LivePortfolioGrid(StrategyV2Base):
         }:
             return
         now = float(self.current_timestamp)
+        retrying = status.get("state") in {"MISSING", "RETRYING", "RESTRICTED"} and status.get("refresh_requested_at") is not None
+        requested_at = status.get("refresh_requested_at") if retrying else None
         status.update({
             "state": "REFRESH_REQUESTED",
             "reason": reason,
             "refresh_reason": reason,
-            "refresh_requested_at": now,
+            "refresh_requested_at": requested_at if requested_at is not None else now,
             "cancel_started_at": None,
-            "last_cancel_attempt_at": None,
-            "refresh_generation": int(status.get("refresh_generation", 0)) + 1,
+            "last_cancel_attempt_at": status.get("last_cancel_attempt_at") if retrying else None,
+            "refresh_generation": int(status.get("refresh_generation", 0)) + (0 if retrying else 1),
             "refresh_warning_notified": False,
             "refresh_restricted_notified": False,
             "consecutive_empty_cycles": 0,
@@ -1545,6 +1573,8 @@ class LivePortfolioGrid(StrategyV2Base):
                 status["state"] = "REBUILDING"
                 phase = "REBUILDING"
             if phase == "REBUILDING":
+                if now < float(status.get("next_retry_at") or 0):
+                    return True
                 if self._pair_owned_active_orders(pair, active_orders):
                     status["state"] = "CANCEL_PENDING"
                     return True
@@ -1552,9 +1582,13 @@ class LivePortfolioGrid(StrategyV2Base):
                     self._place_pair_grid(
                         pair, prices[pair], self._available_balance(self.config.quote_asset),
                     )
+                except OrderReconciliationPending as exc:
+                    self._wait_for_order_reconciliation(pair, str(exc))
+                    return True
                 except ParameterBuildError as exc:
                     self._record_order_build_failure(pair, str(exc))
                     return True
+                self.parameter_blocked_pairs.pop(pair, None)
                 self._order_status(pair).update({
                     "refresh_reason": None,
                     "refresh_requested_at": None,
@@ -1658,6 +1692,8 @@ class LivePortfolioGrid(StrategyV2Base):
                         reason="pair_parameter_order_build_recovered",
                         previous_reason=previous_reason,
                     )
+            except OrderReconciliationPending as exc:
+                self._wait_for_order_reconciliation(pair, str(exc))
             except ParameterBuildError as exc:
                 reason = str(exc)
                 self._record_order_build_failure(pair, reason)
@@ -1678,6 +1714,7 @@ class LivePortfolioGrid(StrategyV2Base):
         ledger = self.ledgers[pair]
         if ledger.halted:
             return remaining_quote
+        self._require_exchange_pair_empty(pair)
         existing = [
             order for order in self._strategy_pair_active_orders()
             if str(getattr(order, "trading_pair", "")) == pair
@@ -1869,14 +1906,114 @@ class LivePortfolioGrid(StrategyV2Base):
                 by_id[order_id] = order
         return list(by_id.values())
 
+    def _reconcile_order_ownership(self, active_orders: list) -> list:
+        """Recover lost IDs from this strategy's durable Order records, never a prefix.
+
+        Adoption repairs tracking only: partial fills remain the responsibility
+        of the connector/TradeFill stream and are not booked a second time.
+        Unproven and protective orders remain visible and block overlapping grids.
+        """
+        orders = self._strategy_pair_active_orders(active_orders)
+        special = (set(getattr(self, "flatten_order_ids", {}).values())
+                   | set(getattr(self, "reentry_order_ids", {}).values())
+                   | set(getattr(self, "inventory_exit_order_ids", {}).values()))
+        unknown = [order for order in orders
+                   if str(order.client_order_id) not in self._owned_order_ids() | special]
+        database = self._runtime_database() if unknown else None
+        if database is None:
+            return orders
+        try:
+            with closing(sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True, timeout=1)) as conn:
+                for order in unknown:
+                    order_id, pair = str(order.client_order_id), str(order.trading_pair)
+                    row = conn.execute(
+                        'SELECT config_file_path, strategy, market, symbol, order_type, '
+                        'last_status, exchange_order_id FROM "Order" WHERE id=?', (order_id,),
+                    ).fetchone()
+                    if not row:
+                        continue
+                    config, strategy, market, symbol, kind, status, exchange_id = row
+                    if (Path(str(config)).name != database.with_suffix('.yml').name
+                            or str(strategy) != "walk_forward_portfolio_grid_live"
+                            or str(market) != self.config.exchange or str(symbol) != pair
+                            or str(kind) != "LIMIT_MAKER"):
+                        continue
+                    # A terminal database row conflicting with an active connector
+                    # order needs reconciliation, not silent deletion or adoption.
+                    if any(token in str(status) for token in ("Completed", "Cancelled", "Failure")):
+                        continue
+                    is_buy = getattr(order, "is_buy", None)
+                    if is_buy is None:
+                        if str(status) == "BuyOrderCreated":
+                            is_buy = True
+                        elif str(status) == "SellOrderCreated":
+                            is_buy = False
+                        else:
+                            continue
+                    if (str(status) == "BuyOrderCreated" and not is_buy) or (
+                        str(status) == "SellOrderCreated" and is_buy
+                    ):
+                        continue
+                    tracked = (getattr(self.connector, "in_flight_orders", {}) or {}).get(order_id)
+                    actual_id = getattr(tracked, "exchange_order_id", None)
+                    if actual_id is not None and str(actual_id) != str(exchange_id):
+                        continue
+                    self.ledgers[pair].open_order_ids.add(order_id)
+                    self._order_status(pair).pop("reconciliation_error", None)
+                    (self.buy_order_ids if is_buy else self.sell_order_ids).add(order_id)
+                    self._record_runtime_event(
+                        "grid_order_tracking_restored", pair=pair, order_id=order_id,
+                        exchange_order_id=str(exchange_id), source="strategy_order_database",
+                    )
+        except (OSError, sqlite3.Error) as exc:
+            # Keep the order visible; it must still block a new generation.
+            for order in unknown:
+                self._order_status(str(order.trading_pair))["reconciliation_error"] = str(exc)
+        return orders
+
+    def _require_exchange_pair_empty(self, pair: str) -> None:
+        try:
+            self._verify_exchange_pair_empty(pair)
+        except ParameterBuildError as exc:
+            raise OrderReconciliationPending(
+                pair, str(exc).removeprefix(f"{pair}: "),
+            ) from exc
+
+    def _verify_exchange_pair_empty(self, pair: str) -> None:
+        configured = str(getattr(self.config, "runtime_state_file", "") or "")
+        if not configured:
+            return  # In-memory fixtures have no Guard contract; production always does.
+        path = Path(configured).parent / "grid_exchange_order_snapshot.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            row = payload["pairs"][pair]
+            sampled_at = float(row["sampled_at"])
+            age = float(self.current_timestamp) - sampled_at
+            if payload.get("schema") != "grid-exchange-orders-v1" or not payload.get("account_fingerprint"):
+                raise ValueError("unbound exchange order evidence")
+            if age < -5 or age > 30:
+                raise ValueError("exchange order evidence is stale")
+            if sampled_at < float(self._order_status(pair).get("last_cancel_attempt_at") or 0):
+                raise ValueError("awaiting exchange verification after cancellation")
+            orders = row["orders"]
+            if not isinstance(orders, list):
+                raise ValueError("invalid exchange order evidence")
+            self._order_status(pair)["exchange_open_orders"] = orders
+            if orders:
+                raise ValueError(f"exchange still has {len(orders)} active orders")
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ParameterBuildError(pair, f"订单核对未完成: {exc}") from exc
+
     def cancel_strategy_pair_orders(self, active_orders: list | None = None) -> int:
         # BTC/ETH-FDUSD are reserved exclusively for this Grid strategy.  This
         # intentionally includes connector-restored orders absent from the
         # latest runtime-state write (for example, an abrupt kill mid-tick).
-        orders = self._strategy_pair_active_orders(active_orders)
+        orders = self._reconcile_order_ownership(active_orders)
         attempts = getattr(self, "shutdown_cancel_attempts", {})
         now = self.current_timestamp
         for order in orders:
+            if str(order.client_order_id) not in self._owned_order_ids():
+                continue
             last_attempt = attempts.get(order.client_order_id)
             if last_attempt is not None and now - float(last_attempt) < 5:
                 continue
@@ -1897,7 +2034,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 "startup_order_reconciliation_started",
                 wait_seconds=self.config.startup_order_reconcile_seconds,
             )
-        orders = self._strategy_pair_active_orders(active_orders)
+        orders = self._reconcile_order_ownership(active_orders)
         if orders:
             self.startup_reconcile_quiet_cycles = 0
             for order in orders:
@@ -1906,11 +2043,27 @@ class LivePortfolioGrid(StrategyV2Base):
                 )
                 if last_attempt is not None and now - last_attempt < 5:
                     continue
+                special = (set(self.flatten_order_ids.values())
+                           | set(getattr(self, "reentry_order_ids", {}).values())
+                           | set(self.inventory_exit_order_ids.values()))
+                if str(order.client_order_id) not in self._owned_order_ids() or str(order.client_order_id) in special:
+                    self._order_status(str(order.trading_pair))["reconciliation_error"] = (
+                        "活动订单归属待核实或为保护订单，禁止自动撤销及重建"
+                    )
+                    continue
                 self.cancel(
                     self.config.exchange, order.trading_pair, order.client_order_id,
                 )
                 self.startup_reconcile_cancel_attempts[order.client_order_id] = now
+                self._order_status(str(order.trading_pair))["last_cancel_attempt_at"] = now
         else:
+            try:
+                for pair in self.config.trading_pairs:
+                    self._require_exchange_pair_empty(pair)
+            except OrderReconciliationPending as exc:
+                self._wait_for_order_reconciliation(exc.pair, str(exc))
+                self.startup_reconcile_quiet_cycles = 0
+                return True
             self.startup_reconcile_quiet_cycles += 1
         elapsed = now - self.startup_reconcile_started_at
         if (
@@ -1949,6 +2102,7 @@ class LivePortfolioGrid(StrategyV2Base):
             was_pending = pair in self.pending_inventory_exit
             extra = max(ledger.inventory_delta(), Decimal("0"))
             if extra <= 0:
+                getattr(self, "inventory_exit_dust", {}).pop(pair, None)
                 self.excess_inventory_started_at[pair] = None
                 self.pending_inventory_exit.discard(pair)
                 order_id = self.inventory_exit_order_ids.get(pair)
@@ -1966,11 +2120,41 @@ class LivePortfolioGrid(StrategyV2Base):
             age = self.current_timestamp - float(self.excess_inventory_started_at[pair])
             if age < self.config.max_extra_inventory_hold_seconds:
                 continue
-            self.pending_inventory_exit.add(pair)
             order_id = self.inventory_exit_order_ids.get(pair)
             if order_id is not None and order_id in active_ids:
                 action_pending = True
                 continue
+            # Test tradability BEFORE touching ordinary orders. Dust must not
+            # cancel the grid, block SELL budgets, or flood the event ring.
+            price = prices[pair]
+            step, minimum_amount = self._pair_amount_filters(pair)
+            amount = min(extra, self._quantized_amount(pair, extra))
+            if step > 0:
+                amount = (amount // step) * step
+            rules = getattr(self.connector, "trading_rules", {}) or {}
+            rule = rules.get(pair)
+            minimum_quote = Decimal(str(getattr(rule, "min_notional_size", None)
+                                        or self.config.min_order_quote))
+            if amount <= 0 or amount < minimum_amount or amount * price < minimum_quote:
+                if not hasattr(self, "inventory_exit_dust"):
+                    self.inventory_exit_dust = {}
+                fingerprint = (str(extra), str(step), str(minimum_amount), str(minimum_quote))
+                previous = self.inventory_exit_dust.get(pair, {})
+                self.inventory_exit_dust[pair] = {
+                    "phase": "DUST", "fingerprint": list(fingerprint),
+                    "quantity": str(extra), "tradable_quantity": str(amount),
+                    "estimated_quote": str(extra * price), "checked_at": self.current_timestamp,
+                }
+                self.pending_inventory_exit.discard(pair)
+                if tuple(previous.get("fingerprint", ())) != fingerprint:
+                    self._record_runtime_event(
+                        "inventory_48h_exit_below_exchange_minimum", pair=pair,
+                        excess_quote=str(extra * price), amount=str(amount),
+                        minimum_quote=str(minimum_quote), reason="dust_no_order_no_grid_cancel",
+                    )
+                continue
+            getattr(self, "inventory_exit_dust", {}).pop(pair, None)
+            self.pending_inventory_exit.add(pair)
             if order_id is not None:
                 self.inventory_exit_order_ids.pop(pair, None)
                 ledger.open_order_ids.discard(order_id)
@@ -1980,20 +2164,13 @@ class LivePortfolioGrid(StrategyV2Base):
                     self.cancel(self.config.exchange, pair, order.client_order_id)
                 action_pending = True
                 continue
-            price = prices[pair]
-            if extra * price < self.config.min_order_quote:
-                self._record_runtime_event(
-                    "inventory_48h_exit_below_exchange_minimum",
-                    pair=pair, excess_quote=str(extra * price),
-                )
-                continue
-            order_id = self.sell(self.config.exchange, pair, extra, OrderType.MARKET)
+            order_id = self.sell(self.config.exchange, pair, amount, OrderType.MARKET)
             ledger.open_order_ids.add(order_id)
             self.inventory_exit_order_ids[pair] = order_id
             self.sell_order_ids.add(order_id)
             self._record_runtime_event(
                 "inventory_48h_excess_taker_exit",
-                pair=pair, amount=str(extra), excess_quote=str(extra * price),
+                pair=pair, amount=str(amount), excess_quote=str(amount * price),
                 reason="managed excess inventory exceeded maximum hold time",
             )
             action_pending = True
@@ -2505,6 +2682,7 @@ class LivePortfolioGrid(StrategyV2Base):
                 continue
             if order.client_order_id not in exclude:
                 self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+                self._order_status(str(order.trading_pair))["last_cancel_attempt_at"] = float(self.current_timestamp)
                 cancelled += 1
         return cancelled
 
@@ -2545,6 +2723,11 @@ class LivePortfolioGrid(StrategyV2Base):
     def _append_notification_event(
         self, runtime_event: str, occurred_at: str, details: Mapping[str, Any],
     ) -> None:
+        if runtime_event in {
+            "grid_order_set_missing", "grid_order_rebuild_failed", "grid_order_set_recovered",
+            "grid_parameter_pair_restricted", "grid_parameter_pair_recovered",
+        }:
+            return  # Guard is the single persistent execution-fault notifier.
         recovery = details.get("recovery") if isinstance(details.get("recovery"), Mapping) else {}
         mapping = {
             "risk_breaker_triggered": (str(recovery.get("mechanism", "")), ["TRIGGERED", "EXITING"], "warning"),
@@ -2559,8 +2742,6 @@ class LivePortfolioGrid(StrategyV2Base):
             "xgboost_buy_gate_recovered_immediate_refresh": ("v22_weekly_buy_gate", "RECOVERED", "info"),
             "fomc_gate_transition": ("fomc_gate", "TRIGGERED" if details.get("paused") else "RECOVERED", "warning" if details.get("paused") else "info"),
             "integrity_failure_latched": ("infrastructure_integrity_breaker", "EXITING", "critical"),
-            "grid_parameter_pair_restricted": ("parameter_update", "ACTION_FAILED", "critical"),
-            "grid_parameter_pair_recovered": ("parameter_update", "RECOVERED", "info"),
             "grid_order_set_missing": ("runtime_error", "ERROR_OCCURRED", "warning"),
             "grid_order_rebuild_failed": ("runtime_error", "ERROR_OCCURRED", "critical"),
             "grid_order_set_recovered": ("runtime_error", "ERROR_RECOVERED", "info"),
@@ -2693,7 +2874,7 @@ class LivePortfolioGrid(StrategyV2Base):
         """Drop persisted IDs only after the connector confirms inactivity."""
         active_ids = {
             str(order.client_order_id)
-            for order in active
+            for order in self._strategy_pair_active_orders(active)
             if getattr(order, "client_order_id", None)
         }
         self.buy_order_ids.intersection_update(active_ids)
@@ -2743,6 +2924,14 @@ class LivePortfolioGrid(StrategyV2Base):
         ledger = self.ledgers.get(event.trading_pair)
         if ledger is None:
             return
+        if event.order_id not in ledger.open_order_ids:
+            # A fill can race the next tick after an ID was lost. Verify durable
+            # ownership before processing it; never lose the fill or book a foreign order.
+            from types import SimpleNamespace
+            self._reconcile_order_ownership([SimpleNamespace(
+                client_order_id=event.order_id, trading_pair=event.trading_pair,
+                is_buy=event.trade_type == TradeType.BUY,
+            )])
         if event.order_id not in ledger.open_order_ids:
             if getattr(self, "_reentry_submission_pair", None) == event.trading_pair:
                 if not hasattr(self, "_pending_reentry_fill_events"):
@@ -3125,6 +3314,10 @@ class LivePortfolioGrid(StrategyV2Base):
                 for pair, order_id in state.get("inventory_exit_order_ids", {}).items()
                 if pair in restored
             }
+            self.inventory_exit_dust = {
+                pair: dict(value) for pair, value in state.get("inventory_exit_dust", {}).items()
+                if pair in restored and isinstance(value, dict)
+            }
             saved_timers = state.get("excess_inventory_started_at", {})
             self.excess_inventory_started_at = {
                 pair: (
@@ -3242,6 +3435,7 @@ class LivePortfolioGrid(StrategyV2Base):
             "reentry_intents": self.reentry_intents,
             "pending_inventory_exit": sorted(self.pending_inventory_exit),
             "inventory_exit_order_ids": self.inventory_exit_order_ids,
+            "inventory_exit_dust": getattr(self, "inventory_exit_dust", {}),
             "excess_inventory_started_at": self.excess_inventory_started_at,
             "buy_order_ids": sorted(self.buy_order_ids),
             "sell_order_ids": sorted(self.sell_order_ids),

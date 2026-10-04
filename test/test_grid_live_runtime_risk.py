@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from unittest.mock import patch
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -26,6 +27,7 @@ from walk_forward_portfolio_grid_live import (  # noqa: E402
     GridState,
     LivePortfolioGrid,
     ParameterBuildError,
+    OrderReconciliationPending,
     SUPPORTED_RUNTIME_STATE_SCHEMA_VERSIONS,
 )
 from risk_recovery import ACTIVE, EXITING, REENTRY, active_state, normalize_state, trigger_state  # noqa: E402
@@ -961,6 +963,7 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
 
     def test_shutdown_pair_cancellation_is_rate_limited_but_retried(self):
         strategy = self.strategy()
+        strategy.ledgers["ETH-FDUSD"].open_order_ids.add("old")
         strategy.connector.limit_orders = [Order("old", "ETH-FDUSD")]
         strategy._set_current_timestamp(1000)
         cancelled = []
@@ -972,6 +975,14 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         strategy._set_current_timestamp(1005)
         self.assertEqual(1, strategy.cancel_strategy_pair_orders())
         self.assertEqual(["old", "old"], cancelled)
+
+    def test_shutdown_does_not_cancel_unproven_connector_order(self):
+        strategy = self.strategy()
+        strategy.connector.limit_orders = [Order("unknown", "ETH-FDUSD")]
+        cancelled = []
+        strategy.cancel = lambda *args: cancelled.append(args)
+        strategy.cancel_strategy_pair_orders()
+        self.assertFalse(cancelled)
 
     def test_sigterm_blocks_orders_and_schedules_only_one_graceful_shutdown(self):
         strategy = self.strategy()
@@ -1287,6 +1298,283 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertEqual(extra, submitted[0][1])
         self.assertEqual("inventory-exit", strategy.inventory_exit_order_ids[pair])
         self.assertEqual(ledger.initial_base + extra, ledger.base)
+
+    def test_lost_order_ids_real_database_cancel_delay_and_exchange_verification(self):
+        """Replay the ETH incident with a real DB, two order views and delayed cancel."""
+        with tempfile.TemporaryDirectory() as directory:
+            strategy = self.strategy()
+            root = Path(directory)
+            strategy.config.runtime_state_file = str(root / "live_grid_runtime_state.json")
+            database = root / "walk_forward_portfolio_grid_live_fdusd_400.sqlite"
+            with closing(sqlite3.connect(database)) as conn, conn:
+                conn.execute('CREATE TABLE "Order" (id TEXT PRIMARY KEY, config_file_path TEXT, '
+                             'strategy TEXT, market TEXT, symbol TEXT, order_type TEXT, '
+                             'last_status TEXT, exchange_order_id TEXT)')
+                conn.execute('INSERT INTO "Order" VALUES (?,?,?,?,?,?,?,?)', (
+                    "lost-eth", database.with_suffix('.yml').name,
+                    "walk_forward_portfolio_grid_live", "binance", "ETH-FDUSD",
+                    "LIMIT_MAKER", "SellOrderCreated", "16623107789",
+                ))
+                conn.execute('INSERT INTO "Order" VALUES (?,?,?,?,?,?,?,?)', (
+                    "foreign", "foreign.yml", "foreign_strategy", "binance", "ETH-FDUSD",
+                    "LIMIT_MAKER", "SellOrderCreated", "other",
+                ))
+            orphan = Order("lost-eth", "ETH-FDUSD")
+            strategy.connector.limit_orders = [orphan]
+            original_base = strategy.ledgers["ETH-FDUSD"].base
+            strategy._reconcile_order_ownership([])
+            self.assertIn("lost-eth", strategy.sell_order_ids)
+            self.assertEqual(original_base, strategy.ledgers["ETH-FDUSD"].base)
+            self.assertEqual(1, len(strategy.runtime_events))
+            strategy._reconcile_order_ownership([])
+            self.assertEqual(1, len(strategy.runtime_events))
+            # A partial execution during cancellation is booked via the real
+            # strategy event handler, not by tracking restoration.
+            strategy.did_fill_order(SimpleNamespace(
+                order_id="lost-eth", trading_pair="ETH-FDUSD", trade_type=TradeType.SELL,
+                order_type=OrderType.LIMIT_MAKER, price=Decimal("2828.68"), amount=Decimal("0.003"),
+                trade_fee=DeductedFromReturnsTradeFee(percent=Decimal("0")),
+            ))
+            self.assertEqual(original_base - Decimal("0.003"), strategy.ledgers["ETH-FDUSD"].base)
+            strategy._prune_inactive_order_ownership([])
+            self.assertIn("lost-eth", strategy.ledgers["ETH-FDUSD"].open_order_ids)
+            cancelled, rebuilt = [], []
+            strategy.cancel = lambda exchange, pair, oid: cancelled.append((pair, oid))
+            def rebuild(pair, price, quote):
+                strategy._require_exchange_pair_empty(pair)
+                rebuilt.append(pair)
+                strategy._mark_order_build_healthy(pair, expected_buy=0, expected_sell=1,
+                                                  actual_buy=0, actual_sell=1)
+                return quote
+            strategy._place_pair_grid = rebuild
+            strategy._request_pair_order_refresh("ETH-FDUSD", reason="lost_order_ids")
+            prices = {"ETH-FDUSD": Decimal("2820"), "BTC-FDUSD": Decimal("70000")}
+            for now in (1000, 1001, 1005):
+                strategy._set_current_timestamp(now)
+                strategy._advance_pair_order_refreshes(prices, [])
+            self.assertEqual([("ETH-FDUSD", "lost-eth")] * 2, cancelled)
+            self.assertFalse(rebuilt)
+            # Connector cancellation alone is not enough: exchange still shows it.
+            strategy.connector.limit_orders = []
+            snapshot = root / "grid_exchange_order_snapshot.json"
+            payload = {"schema": "grid-exchange-orders-v1", "account_fingerprint": "test",
+                       "pairs": {"ETH-FDUSD": {"sampled_at": 1006, "orders": [{"clientOrderId": "lost-eth"}]}}}
+            snapshot.write_text(json.dumps(payload), encoding="utf-8")
+            strategy._set_current_timestamp(1006)
+            strategy._advance_pair_order_refreshes(prices, [])
+            self.assertFalse(rebuilt)
+            # After confirmed terminal status + fill stream catch-up, build once.
+            payload["pairs"]["ETH-FDUSD"].update(sampled_at=1011, orders=[])
+            snapshot.write_text(json.dumps(payload), encoding="utf-8")
+            strategy._set_current_timestamp(1011)
+            strategy._request_pair_order_refresh("ETH-FDUSD", reason="retry")
+            self.assertEqual(1005, strategy._order_status("ETH-FDUSD")["last_cancel_attempt_at"])
+            strategy._advance_pair_order_refreshes(prices, [])
+            self.assertEqual(["ETH-FDUSD"], rebuilt)
+            strategy._advance_pair_order_refreshes(prices, [])
+            self.assertEqual(1, len(rebuilt))
+            strategy._reconcile_order_ownership([Order("foreign", "ETH-FDUSD")])
+            self.assertNotIn("foreign", strategy._owned_order_ids())
+
+    def test_dust_never_cancels_grid_or_floods_events_and_rechecks_filters(self):
+        strategy = self.strategy()
+        pair = "ETH-FDUSD"
+        strategy.ledgers[pair].base += Decimal("0.00007630")
+        strategy.excess_inventory_started_at[pair] = 1000 - 48 * 3600
+        strategy.ledgers[pair].open_order_ids.add("ordinary")
+        strategy.sell_order_ids.add("ordinary")
+        strategy.pending_inventory_exit.add(pair)  # Migrate the old blocked state.
+        strategy.connector.trading_rules = {pair: SimpleNamespace(
+            min_base_amount_increment=Decimal("0.0001"), min_order_size=Decimal("0.0001"),
+            min_notional_size=Decimal("5"),
+        )}
+        cancelled, sold = [], []
+        strategy.cancel = lambda *args: cancelled.append(args)
+        strategy.sell = lambda *args: sold.append(args) or "exit"
+        for index in range(100):
+            strategy._set_current_timestamp(1000 + index)
+            self.assertFalse(strategy._process_inventory_exit_policy(
+                {pair: Decimal("2800") + index}, [Order("ordinary", pair)],
+            ))
+        self.assertFalse(cancelled)
+        self.assertFalse(sold)
+        self.assertNotIn(pair, strategy.pending_inventory_exit)
+        self.assertEqual(1, len(strategy.runtime_events))
+        persisted = json.loads(json.dumps(strategy.inventory_exit_dust))
+        strategy.inventory_exit_dust = persisted  # Restart retains classification.
+        strategy._process_inventory_exit_policy({pair: Decimal("2900")}, [])
+        self.assertEqual(1, len(strategy.runtime_events))
+        strategy.ledgers[pair].base += Decimal("0.002")
+        self.assertTrue(strategy._process_inventory_exit_policy(
+            {pair: Decimal("2900")}, [Order("ordinary", pair)],
+        ))
+        self.assertEqual(1, len(cancelled))
+        self.assertFalse(sold)
+        strategy._process_inventory_exit_policy({pair: Decimal("2900")}, [])
+        self.assertEqual(Decimal("0.0020"), sold[0][2])
+
+    def test_timer_tick_cancels_pair_then_waits_for_post_cancel_exchange_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            strategy = self.strategy()
+            root = Path(directory)
+            pair = "ETH-FDUSD"
+            strategy.config.trading_pairs = [pair]
+            strategy.config.runtime_state_file = str(root / "state.json")
+            strategy.config.trading_enabled = True
+            strategy.config.bootstrap_from_quote = False
+            strategy.config.inventory_exit_enabled = False
+            strategy.config.order_refresh_time = 7200
+            strategy.config.risk_state_persist_seconds = 5
+            strategy.state_invalid_reason = None
+            strategy.pending_parameters = None
+            strategy.next_refresh = 0
+            strategy._control_risk = lambda *args: None
+            strategy.reference_price = lambda *args: Decimal("2800")
+            for name in ("_poll_parameter_update", "_poll_technical_buy_gate", "_poll_macro_gate",
+                         "_clear_ineligible_maker_deferred_layers", "_mark_expected_empty_for_active_gates",
+                         "_persist"):
+                setattr(strategy, name, lambda *args: None)
+            for name in ("_advance_risk_recovery", "_startup_order_reconciliation",
+                         "_advance_maker_deferred_layers", "_check_order_liveness_and_rebuild"):
+                setattr(strategy, name, lambda *args: False)
+            old = Order("old-eth", pair)
+            strategy.connector.limit_orders = [old]
+            strategy.get_active_orders = lambda *args: list(strategy.connector.limit_orders)
+            strategy.sell_order_ids.add(old.client_order_id)
+            strategy.ledgers[pair].open_order_ids.add(old.client_order_id)
+            cancelled, builds = [], []
+            strategy.cancel = lambda exchange, pair, oid: cancelled.append(oid)
+            def build(pair, price, quote):
+                strategy._require_exchange_pair_empty(pair)
+                builds.append(pair)
+                strategy._mark_order_build_healthy(pair, expected_buy=0, expected_sell=1,
+                                                  actual_buy=0, actual_sell=1)
+                return quote
+            strategy._place_pair_grid = build
+            target = root / "grid_exchange_order_snapshot.json"
+            payload = {"schema": "grid-exchange-orders-v1", "account_fingerprint": "test",
+                       "pairs": {pair: {"sampled_at": 999, "orders": []}}}
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            strategy.on_tick()  # The real timer path, not a direct build call.
+            self.assertEqual(["old-eth"], cancelled)
+            self.assertEqual(8200, strategy.next_refresh)
+            strategy.connector.limit_orders = []  # Cancel callback beats Guard's snapshot.
+            for now in (1005, 1010, 1015):
+                strategy._set_current_timestamp(now)
+                strategy.on_tick()
+            self.assertFalse(builds)
+            self.assertFalse(strategy.parameter_blocked_pairs)
+            self.assertFalse(strategy.runtime_events)
+            payload["pairs"][pair]["sampled_at"] = 1016
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            strategy._set_current_timestamp(1016)
+            strategy.on_tick()
+            self.assertEqual([pair], builds)
+            self.assertFalse(strategy.portfolio_tripped)
+
+    def test_scheduled_refresh_wait_preserves_parameters_then_builds_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            strategy = self.strategy()
+            root = Path(directory)
+            strategy.config.runtime_state_file = str(root / "live_grid_runtime_state.json")
+            pair = "ETH-FDUSD"
+            strategy.config.trading_pairs = [pair]
+            original_grid = strategy._new_grid(pair, Decimal("2800"))
+            strategy.grid_states[pair] = original_grid
+            original_ledger = dict(vars(strategy.ledgers[pair]))
+            strategy._order_status(pair)["last_cancel_attempt_at"] = 1000
+            snapshot = root / "grid_exchange_order_snapshot.json"
+            payload = {"schema": "grid-exchange-orders-v1", "account_fingerprint": "test",
+                       "pairs": {pair: {"sampled_at": 999, "orders": []}}}
+            snapshot.write_text(json.dumps(payload), encoding="utf-8")
+            builds = []
+            def build(pair, price, quote):
+                strategy._require_exchange_pair_empty(pair)
+                builds.append(pair)
+                strategy._mark_order_build_healthy(pair, expected_buy=0, expected_sell=1,
+                                                  actual_buy=0, actual_sell=1)
+                return quote
+            strategy._place_pair_grid = build
+            prices = {pair: Decimal("2800")}
+            strategy._place_grids(prices)
+            for now in (1001, 1005, 1015):
+                strategy._set_current_timestamp(now)
+                strategy._advance_pair_order_refreshes(prices, [])
+            self.assertFalse(builds)
+            self.assertFalse(strategy.parameter_blocked_pairs)
+            self.assertIs(original_grid, strategy.grid_states[pair])
+            self.assertEqual(original_ledger, vars(strategy.ledgers[pair]))
+            self.assertIsNone(strategy._order_status(pair)["first_failure_at"])
+            self.assertFalse(strategy.runtime_events)
+            payload["pairs"][pair].update(sampled_at=1016, orders=[])
+            snapshot.write_text(json.dumps(payload), encoding="utf-8")
+            strategy._set_current_timestamp(1016)
+            strategy._advance_pair_order_refreshes(prices, [])
+            strategy._advance_pair_order_refreshes(prices, [])
+            self.assertEqual([pair], builds)
+            self.assertEqual("HEALTHY", strategy._order_status(pair)["state"])
+            self.assertEqual(original_ledger, vars(strategy.ledgers[pair]))
+
+    def test_prolonged_exchange_wait_reports_execution_not_parameter_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            strategy = self.strategy()
+            strategy.config.trading_pairs = ["ETH-FDUSD"]
+            strategy.config.runtime_state_file = str(Path(directory) / "state.json")
+            pair = "ETH-FDUSD"
+            prices = {pair: Decimal("2800")}
+            strategy._place_grids(prices)
+            for now in (1010, 1030, 1035, 1050, 1090, 1150):
+                strategy._set_current_timestamp(now)
+                strategy._advance_pair_order_refreshes(prices, [])
+            self.assertFalse(strategy.parameter_blocked_pairs)
+            self.assertEqual("REBUILDING", strategy._order_status(pair)["state"])
+            self.assertEqual(1000, strategy._order_status(pair)["refresh_requested_at"])
+            self.assertEqual(1030, strategy._order_status(pair)["first_failure_at"])
+            self.assertTrue(any(e["event"] == "grid_order_rebuild_failed" for e in strategy.runtime_events))
+            self.assertFalse(any(e["event"].startswith("grid_parameter") for e in strategy.runtime_events))
+
+    def test_execution_faults_never_emit_parameter_model_update_notifications(self):
+        strategy = self.strategy()
+        for event in ("grid_parameter_pair_restricted", "grid_parameter_pair_recovered"):
+            LivePortfolioGrid._append_notification_event(strategy, event, "2026-10-02T00:00:00Z", {})
+
+    def test_exchange_evidence_missing_stale_or_pre_cancel_cannot_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            strategy = self.strategy()
+            root = Path(directory)
+            strategy.config.runtime_state_file = str(root / "live_grid_runtime_state.json")
+            pair = "ETH-FDUSD"
+            with self.assertRaises(OrderReconciliationPending):
+                strategy._require_exchange_pair_empty(pair)
+            target = root / "grid_exchange_order_snapshot.json"
+            payload = {"schema": "grid-exchange-orders-v1", "account_fingerprint": "test",
+                       "pairs": {pair: {"sampled_at": 900, "orders": []}}}
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(ParameterBuildError):
+                strategy._require_exchange_pair_empty(pair)
+            payload["pairs"][pair]["sampled_at"] = 990
+            strategy._order_status(pair)["last_cancel_attempt_at"] = 995
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(ParameterBuildError):
+                strategy._require_exchange_pair_empty(pair)
+            payload["pairs"][pair]["sampled_at"] = 1000
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            strategy._require_exchange_pair_empty(pair)
+
+    def test_startup_keeps_protective_and_unproven_orders_for_reconciliation(self):
+        strategy = self.strategy()
+        strategy.startup_reconcile_complete = False
+        strategy.startup_reconcile_started_at = None
+        strategy.startup_reconcile_quiet_cycles = 0
+        strategy.startup_reconcile_cancel_attempts = {}
+        strategy.inventory_exit_order_ids["ETH-FDUSD"] = "protective"
+        strategy.ledgers["ETH-FDUSD"].open_order_ids.add("protective")
+        strategy.connector.limit_orders = [Order("protective", "ETH-FDUSD"), Order("foreign", "ETH-FDUSD")]
+        cancelled = []
+        strategy.cancel = lambda *args: cancelled.append(args)
+        self.assertTrue(strategy._startup_order_reconciliation([]))
+        self.assertFalse(cancelled)
+        self.assertFalse(strategy.startup_reconcile_complete)
 
     def test_technical_risk_off_cancels_buy_but_preserves_sell(self):
         strategy = self.strategy()

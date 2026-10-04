@@ -709,9 +709,18 @@ class Guard:
             raise RuntimeError("Grid Binance key must not permit margin trading")
         tested = []
         open_order_counts = {}
+        exchange_order_evidence = {}
         commissions = {}
         for pair in pairs:
-            open_order_counts[pair] = len(self.emergency_exchange.open_orders(pair))
+            orders = self.emergency_exchange.open_orders(pair)
+            open_order_counts[pair] = len(orders)
+            exchange_order_evidence[pair] = {
+                "sampled_at": time.time(),
+                "orders": [{key: order.get(key) for key in (
+                    "clientOrderId", "orderId", "symbol", "side", "type", "status",
+                    "price", "origQty", "executedQty",
+                )} for order in orders],
+            }
             fee_payload = self.emergency_exchange._signed(
                 "GET", "/sapi/v1/asset/tradeFee",
                 {"symbol": pair.replace("-", "")},
@@ -788,6 +797,19 @@ class Guard:
             }
         if not all(item["covered"] for item in ownership_coverage.values()):
             raise RuntimeError("Grid managed inventory exceeds the emergency account balance")
+        # Publish only a fully checked, account-bound read-only snapshot. A failed
+        # check leaves the last evidence to age out, never asserts an empty set.
+        evidence = {
+            "schema": "grid-exchange-orders-v1",
+            "account_fingerprint": inventory["account_fingerprint"],
+            "generated_at": time.time(), "pairs": exchange_order_evidence,
+        }
+        for instance in (getattr(self, "bots_path", Path("/workspace/bots")) / "instances").glob(f"{PORTFOLIOS['FDUSD'].bot_name}*"):
+            target = instance / "data" / "grid_exchange_order_snapshot.json"
+            if target.parent.is_dir():
+                temporary = target.with_suffix(".tmp")
+                temporary.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
+                temporary.replace(target)
         return {
             "account_read": True,
             "spot_trading": True,
@@ -1418,6 +1440,10 @@ class Guard:
         gate_pairs = gate.get("pairs", {}) if isinstance(gate.get("pairs"), dict) else {}
         macro = runtime.get("macro_gate", {}) if isinstance(runtime.get("macro_gate"), dict) else {}
         result: dict[str, dict[str, Any]] = {}
+        try:
+            exchange = json.loads((runtime_path.parent / "grid_exchange_order_snapshot.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            exchange = {}
         pairs = runtime.get("trading_pairs") or list(gate_pairs)
         for pair in pairs:
             raw = dict(runtime.get("order_build_status", {}).get(pair, {}))
@@ -1453,8 +1479,52 @@ class Guard:
             else:
                 raw["trading_expected"] = True
             raw["source"] = "grid_guard_effective_order_status_v1"
+            evidence = exchange.get("pairs", {}).get(pair, {})
+            raw["exchange_open_orders"] = evidence.get("orders", [])
+            expected_ids = set(runtime.get("ledgers", {}).get(pair, {}).get("open_order_ids", []))
+            actual_ids = {str(order.get("clientOrderId")) for order in evidence.get("orders", [])}
+            age = time.time() - float(evidence.get("sampled_at") or 0)
+            raw["exchange_orders_verified"] = bool(
+                exchange.get("schema") == "grid-exchange-orders-v1"
+                and exchange.get("account_fingerprint") and -5 <= age <= 30
+                and expected_ids and expected_ids == actual_ids
+            )
             result[str(pair)] = raw
         return result
+
+    def _monitor_order_execution(self, statuses: dict) -> None:
+        """Execution health is a persistent current fault, not a log-only event."""
+        now = time.time()
+        for pair, row in statuses.items():
+            component = f"grid_order_execution:{pair}"
+            state = str(row.get("state") or "UNKNOWN")
+            if not row.get("trading_expected"):
+                continue  # A closed risk gate is not proof that rebuild recovered.
+            refresh_age = now - float(row.get("refresh_requested_at") or now)
+            if state in {"MISSING", "RETRYING", "RESTRICTED"} or (
+                state in {"CANCEL_PENDING", "REBUILDING"} and refresh_age >= 30
+            ):
+                self.runtime_errors.failure(
+                    component, "网格订单重建持续失败：残留订单或执行证据尚未核对完成",
+                    trading_impact=(
+                        f"{pair} 当前不能正常重建网格；不清仓、不锁存，不影响另一交易对。"
+                        "解除条件：核对残留订单及成交，确认撤单终态并验证新网格。"
+                    ),
+                    action="reconcile_orders_then_rebuild_pair", notify_after_seconds=15,
+                    details={"pair": pair, "reason": row.get("reason"),
+                             "residual_orders": row.get("exchange_open_orders", []),
+                             "failure_duration_seconds": max(0, now - float(row.get("first_failure_at") or now)),
+                             "execution_first_failure_at": row.get("first_failure_at")},
+                    now=now,
+                )
+            elif state in {"HEALTHY", "HEALTHY_DEFERRED"} and (
+                int(row.get("actual_buy_layers") or 0) + int(row.get("actual_sell_layers") or 0) > 0
+            ) and row.get("exchange_orders_verified"):
+                self.runtime_errors.recovered(
+                    component, trading_status=f"{pair} 订单核对完成，新网格已验证",
+                    details={"pair": pair, "buy_orders": row.get("actual_buy_layers"),
+                             "sell_orders": row.get("actual_sell_layers")}, now=now,
+                )
 
     @staticmethod
     def _items(payload: Any) -> list[dict]:
@@ -1628,6 +1698,12 @@ class Guard:
             bot["latest"] = snapshot
             if key == "FDUSD":
                 self.state["effective_order_status"] = self._effective_order_status(snapshot)
+                try:
+                    self._monitor_order_execution(self.state["effective_order_status"])
+                    self.state.pop("order_execution_monitor_error", None)
+                except (OSError, ValueError, TypeError) as exc:
+                    # Notification persistence is not a trading-integrity breaker.
+                    self.state["order_execution_monitor_error"] = repr(exc)
             stuck, stuck_reason = self._stuck_recoverable_exit(snapshot) if key == "FDUSD" else (False, "")
             if stuck:
                 self.trip(key, stuck_reason, snapshot)

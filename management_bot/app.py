@@ -417,6 +417,7 @@ class TradingManagementBot:
         warnings: list[str] = []
         normal = 0
         total = 0
+        normal_pairs: set[tuple[str, str]] = set()
         try:
             status = self.reports.status()
             for robot in status["robots"]:
@@ -428,6 +429,7 @@ class TradingManagementBot:
                 sell = "放行" if permissions.get("sell_enabled") else "阻止"
                 if robot.get("trading_normal"):
                     normal += 1
+                    normal_pairs.add((strategy, pair))
                 else:
                     reasons = robot.get("blockers", [])
                     reason = "；".join(_safe_text(item, 100) for item in reasons) or "存在生效中的风控门"
@@ -460,6 +462,29 @@ class TradingManagementBot:
                 bot_name = str(error.get("bot") or error.get("source") or "未知组件")
                 summary = _safe_text(error.get("summary") or "未知运行错误", 140)
                 impact = _safe_text(error.get("trading_impact") or "当前权限以风控状态为准", 120)
+                if str(error.get("component") or "").startswith("grid_order_execution:"):
+                    pair = str(error.get("pair") or "未知交易对")
+                    key = ("GRID", pair)
+                    if key in normal_pairs:
+                        normal_pairs.remove(key)
+                        normal -= 1
+                    try:
+                        duration = max(0, int(time.time() - float(error.get("first_seen_at"))))
+                        duration_text = f"已持续 {duration // 60} 分 {duration % 60} 秒"
+                    except (ValueError, TypeError, OverflowError):
+                        duration_text = "持续时间未记录"
+                    orders = error.get("residual_orders") or []
+                    lines = [f"GRID {pair}：网格执行异常，{duration_text}", summary]
+                    lines.append(f"交易所残留挂单：{len(orders)} 笔")
+                    for order in orders[:6]:
+                        try:
+                            remaining = Decimal(str(order.get("origQty") or "0")) - Decimal(str(order.get("executedQty") or "0"))
+                            lines.append(_safe_text(f"{'买' if order.get('side') == 'BUY' else '卖'} @ {order.get('price')}，剩余 {remaining}", 120))
+                        except (ValueError, TypeError, InvalidOperation):
+                            lines.append("挂单明细暂不可用")
+                    lines.append("解除条件：核对订单与成交、确认撤单终态并验证新网格；不清仓、不解除其他风控门。")
+                    blockers.append("\n  ".join(lines))
+                    continue
                 warnings.append(f"{bot_name}：{summary}；{impact}")
 
         snapshot = self.contracts.snapshot()

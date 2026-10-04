@@ -285,7 +285,8 @@ class RuntimeErrorChannel:
 
     def _failure_event(self, component: str, row: Mapping[str, Any]) -> dict[str, Any]:
         return build_event(
-            source=self.source, strategy=self.strategy, bot=self.bot, pair=self.pair,
+            source=self.source, strategy=self.strategy, bot=self.bot,
+            pair=str((row.get("details") or {}).get("pair") or self.pair),
             mechanism="runtime_error", transition="ERROR_OCCURRED",
             reason=str(row.get("summary") or "unknown runtime error"),
             severity=str(row.get("severity") or "warning"),
@@ -405,7 +406,8 @@ class RuntimeErrorChannel:
         emitted = False
         if row.get("notified"):
             emitted = self._emit(build_event(
-                source=self.source, strategy=self.strategy, bot=self.bot, pair=self.pair,
+                source=self.source, strategy=self.strategy, bot=self.bot,
+                pair=str((details or {}).get("pair") or self.pair),
                 mechanism="runtime_error", transition="ERROR_RECOVERED",
                 reason=f"{component} recovered", severity="info",
                 phase_from="ERROR_ACTIVE", phase_to="HEALTHY",
@@ -677,6 +679,16 @@ def format_event(event: Mapping[str, Any]) -> str:
                     f"盘口：BestBid={details.get('best_bid', '-')} / "
                     f"BestAsk={details.get('best_ask', '-')}"
                 )
+        if not recovered and str(details.get("component") or "").startswith("grid_order_execution:"):
+            if details.get("reason"):
+                lines.append(f"核对详情：{details['reason']}")
+            if details.get("failure_duration_seconds") is not None:
+                lines.append(f"持续时间：{float(details['failure_duration_seconds']):.0f} 秒")
+            orders = details.get("residual_orders") or []
+            lines.append(f"交易所残留挂单：{len(orders)} 笔")
+            for order in orders[:6]:
+                remaining = Decimal(str(order.get("origQty") or "0")) - Decimal(str(order.get("executedQty") or "0"))
+                lines.append(f"{'买' if order.get('side') == 'BUY' else '卖'} @ {order.get('price')} · 剩余 {remaining}")
         lines.extend((
             f"时间：{event.get('occurred_at')}",
             f"事件ID：{str(event.get('event_id', ''))[:20]}",

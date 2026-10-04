@@ -1080,19 +1080,22 @@ class UnifiedTelegramReporting:
             for component, raw in components.items():
                 if not isinstance(raw, Mapping) or not raw.get("active"):
                     continue
+                details = raw.get("details") if isinstance(raw.get("details"), Mapping) else {}
                 errors.append({
                     "active": True,
                     "source": source,
                     "component": str(component),
                     "bot": bot,
-                    "pair": pair,
+                    "pair": details.get("pair") or pair,
                     "summary": str(raw.get("summary") or "未知运行错误"),
                     "severity": str(raw.get("severity") or "warning"),
-                    "first_seen_at": raw.get("first_seen_at"),
+                    "first_seen_at": details.get("execution_first_failure_at") or raw.get("first_seen_at"),
                     "last_seen_at": raw.get("last_seen_at"),
                     "occurrences": int(raw.get("occurrences") or 1),
                     "trading_impact": str(raw.get("trading_impact") or ""),
                     "action": str(raw.get("action") or "automatic_retry"),
+                    "reason": details.get("reason"),
+                    "residual_orders": details.get("residual_orders", []),
                 })
         payload = {
             "schema": "management-current-runtime-errors-v1",
