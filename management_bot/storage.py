@@ -99,7 +99,7 @@ class BotStore:
             )
             self.db.execute(
                 "DELETE FROM processed_updates WHERE processed_at < ?",
-                (time.time() - 7 * 86400,),
+                (time.time() - 370 * 86400,),
             )
             self.db.commit()
             return True
@@ -191,3 +191,11 @@ class BotStore:
              json.dumps(details or {}, ensure_ascii=False, default=str), time.time()),
         )
         self.db.commit()
+        # Economic action_results are indefinite idempotency anchors, not logs.
+        last = float(self.metadata("history_maintenance", "0"))
+        if time.time()-last >= 86400:
+            self.db.execute("DELETE FROM audit_events WHERE event_id IN "
+                            "(SELECT event_id FROM audit_events WHERE created_at<? LIMIT 5000)",
+                            (time.time()-370*86400,))
+            self.db.commit()
+            self.set_metadata("history_maintenance", time.time())

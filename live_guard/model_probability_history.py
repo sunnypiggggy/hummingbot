@@ -90,7 +90,7 @@ def collect(grid_state, output, now, *, price_reader=None):
                 'points': [dict(r) for r in db.execute(
                     'SELECT timestamp,close FROM prices WHERE pair=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp',
                     (market,now-168*3600,now))]}
-        db.execute('DELETE FROM prices WHERE timestamp<?', (now-30*86400,))
+        db.execute('DELETE FROM prices WHERE timestamp<?', (now-370*86400,))
         audit = grid_state / 'risk_audit.jsonl'
         if not db.execute("SELECT 1 FROM imports WHERE name='risk_audit_v1'").fetchone():
             if audit.exists() and audit.stat().st_size <= 8*1024*1024:
@@ -180,6 +180,6 @@ def collect(grid_state, output, now, *, price_reader=None):
                                 'risk_off': row['risk_off_active'], 'signal_ts': signal}
             result['pairs'][pair] = {'current_available': bool(healthy), 'points': points,
                                      'current_recovery': recovery}
-        db.execute('DELETE FROM signals WHERE signal_ts<?', (now-30*86400,))
+        db.execute('DELETE FROM signals WHERE signal_ts<?', (now-370*86400,))
         db.commit()
     return result

@@ -1,0 +1,23 @@
+# Optional overlay; resolve relative paths from the repository's root Compose.
+# Default is dry-run. No token file is mounted or consumed until explicit publish.
+services:
+  cardputer-monitor:
+    profiles: [cardputer-monitor]
+    build:
+      context: .
+      dockerfile: cardputer_monitor/Dockerfile
+    image: hummingbot/cardputer-monitor:local
+    command: ["--config", "/app/cardputer_monitor/config.example.json"]
+    volumes:
+      - ./dca-live-data/telegram:/reports:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

@@ -15,6 +15,7 @@ from stocks_runtime.executor_config import (
 )
 from stocks_runtime.ledger import LedgerConflict, LedgerLimitExceeded, LedgerUnavailable
 from stocks_runtime.policy import PolicyViolation
+from stocks_runtime.database_capacity import latest as latest_database_capacity
 
 
 router = APIRouter(prefix="/stocks", tags=["Binance Stocks Runtime"], dependencies=[Depends(auth_user)])
@@ -157,6 +158,7 @@ async def health(request: Request) -> Dict[str, Any]:
         "external_positions_unknown": settings.mode != "PAPER",
         "economic_requests_enabled": settings.mode == "LIVE" and settings.live_authorized,
         "scenario_mode": settings.scenario_mode,
+        "database_capacity": latest_database_capacity(getattr(request.app.state, "stocks_database_capacity", None)),
     }
     if settings.mode == "PAPER":
         broker = request.app.state.stocks_paper_broker

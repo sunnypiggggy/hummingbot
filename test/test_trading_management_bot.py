@@ -562,6 +562,33 @@ class TelegramFlowTests(TestCase):
             self.assertIn("Binance真实经济请求计数：0", text)
             bot.store.close()
 
+    def test_paused_paper_hides_orders_and_blocks_old_callbacks_without_runtime(self):
+        from dataclasses import replace
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as raw:
+            bot = self._bot(Path(raw), paper_enabled=True, mutations_enabled=True)
+            bot.settings = replace(bot.settings, stocks_paper_paused=True)
+            bot.stocks = Mock()
+            text, rows = bot._stock_menu()
+            self.assertIn("已暂停交易", text)
+            self.assertEqual(["m:stock", "m:home"], [value for row in rows for _, value in row])
+            self.assertIn("已暂停", bot._execute_stock({})[0])
+            callback = {"id": "old-paper", "from": {"id": 7},
+                        "message": {"chat": {"id": 7, "type": "private"}, "message_id": 10}}
+            for action in ("s:new:order", "s:paper_profit", "q:old:confirm_cancel", "w:old:confirm:-"):
+                bot._handle_callback(100, {**callback, "data": action})
+            session = bot.store.create_session(7, 7, "whitelist_input", 10)
+            bot.store.update_session(session["session_id"], payload={"symbol": "AAPL"})
+            result, _ = bot._handle_session_action(
+                f"x:{session['session_id']}:wl_confirm", callback, 101
+            )
+            self.assertIn("已暂停", result)
+            bot._notify_stock_schedules()
+            bot.reports = FakeReports()
+            self.assertIn("暂无新账本收益", bot._profit())
+            self.assertEqual([], bot.stocks.mock_calls)
+            bot.store.close()
+
     def _pending_model(self, root):
         weekly = root / "weekly"
         weekly.mkdir(exist_ok=True)

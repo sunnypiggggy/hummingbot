@@ -65,7 +65,11 @@ def test_retention_and_failed_generation(tmp_path):
     result=collect(root,out,1788670801+31*86400)
     assert len(result["pairs"]["BTC-FDUSD"]["points"]) == 1
     with sqlite3.connect(out/"model_probability_history.sqlite") as db:
-        assert db.execute("SELECT count(*) FROM signals").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM signals").fetchone()[0] == 4
+    source(root,now=1788670800+371*86400)
+    collect(root,out,1788670801+371*86400)
+    with sqlite3.connect(out/"model_probability_history.sqlite") as db:
+        assert db.execute("SELECT count(*) FROM signals").fetchone()[0] == 4
     (root/"v22-runtime/current.json").write_text('{"runtime_generation":"bad"}')
     assert not collect(root,out,1788670802+31*86400)["pairs"]["BTC-FDUSD"]["current_available"]
 
@@ -85,6 +89,21 @@ def test_curve_gap_threshold_step_stale_view(tmp_path):
         snapshot(contract,"grid","../../escape",rows[-1]["signal_ts"])
     with pytest.raises(ValueError):
         snapshot(contract,"grid","ETH",rows[-1]["signal_ts"])
+
+
+def test_canonical_history_unknown_is_not_probability_risk_off(tmp_path):
+    now = 1800000000
+    start = now-168*3600
+    contract = {"schema": "management-probability-history-v1", "generated_at": now,
+        "pairs": {"BTC-FDUSD": {"current_available": True,"points": [
+            {"signal_ts": now-3600,"probability": .1,"threshold": .2,"risk_off": 1},
+            {"signal_ts": now,"probability": .1,"threshold": .2,"risk_off": 1}]}},
+        "observed_risk_history": {"risk_off_intervals": {"grid:BTC-FDUSD": []},
+            "known_signal_intervals": {"grid:BTC-FDUSD": [{"start":start,"end":now-6*3600}]}}}
+    data = snapshot(contract,"grid","BTC",now)
+    with Image.open(render(data,tmp_path/"canonical.png")) as image:
+        assert image.getpixel((1000,1310)) == (255,255,255)
+        assert image.getpixel((1340,1310)) == (240,241,243)
 
 
 def test_database_lock(tmp_path):

@@ -1,0 +1,19 @@
+# Opt-in overlay, apply only to the existing dca-live-report service.
+services:
+  dca-live-report:
+    image: ${CARDPUTER_REPORT_IMAGE:?Set the tested versioned report image}
+    environment:
+      CARDPUTER_MQTT_ENABLED: "true"
+      CARDPUTER_MQTT_HOST: sh.sunnypiggy.top
+      CARDPUTER_MQTT_PORT: "8883"
+      CARDPUTER_MQTT_CREDENTIALS_FILE: /run/secrets/cardputer_report_mqtt
+      CARDPUTER_MQTT_CA_FILE: /etc/cardputer/isrg-root-x1.pem
+      CARDPUTER_PRICE_PROVIDER: binance-public
+    volumes:
+      - ${CARDPUTER_REPORT_CA_PATH:?Set the trusted CA path}:/etc/cardputer/isrg-root-x1.pem:ro
+    secrets:
+      - cardputer_report_mqtt
+
+secrets:
+  cardputer_report_mqtt:
+    file: ${CARDPUTER_REPORT_CREDENTIALS_PATH:?Set the private report credentials path}

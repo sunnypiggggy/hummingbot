@@ -360,6 +360,8 @@ class TradingManagementBot:
                     )
         lines.extend(("", "🧪 Stock PAPER"))
         try:
+            if self.settings.stocks_paper_paused:
+                raise ServiceError("PAPER已暂停，旧收益不接入新账本；恢复后从新起点计算。")
             paper = self.stocks.paper_summary()
             if not paper.get("valuation_complete") or not paper.get("reconciliation", {}).get("ok"):
                 lines.append("• 收益数据无法对账，暂不展示收益数值。")
@@ -378,9 +380,12 @@ class TradingManagementBot:
                     f"回撤 {Decimal(str(account.get('drawdown_pct', 0))):.4f}%"
                 )
         except Exception as exc:
-            lines.append(f"• 数据不可用：{_safe_text(exc, 160)}")
+            if self.settings.stocks_paper_paused:
+                lines.append("• 已暂停，暂无新账本收益；不会显示旧收益或补零。")
+            else:
+                lines.append(f"• 数据不可用：{_safe_text(exc, 160)}")
         lines.append(
-            "\n口径：Grid/DCA为机器人归属MTM；Stock为独立2000 USDC Paper账户，币种不合并。"
+            "\n口径：Grid/DCA为机器人归属MTM；Stock为独立PAPER模拟账户，币种不合并。"
         )
         return "\n".join(lines)
 
@@ -866,7 +871,19 @@ class TradingManagementBot:
             contract_path = self.settings.reports_root / "model_probability_history.json"
             if not contract_path.is_file():
                 return "历史曲线尚未生成，请等待报告服务采集后刷新。", rows
-            data = snapshot(json.loads(contract_path.read_text(encoding="utf-8")), parts[2], parts[3], time.time())
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            # Missing archive is unknown; never silently reuse another risk
+            # history source once this consumer uses the canonical contract.
+            contract["observed_risk_history"] = {}
+            archive = self.settings.reports_root / "risk_history.json"
+            if archive.is_file():
+                try:
+                    history = json.loads(archive.read_text(encoding="utf-8"))
+                    if history.get("schema") == "report-risk-history-v1":
+                        contract["observed_risk_history"] = history
+                except (OSError, ValueError):
+                    contract["observed_risk_history"] = {}
+            data = snapshot(contract, parts[2], parts[3], time.time())
             path = render(data, self.settings.state_dir / "charts" / f"v22-{parts[2]}-{parts[3]}.png")
             self.telegram.send_file(chat_id, str(path))
             return "✅ 已发送该机器人的近一周曲线。实际覆盖以图中记录时间为准；点击机器人可刷新。", rows
@@ -913,6 +930,14 @@ class TradingManagementBot:
         return trading_view.page(self.settings.reports_root, 'dca', reason_cn=_reason_cn)
 
     def _stock_menu(self) -> tuple[str, list[list[tuple[str, str]]]]:
+        if self.settings.stocks_paper_paused:
+            return (
+                "🧪 Stock PAPER\n\n状态：已暂停交易\n"
+                "模拟下单与旧向导均已停用。\n"
+                "收益不接入旧账本；新版本验收并获得恢复授权后再开始。\n"
+                "Grid/DCA实盘不受影响。",
+                [[("🔄 刷新", "m:stock"), ("🏠 主菜单", "m:home")]],
+            )
         health: dict[str, Any] = {}
         mode = "UNKNOWN"
         try:
@@ -1040,6 +1065,8 @@ class TradingManagementBot:
         return RichText(escape(prefix) + "\n\n" + text), rows
 
     def _notify_stock_schedules(self) -> None:
+        if self.settings.stocks_paper_paused:
+            return
         for subscription in self.store.stock_schedule_subscriptions():
             schedule_id = str(subscription["schedule_id"])
             try:
@@ -1499,6 +1526,8 @@ class TradingManagementBot:
         return "\n".join(lines), [[("✅ 确认创建", f"w:{session['session_id']}:confirm:-"), ("取消", f"w:{session['session_id']}:cancel:-")]]
 
     def _execute_stock(self, session: dict) -> tuple[str, list]:
+        if self.settings.stocks_paper_paused:
+            return self._stock_menu()
         request = dict(session["payload"].get("request", {}))
         request_type = str(session["payload"].get("request_type", ""))
         if not request or request_type not in {"order", "position"}:
@@ -1750,6 +1779,11 @@ class TradingManagementBot:
         raise ValueError("未知审批动作")
 
     def _handle_text_session(self, message: dict, session: dict) -> tuple[str, list]:
+        if self.settings.stocks_paper_paused and session["flow"] in {
+            "stock_order", "stock_position", "whitelist_input", "limits_input", "executor_action",
+        }:
+            self.store.delete_session(session["session_id"])
+            return self._stock_menu()
         text = str(message.get("text", "")).strip()
         sid = session["session_id"]
         flow, step = session["flow"], session["step"]
@@ -1821,6 +1855,9 @@ class TradingManagementBot:
         session = self.store.get_session(sid)
         if not session:
             return "向导已过期，请重新开始。", self._back()
+        if self.settings.stocks_paper_paused and action.startswith(("wl_", "limits_", "exec_")):
+            self.store.delete_session(sid)
+            return self._stock_menu()
         if action == "wl_toggle_confirm":
             self.store.delete_session(sid)
             return "ℹ️ 白名单停用功能已移除，请在列表中直接删除。", self._back("s:whitelist")
@@ -1974,7 +2011,10 @@ class TradingManagementBot:
                 "s:paper_positions", "s:paper_trades", "s:scheduled",
             }:
                 self.store.clear_sessions(user_id, chat_id)
-            if data in {"m:home", "m:overview", "m:profit"}:
+            if self.settings.stocks_paper_paused and data.startswith(("s:", "w:", "q:")):
+                self.store.clear_sessions(user_id, chat_id)
+                text, rows = self._stock_menu()
+            elif data in {"m:home", "m:overview", "m:profit"}:
                 text, rows = self._command_route(data)
             elif data == "m:simple_audit":
                 text, rows = simple_audit_view.page(self.settings.reports_root)

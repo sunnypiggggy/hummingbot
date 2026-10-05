@@ -9,6 +9,16 @@ from typing import Any, Dict
 from urllib.parse import urlsplit, urlunsplit
 
 
+def validate_paper_startup_policy() -> None:
+    """A maintenance pause must precede database or Executor initialization."""
+    value = os.getenv("BINANCE_STOCKS_PAPER_PAUSED", "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError("BINANCE_STOCKS_PAPER_PAUSED must be true or false")
+    mode = os.getenv("BINANCE_STOCKS_RUNTIME_MODE", "PAPER").strip().upper()
+    if mode == "PAPER" and value == "true":
+        raise RuntimeError("Stock PAPER is paused; database and Executor startup are disabled")
+
+
 def dedicated_database_url(source: str, database_name: str = "hummingbot_stocks") -> str:
     parsed = urlsplit(source)
     if not database_name.replace("_", "").isalnum():

@@ -4,10 +4,11 @@ import asyncio
 import os
 from urllib.parse import urlsplit, urlunsplit
 
-from stocks_runtime.settings import dedicated_database_url
+from stocks_runtime.settings import dedicated_database_url, validate_paper_startup_policy
 
 
 async def main() -> None:
+    validate_paper_startup_policy()
     import asyncpg
 
     target = dedicated_database_url(
@@ -23,6 +24,8 @@ async def main() -> None:
     try:
         exists = await connection.fetchval("SELECT 1 FROM pg_database WHERE datname=$1", database)
         if not exists:
+            if os.getenv("BINANCE_STOCKS_DATABASE_CREATE_ENABLED", "false").strip().lower() != "true":
+                raise RuntimeError("Stocks database is missing; explicit creation authorization is required")
             await connection.execute(f'CREATE DATABASE "{database}"')
     finally:
         await connection.close()

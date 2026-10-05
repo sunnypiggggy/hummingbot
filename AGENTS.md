@@ -50,6 +50,7 @@
 - 模型授权、当前签名周、PAPER/LIVE、普通交易门和保护性退出权限分别检查。一个机制恢复不能覆盖其他阻塞；模型缺失或失效不能擅自回退旧模型。具体故障宽限、锁存和恢复规则见[韧性策略](release_packages/ethbtc-forced-exit/documentation/RESILIENCE_POLICY.md)与[退出恢复](release_packages/ethbtc-forced-exit/documentation/FORCED_EXIT_AND_RECOVERY.md)。
 - 保持[禁止 BNB 抵扣手续费规则](release_packages/ethbtc-forced-exit/documentation/NO_BNB_FEE_POLICY.md)。费用比例、过滤器、限额取相应权威来源，不从截图或历史报告推断。
 - Stock 的行情、白名单、资金、成交和风控最终校验由 Runtime 承担。PAPER 撮合应验证真实经济请求为零；不得为测试开启实盘或重置已有 Paper run。
+- 用户授权废弃PAPER账本时，先暂停Stock并验证私有备份；禁止删除共用PostgreSQL或API数据库。新存储与暂停规则见[Stock PAPER重设计](docs/STOCK_PAPER_REDESIGN.md)，缺库不自动建库，重设计验收不等于恢复交易授权。
 
 ## Telegram 与报告约定
 
@@ -117,7 +118,15 @@ docker compose --profile telegram config --quiet
 
 ## 密钥、数据与发布包
 
+- 数据库治理见[Report统一风控历史与370天保留](docs/REPORT_RISK_HISTORY_AND_DATABASE_RETENTION.md)。Report为统一风控历史唯一写入者，消费者只读；Guard运行、恢复及经济证据保留。DCA历史成交仍用于归属计算，不按年龄盲删。Telegram已发送记录及容量压力清理策略保持原样。Stock数据库500 MiB是容量目标与告警，不得以阻断成交或保护性退出写入实现硬限额。
+
 - 不输出或提交 Token、API Secret、私钥、完整环境文件或生产数据库。只读取任务所需字段；错误日志和命令不得泄露带 Token 的 URL。测试使用专用假凭证。
 - 区分源码、运行状态、研究结果与不可变发布证据。`results/`、`data/`、`logs/`、构建目录和未跟踪文件不等于可删除垃圾，清理必须有明确范围。
 - [发布包目录](release_packages/)中的内容寻址 release、manifest 和冻结报告不可原地改写。新增版本使用相应封包流程并校验依赖与哈希；发布族文档可以随源码维护，已封包副本保持不变。
 - 提交前审查差异和文件范围；不自动 `git add .`、提交、推送或部署。文档整理任务不应改变交易代码、运行状态或历史发布包。
+
+## Cardputer 报告 MQTT 运行记录
+
+- 2026-10-05 已在现有 OCI `dca-live-report` 进程内上线后台发布，不新增监控容器。当前版本 `hummingbot/dca-live-report:cardputer-mqtt-20261005-mqtt-v2`，只写 `cardputer/v1/trading/hummingbot-main/{snapshot,availability}`，TLS/只读专用 secret；报告、Telegram、策略和 Guard 权限保持原口径。
+- 部署及回退见 [Report MQTT 记录](docs/CARDPUTER_REPORT_MQTT_DEPLOYMENT.md)。OCI 主仓原报告文件仍保留，加载代码来自私有 release/context 与版本镜像；维护必须携带该版本 overlay，定向 `--no-deps --no-build`，不能用基础 Compose 或 Guard Dockerfile 覆盖报告版本。
+- 221 项相关测试、真实 retained 和下一帧、四行源时间/币种及 12h 曲线已验证；价格左端额外获取一根已闭合 K 线，收益真实缺口保持 null。其他 10 个运行容器未重启。云端接收落库与设备 HTTPS/实机显示须另验收，不能将 Broker/PUBACK/只读订阅通过等同端到端上线。

@@ -10,6 +10,9 @@ import json
 import os
 import sqlite3
 import logging
+import multiprocessing
+import signal
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -847,6 +850,9 @@ class ParameterReportWorker:
         self.receipts.mkdir(parents=True, exist_ok=True)
         self.executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=1, initializer=_low_priority_report_worker,
+            # MQTT owns background sockets/locks; fork must not inherit them.
+            **({"mp_context": multiprocessing.get_context("spawn")}
+               if _cardputer_mqtt_requested() else {}),
         )
         self.future: concurrent.futures.Future | None = None
         self.active_path: Path | None = None
@@ -1797,9 +1803,56 @@ class UnifiedTelegramReporting:
         )
         append_event(self.events, event)
 
+    def archive_risk_sources(self, now: datetime) -> None:
+        # Archive original producer records before notification flags, formatting
+        # or attachment generation can filter/mutate them. Never gate trading.
+        history_sources = [self.events, self.dca_state / "risk_audit.jsonl",
+                           self.grid_state / "telegram_events.jsonl",
+                           self.grid_state / "risk_audit.jsonl",
+                           Path("/workspace/stock-reports/telegram_events.jsonl"),
+                           Path(os.getenv("MACRO_AUDIT_PATH", "/workspace/macro/audit.jsonl"))]
+        history_sources.extend(self.bots_path.glob("instances/*/data/telegram_events.jsonl"))
+        try:
+            if not hasattr(self, "risk_history"):
+                try:
+                    from risk_history import RiskHistory
+                except ModuleNotFoundError:
+                    from live_guard.risk_history import RiskHistory
+                self.risk_history = RiskHistory(self.output, now=now.timestamp(), sources=history_sources)
+            for source in history_sources:
+                self.risk_history.ingest(source, now=now.timestamp())
+            # Inventory Guard already durably publishes pending inventory events
+            # into its JSONL before acknowledging them, regardless of Telegram.
+            # Archive that original stream above; do not open its live WAL DB
+            # through a read-only mount (which may need writable shared memory).
+        except Exception:
+            logging.getLogger(__name__).exception("Read-only risk archive unavailable; trading unaffected")
+
     def cycle(self, report: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
+        self.archive_risk_sources(now)
         robots = self.update_snapshots(report, now)
+        try:
+            # Guard timestamps describe the gates; candle/database ages do not.
+            from_source = {}
+            for strategy, root in (("grid", self.grid_state), ("dca", self.dca_state)):
+                state = self._load(root / "guard_state.json")
+                from_source[strategy] = (state.get("last_success_at") or state.get("generated_at")
+                                         or state.get("updated_at"))
+            self.risk_history.sample(robots, now=now.timestamp(), source_times=from_source)
+            self.risk_history.maintain(now=now.timestamp())
+            self.risk_history.publish(now=now.timestamp())
+        except Exception:
+            logging.getLogger(__name__).exception("Risk snapshot history unavailable; trading unaffected")
+        mqtt_reporter = getattr(self, "mqtt_reporter", None)
+        if mqtt_reporter is not None:
+            try:
+                mqtt_reporter.notify_report_ready()
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Cardputer MQTT refresh unavailable (%s); report continues",
+                    type(exc).__name__,
+                )
         try:
             if not hasattr(self, "simple_audit"):
                 try:
@@ -1831,6 +1884,7 @@ class UnifiedTelegramReporting:
                 # the persistent outbox, or parameter evidence delivery.
                 profit_report_error = f"{type(exc).__name__}: {exc}"
         sources = [self.events, self.grid_state / "telegram_events.jsonl"]
+        sources.append(Path("/workspace/stock-reports/telegram_events.jsonl"))
         sources.extend(self.bots_path.glob("instances/*/data/telegram_events.jsonl"))
         for source in sources:
             self.outbox.ingest(Path(source), attachment_builder=self.parameter_worker.schedule)
@@ -1843,6 +1897,30 @@ class UnifiedTelegramReporting:
                 "active_runtime_errors": len(current_errors["errors"]),
                 "evidence_receipts_written": evidence_receipts,
                 "profit_report_error": profit_report_error}
+
+
+def _cardputer_mqtt_requested() -> bool:
+    return os.getenv("CARDPUTER_MQTT_ENABLED", "false").strip().lower() in {
+        "true", "1", "yes", "on",
+    }
+
+
+def _start_cardputer_mqtt(output_dir: Path):
+    if not _cardputer_mqtt_requested():
+        return None
+    try:
+        from cardputer_monitor.mqtt_reporter import MqttReportPublisher
+        reporter = MqttReportPublisher.from_environment(
+            output_dir / "telegram", logger=logging.getLogger(__name__),
+        )
+        reporter.start()
+        return reporter
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Cardputer MQTT initialization unavailable (%s); report continues",
+            type(exc).__name__,
+        )
+        return None
 
 
 def main() -> int:
@@ -1875,8 +1953,34 @@ def main() -> int:
         source="dca-live-report", strategy="grid+dca", bot="report-service",
         pair="BTC-FDUSD,ETH-FDUSD,BTC-USDT,ETH-USDT",
     )
-    while True:
+    reporter = _start_cardputer_mqtt(args.output_dir)
+    telegram.mqtt_reporter = reporter
+    stopping = threading.Event()
+    previous_signals = {}
+    def request_stop(_signum, _frame):
+        stopping.set()
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_signals[signum] = signal.signal(signum, request_stop)
+    try:
+        return _run_report_loop(args, collector, telegram, runtime_errors, stopping)
+    finally:
+        if reporter is not None:
+            try:
+                reporter.stop(timeout=2)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Cardputer MQTT shutdown unavailable (%s)", type(exc).__name__,
+                )
+        for signum, previous in previous_signals.items():
+            signal.signal(signum, previous)
+
+
+def _run_report_loop(args, collector, telegram, runtime_errors, stopping) -> int:
+    while not stopping.is_set():
+        cycle_succeeded = False
         try:
+            telegram.archive_risk_sources(datetime.now(timezone.utc))
             report = collector.collect()
             telegram_status = telegram.cycle(report)
             if report.get("warnings"):
@@ -1924,6 +2028,14 @@ def main() -> int:
             runtime_errors.recovered(
                 "report_cycle", trading_status="报告与通知恢复；交易始终不受报告服务影响",
             )
+            cycle_succeeded = True
+            mqtt_health = {}
+            reporter = getattr(telegram, "mqtt_reporter", None)
+            if reporter is not None:
+                try:
+                    mqtt_health = reporter.health()
+                except Exception:
+                    mqtt_health = {"status": "unavailable"}
             print(
                 json.dumps(
                     {
@@ -1932,6 +2044,7 @@ def main() -> int:
                         "bots": len(report["bots"]),
                         "warnings": report["warnings"],
                         "telegram": telegram_status,
+                        "cardputer_mqtt": mqtt_health,
                     }
                 ),
                 flush=True,
@@ -1949,8 +2062,17 @@ def main() -> int:
                 flush=True,
             )
         if args.once:
+            if not cycle_succeeded:
+                return 1
+            if _cardputer_mqtt_requested():
+                reporter = getattr(telegram, "mqtt_reporter", None)
+                try:
+                    return 0 if reporter is not None and reporter.flush_once(timeout=30) else 1
+                except Exception:
+                    return 1
             return 0
-        time.sleep(max(60, args.interval))
+        stopping.wait(max(60, args.interval))
+    return 0
 
 
 if __name__ == "__main__":

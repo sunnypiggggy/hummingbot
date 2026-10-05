@@ -1,0 +1,16 @@
+# Extend the deployed report image without rebuilding/restarting guard/manager.
+# On OCI, REPORT_BASE_IMAGE is a pinned local tag of the pre-update report image.
+ARG REPORT_BASE_IMAGE=hummingbot/dca-live-report:local
+FROM ${REPORT_BASE_IMAGE}
+
+WORKDIR /app
+COPY cardputer_monitor/wheels/ /tmp/cardputer-wheels/
+RUN pip install --no-cache-dir --no-index --find-links=/tmp/cardputer-wheels paho-mqtt==2.1.0 \
+    && rm -rf /tmp/cardputer-wheels
+
+COPY live_guard/dca_live_report.py /app/dca_live_report.py
+COPY cardputer_monitor/__init__.py cardputer_monitor/collector.py cardputer_monitor/history.py cardputer_monitor/mqtt_reporter.py /app/cardputer_monitor/
+COPY management_bot/__init__.py management_bot/clients.py management_bot/risk_display.py /app/management_bot/
+COPY live_guard/trading_status.py live_guard/risk_history.py /app/live_guard/
+
+CMD ["python", "/app/dca_live_report.py"]

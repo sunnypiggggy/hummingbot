@@ -722,6 +722,9 @@ def test_profit_png_failure_does_not_block_event_ingest_or_mark_slot(tmp_path):
     reporting.profit_enabled = True
     reporting.client = object()
     reporting.events = tmp_path / "events.jsonl"
+    reporting.dca_state = tmp_path
+    reporting.output = tmp_path / "telegram"
+    reporting.inventory_status_path = tmp_path / "inventory" / "account_inventory_status.json"
     reporting.grid_state = tmp_path / "grid"
     reporting.bots_path = tmp_path / "bots"
     reporting.outbox = FakeOutbox()

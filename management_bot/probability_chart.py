@@ -36,7 +36,15 @@ def snapshot(contract, strategy, asset, now):
         if (all(type(v) in (int, float) and math.isfinite(v) for v in (stamp,close))
                 and now-168*3600 <= stamp <= now and close > 0):
             prices[stamp] = {'timestamp': stamp, 'close': close}
+    history = contract.get("observed_risk_history")
+    intervals = None
+    if isinstance(history, dict):
+        # A canonical archive gap is unknown, never infer it from probability.
+        intervals = history.get("risk_off_intervals", {}).get(f"{strategy}:{market_pair}", [])
     return dict(strategy=strategy, pair=f"{asset}-{'FDUSD' if strategy == 'grid' else 'USDT'}",
+                risk_off_intervals=intervals,
+                known_signal_intervals=(history.get("known_signal_intervals", {}).get(f"{strategy}:{market_pair}", [])
+                                        if isinstance(history, dict) else None),
                 prices=[prices[t] for t in sorted(prices)],
                 source=f"{asset}-FDUSD", points=points, start=now-168*3600, end=now,
                 available=fresh and source.get("current_available") is True,
@@ -127,10 +135,33 @@ def render(data, path):
             d.line((a[0]+(b[0]-a[0])*start/length,a[1]+(b[1]-a[1])*start/length,
                     a[0]+(b[0]-a[0])*end/length,a[1]+(b[1]-a[1])*end/length),
                    fill="#535960",width=4)
-    for group in segments(data):
-        for a,b in zip(group,group[1:]):
-            if a.get("risk_off") == 1 and b.get("risk_off") == 1:
-                d.rectangle((x(a["signal_ts"]),top,x(b["signal_ts"]),bottom),fill="#F8ECDD")
+    if data.get("known_signal_intervals") is not None:
+        cursor = data["start"]
+        for interval in sorted(data["known_signal_intervals"], key=lambda r: r.get("start", 0)):
+            start, end = interval.get("start"), interval.get("end")
+            if not (type(start) in (int, float) and type(end) in (int, float)
+                    and math.isfinite(start) and math.isfinite(end) and start < end):
+                continue
+            start, end = max(data["start"], start), min(data["end"], end)
+            if start >= end:
+                continue
+            if start > cursor:
+                d.rectangle((x(cursor),top,x(start),bottom),fill="#F0F1F3")
+            cursor = max(cursor,end)
+        if cursor < data["end"]:
+            d.rectangle((x(cursor),top,x(data["end"]),bottom),fill="#F0F1F3")
+    if data.get("risk_off_intervals") is not None:
+        for interval in data["risk_off_intervals"]:
+            start, end = interval.get("start"), interval.get("end")
+            if (type(start) in (int, float) and type(end) in (int, float)
+                    and data["start"] <= start < end <= data["end"]):
+                d.rectangle((x(start),top,x(end),bottom),fill="#F8ECDD")
+    else:
+        # Compatibility only until the Report-owned archive is available.
+        for group in segments(data):
+            for a,b in zip(group,group[1:]):
+                if a.get("risk_off") == 1 and b.get("risk_off") == 1:
+                    d.rectangle((x(a["signal_ts"]),top,x(b["signal_ts"]),bottom),fill="#F8ECDD")
     for v in (0,.25,.5,.75,1):
         d.line((left,y(v),right,y(v)),fill="#DFE2E5",width=2)
         text(left-20,y(v),f"{v:.0%}",28,anchor="rm")
@@ -154,7 +185,10 @@ def render(data, path):
             px=x(b["signal_ts"])
             d.line((px,top,px,bottom),fill="#AAAAAA",width=2)
             text(min(right-130,max(left,px)),top-45,f"第{b['week']}周",26)
-    text(70,1030,"概率（蓝） / 阈值（灰虚线） / Risk-Off（浅色阴影）",30)
+    legend = ("蓝：概率 / 灰虚线：阈值 / 浅橙：Risk-Off / 灰底：历史未知"
+              if data.get("known_signal_intervals") is not None else
+              "概率（蓝） / 阈值（灰虚线） / Risk-Off（浅色阴影）")
+    text(70,1030,legend,26)
     path=Path(path)
     path.parent.mkdir(parents=True,exist_ok=True)
     im.save(path,format="PNG")

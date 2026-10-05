@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Any, Dict, Optional
 
 from stocks_runtime.ledger import ACTIVE_INTENT_STATES, LedgerConflict, PostgresManagedLedger
+from stocks_runtime.quote_store import CompactQuoteStore
 
 
 PAPER_OPEN_STATES = {"OPEN", "PARTIALLY_FILLED"}
@@ -175,6 +176,7 @@ class PostgresPaperBroker:
         self._trading_date: Optional[str] = None
         self._trading_status: Dict[str, str] = {}
         self._tradability: Dict[str, str] = {}
+        self.quote_store = CompactQuoteStore(self.schema)
 
     @property
     def run_id(self) -> str:
@@ -236,22 +238,6 @@ class PostgresPaperBroker:
                     eligible_at TIMESTAMPTZ NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     terminal_at TIMESTAMPTZ
-                )
-                """
-            )
-            await connection.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self.schema}.paper_quote_events (
-                    run_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    bid NUMERIC NOT NULL,
-                    ask NUMERIC NOT NULL,
-                    bid_size NUMERIC NOT NULL,
-                    ask_size NUMERIC NOT NULL,
-                    event_time TIMESTAMPTZ NOT NULL,
-                    processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY(run_id,event_id)
                 )
                 """
             )
@@ -327,10 +313,13 @@ class PostgresPaperBroker:
 
     async def _load_latest_quotes(self) -> None:
         async with self.ledger._pool.acquire() as connection:
+            await self.quote_store.initialize(connection)
+            # A fresh PAPER run must not import old raw quotation history.
+            # Any future legacy restore requires an explicit offline migration.
             rows = await connection.fetch(
                 f"""
                 SELECT DISTINCT ON(symbol) symbol,bid,ask,bid_size,ask_size,event_time,event_id
-                FROM {self.schema}.paper_quote_events WHERE run_id=$1
+                FROM {self.schema}.paper_quote_latest WHERE run_id=$1 AND event_id IS NOT NULL
                 ORDER BY symbol,event_time DESC
                 """,
                 self._run_id,
@@ -454,21 +443,10 @@ class PostgresPaperBroker:
         quote = PaperQuote.from_payload(payload)
         if not quote.valid:
             return []
-        self._latest_quotes[quote.symbol] = quote
         changed: list[str] = []
         async with self.ledger._pool.acquire() as connection:
             async with connection.transaction():
-                inserted = await connection.fetchval(
-                    f"""
-                    INSERT INTO {self.schema}.paper_quote_events
-                      (run_id,event_id,symbol,bid,ask,bid_size,ask_size,event_time)
-                    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-                    ON CONFLICT DO NOTHING RETURNING TRUE
-                    """,
-                    self._run_id, quote.event_id, quote.symbol, quote.bid, quote.ask,
-                    quote.bid_size, quote.ask_size,
-                    datetime.fromtimestamp(quote.event_time, tz=timezone.utc),
-                )
+                inserted = await self.quote_store.accept(connection, self._run_id, quote)
                 if inserted:
                     await connection.execute(
                         f"UPDATE {self.schema}.paper_state SET last_quote_at=$1,updated_at=now() WHERE singleton=TRUE",
@@ -526,11 +504,14 @@ class PostgresPaperBroker:
                     if quantity <= 0:
                         continue
                     await self._apply_fill(connection, order, quote, quantity, price)
+                    await self.quote_store.protect_fill(connection, self._run_id, quote)
                     changed.append(client_id)
                     if side == "BUY":
                         ask_liquidity -= quantity
                     else:
                         bid_liquidity -= quantity
+        if inserted:
+            self._latest_quotes[quote.symbol] = quote
         # Economic cash and the ownership ledger must move as one observable
         # unit. Otherwise a SELL briefly appears as both proceeds and inventory,
         # fabricating an equity peak before the next reconciliation loop.

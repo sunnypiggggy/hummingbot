@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "source_id": "hummingbot-main",
+  "sample_id": "00000000-0000-4000-8000-000000000001",
+  "collected_at": 1791072000,
+  "robots": [
+    {
+      "id": "grid:BTC-FDUSD", "name": "Grid BTC", "bot_name": "grid-live-fdusd-400", "pair": "BTC-FDUSD", "quote_asset": "FDUSD",
+      "status": "NORMAL", "status_observed_at": 1791071970, "status_data_state": "FRESH", "process_running": true,
+      "trade_mode": "NORMAL", "system_health": "HEALTHY", "phase": "ACTIVE", "buy_enabled": true, "sell_enabled": true,
+      "blockers": [], "gates": [{"mechanism": "v22_weekly_buy_gate", "label": "v22周度BUY门", "enabled": true, "applicable": true, "health": "HEALTHY", "state": "RISK_ON", "buy_enabled": true, "sell_enabled": true, "reason": "模型放行"}], "recovery": {},
+      "profit_observed_at": 1791071970, "profit_data_state": "FRESH", "profit": {"4h": 0.24, "24h": 1.2, "7d": 4.8, "all": 12.3},
+      "window_complete": {"4h": true, "24h": true, "7d": true}, "equity": 212.3, "drawdown_pct": 0.42
+    },
+    {
+      "id": "grid:ETH-FDUSD", "name": "Grid ETH", "bot_name": "grid-live-fdusd-400", "pair": "ETH-FDUSD", "quote_asset": "FDUSD",
+      "status": "RESTRICTED", "status_observed_at": 1791071970, "status_data_state": "FRESH", "process_running": true,
+      "trade_mode": "BUY_BLOCKED", "system_health": "HEALTHY", "phase": "ACTIVE", "buy_enabled": false, "sell_enabled": true,
+      "blockers": ["模型暂不允许新增买入"], "gates": [{"mechanism": "v22_weekly_buy_gate", "label": "v22周度BUY门", "enabled": true, "applicable": true, "health": "HEALTHY", "state": "RISK_OFF", "buy_enabled": false, "sell_enabled": true, "reason": "模型暂不允许新增买入"}], "recovery": {},
+      "profit_observed_at": 1791071970, "profit_data_state": "FRESH", "profit": {"4h": -0.15, "24h": 0.62, "7d": 3.1, "all": 7.6},
+      "window_complete": {"4h": true, "24h": true, "7d": true}, "equity": 207.6, "drawdown_pct": 1.1
+    },
+    {
+      "id": "dca:BTC-USDT", "name": "DCA BTC", "bot_name": "dca-live-btcusdt-200", "pair": "BTC-USDT", "quote_asset": "USDT",
+      "status": "STOPPED", "status_observed_at": 1791071970, "status_data_state": "FRESH", "process_running": false,
+      "trade_mode": "STOPPED", "system_health": "HEALTHY", "phase": "ACTIVE", "buy_enabled": false, "sell_enabled": false,
+      "blockers": ["机器人进程已停止"], "gates": [], "recovery": {},
+      "profit_observed_at": 1791071970, "profit_data_state": "FRESH", "profit": {"4h": 0.0, "24h": null, "7d": null, "all": 2.4},
+      "window_complete": {"4h": true, "24h": false, "7d": false}, "equity": 202.4, "drawdown_pct": 0.0
+    },
+    {
+      "id": "dca:ETH-USDT", "name": "DCA ETH", "bot_name": "dca-live-ethusdt-200", "pair": "ETH-USDT", "quote_asset": "USDT",
+      "status": "UNAVAILABLE", "status_observed_at": null, "status_data_state": "UNAVAILABLE", "process_running": null,
+      "trade_mode": null, "system_health": null, "phase": null, "buy_enabled": null, "sell_enabled": null,
+      "blockers": ["缺少可信状态数据"], "gates": [], "recovery": {},
+      "profit_observed_at": null, "profit_data_state": "UNAVAILABLE", "profit": {"4h": null, "24h": null, "7d": null, "all": null},
+      "window_complete": {"4h": false, "24h": false, "7d": false}, "equity": null, "drawdown_pct": null
+    }
+  ]
+}

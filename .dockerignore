@@ -17,6 +17,10 @@
 /results
 /backups
 /rollout-backups
+/ops-backups
+/.env*
+/telegram-notify.env
+/telegram-management.env
 /rollout-smoke-v22*
 /.staging
 /.pytest_cache

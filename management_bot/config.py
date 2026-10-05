@@ -56,6 +56,7 @@ class Settings:
     model_approval_enabled: bool = False
     stocks_paper_trading_enabled: bool = False
     stocks_live_trading_enabled: bool = False
+    stocks_paper_paused: bool = False
     session_ttl_seconds: int = 900
     trading_status_path: Path = Path("/reports/trading_status.json")
     profit_snapshot_db_path: Path = Path("/reports/telegram_outbox.sqlite")
@@ -110,6 +111,7 @@ class Settings:
             stocks_live_trading_enabled=os.getenv(
                 "STOCKS_LIVE_TELEGRAM_TRADING_ENABLED", "false"
             ).lower() == "true",
+            stocks_paper_paused=os.getenv("BINANCE_STOCKS_PAPER_PAUSED", "false").lower() == "true",
             session_ttl_seconds=int(os.getenv("TRADING_MANAGEMENT_SESSION_TTL_SECONDS", "900")),
             trading_status_path=Path(os.getenv(
                 "TRADING_STATUS_PATH", "/reports/trading_status.json"

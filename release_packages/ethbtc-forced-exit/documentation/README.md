@@ -56,3 +56,6 @@ OCI 运维见 [TELEGRAM_NOTIFICATIONS.md](TELEGRAM_NOTIFICATIONS.md)。
 - Risk-Off：禁止普通 BUY，并由 `forced-exit-v2` 执行覆盖层取消订单、清理机器人归属基础币。
 - 归属库存：Grid `capital_reservations` 或 DCA `managed_inventory + 机器人净成交` 证明属于该机器人的基础币。
 - Fail-Closed：任何必要数据或完整性条件失败时不新增风险；完整性故障还会退出归属库存并锁存。
+# Report统一风控历史与容量治理
+
+见[源码运维说明](../../../docs/REPORT_RISK_HISTORY_AND_DATABASE_RETENTION.md)：统一历史由Report归档，业务历史370天，执行证据例外；Telegram消息清理不变，Stock容量目标500 MiB。本链接不修改历史内容寻址release副本。

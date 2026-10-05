@@ -14,7 +14,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from stocks_runtime.settings import dedicated_database_url
+from stocks_runtime.settings import dedicated_database_url, validate_paper_startup_policy
+
+validate_paper_startup_policy()
 
 os.environ["DATABASE_URL"] = dedicated_database_url(
     os.environ["DATABASE_URL"], os.getenv("BINANCE_STOCKS_DATABASE_NAME", "hummingbot_stocks")
@@ -652,6 +654,8 @@ async def stocks_lifespan(runtime_app):
         tasks.append(asyncio.create_task(runtime_app.state.stocks_async_scheduler.run(stop)))
         if paper_mode:
             tasks.append(asyncio.create_task(_checkpoint_paper_executors(runtime_app, stop)))
+            from stocks_runtime.database_capacity import run as maintain_database
+            tasks.append(asyncio.create_task(maintain_database(runtime_app, stop)))
         try:
             yield
         finally:

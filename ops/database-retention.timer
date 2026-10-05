@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily database history upkeep
+
+[Timer]
+OnCalendar=*-*-* 03:10:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=120
+Unit=database-retention.service
+
+[Install]
+WantedBy=timers.target

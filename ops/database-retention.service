@@ -1,0 +1,13 @@
+[Unit]
+Description=Allowlisted database history upkeep (no trading control)
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/ubuntu/extra_drive/hummingbot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/bin/python3 scripts/database_retention.py --root /home/ubuntu/extra_drive/hummingbot --apply
+ExecStart=/usr/bin/python3 scripts/api_database_retention.py --apply
+# Stock PAPER remains paused. No database creation or Stock container invocation.
+TimeoutStartSec=180

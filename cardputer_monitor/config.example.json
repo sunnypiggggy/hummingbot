@@ -1,0 +1,9 @@
+{
+  "reports_dir": "/reports",
+  "token_file": "/run/secrets/cardputer_telemetry_token",
+  "telemetry_url": "https://sh.sunnypiggy.top/api/cardputer/v1/telemetry/trading",
+  "interval_seconds": 60,
+  "request_timeout_seconds": 10,
+  "price_provider": "none",
+  "price_timeout_seconds": 5
+}

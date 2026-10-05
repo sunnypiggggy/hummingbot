@@ -297,7 +297,7 @@ class SimpleAudit:
         # Failures retry next report cycle, never mark a failed observation done.
         if result.get("account_total") is not None and len(result["charts"])==2:
             self.db.execute("INSERT OR IGNORE INTO hours VALUES(?,?,?,?)",(slot,account,now,json.dumps(result,ensure_ascii=False)))
-            self.db.execute("DELETE FROM hours WHERE observed_at<?", (now-90*86400,))
+            self.db.execute("DELETE FROM hours WHERE observed_at<?", (now-370*86400,))
             self.db.commit()
 
 

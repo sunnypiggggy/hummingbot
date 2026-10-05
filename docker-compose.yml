@@ -77,6 +77,8 @@ services:
       BINANCE_STOCKS_CREDENTIALS_FILE: /run/secrets/binance_stocks_credentials
       BINANCE_STOCKS_ACCOUNT: stocks_managed
       BINANCE_STOCKS_DATABASE_NAME: hummingbot_stocks
+      BINANCE_STOCKS_PAPER_PAUSED: "${BINANCE_STOCKS_PAPER_PAUSED:-true}"
+      BINANCE_STOCKS_DATABASE_CREATE_ENABLED: "${BINANCE_STOCKS_DATABASE_CREATE_ENABLED:-false}"
       BINANCE_STOCKS_ORDER_PREFIX: x-HBSTK
       BINANCE_STOCKS_PAPER_INITIAL_USDC: "2000"
       BINANCE_STOCKS_PAPER_FILL_LATENCY_MS: "1000"
@@ -396,7 +398,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dca-live-guard
-    image: hummingbot/dca-live-guard:local
+    image: hummingbot/dca-live-report:local
     restart: unless-stopped
     env_file:
       # Notification-only, non-secret settings. Do not mount .env.control:
@@ -408,6 +410,7 @@ services:
       GRID_LIVE_STATE_PATH: /workspace/grid
       ETHBTC_RELEASE_FAMILY_PATH: /workspace/releases
       GRID_PARAMETER_EVIDENCE_ROOT: /workspace/grid-parameter-evidence
+      MACRO_AUDIT_PATH: /workspace/macro/audit.jsonl
       MODEL_APPROVAL_PUBLIC_ROOT: /workspace/model-approvals
       ACCOUNT_INVENTORY_LEDGER_PATH: /workspace/account-inventory
       # Approval requests and their PNG jobs are picked up within one minute.
@@ -439,6 +442,8 @@ services:
       - ./results/ethbtc_forced_exit_weekly/approval_public:/workspace/model-approvals:ro
       - ./release_packages/ethbtc-forced-exit/parameter_evidence/grid_btc_medium_eth_long_v1:/workspace/grid-parameter-evidence:ro
       - ./account-inventory-data:/workspace/account-inventory:ro
+      - ./dca-macro-data:/workspace/macro:ro
+      - ./api-files/stocks-runtime/logs:/workspace/stock-reports:ro
     secrets:
       - telegram_notify_bot_token
     healthcheck:
@@ -492,7 +497,8 @@ services:
       TRADING_MANAGEMENT_STATE_DIR: /state
       TRADING_MANAGEMENT_MUTATIONS_ENABLED: "${TRADING_MANAGEMENT_MUTATIONS_ENABLED:-false}"
       TRADING_MANAGEMENT_MODEL_APPROVAL_ENABLED: "${TRADING_MANAGEMENT_MODEL_APPROVAL_ENABLED:-true}"
-      STOCKS_PAPER_TELEGRAM_TRADING_ENABLED: "${STOCKS_PAPER_TELEGRAM_TRADING_ENABLED:-true}"
+      STOCKS_PAPER_TELEGRAM_TRADING_ENABLED: "${STOCKS_PAPER_TELEGRAM_TRADING_ENABLED:-false}"
+      BINANCE_STOCKS_PAPER_PAUSED: "${BINANCE_STOCKS_PAPER_PAUSED:-true}"
       STOCKS_LIVE_TELEGRAM_TRADING_ENABLED: "${STOCKS_LIVE_TELEGRAM_TRADING_ENABLED:-false}"
       HUMMINGBOT_API_URL: http://hummingbot-api:8000
       STOCKS_API_URL: http://binance-stocks-runtime:8000

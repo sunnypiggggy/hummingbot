@@ -1,0 +1,15 @@
+# A Dockerfile-specific context allowlist; never send credentials, runtime data,
+# release archives, or unrelated trading code to the builder.
+**
+!cardputer_monitor/
+!cardputer_monitor/*.py
+!cardputer_monitor/requirements.txt
+!cardputer_monitor/config.example.json
+!cardputer_monitor/Dockerfile
+!cardputer_monitor/Dockerfile.dockerignore
+!management_bot/
+!management_bot/__init__.py
+!management_bot/clients.py
+!management_bot/risk_display.py
+!live_guard/
+!live_guard/trading_status.py
