@@ -71,6 +71,83 @@ def pair(tmp_path):
     return make_guard(tmp_path, exchange), exchange
 
 
+def test_empty_stale_portfolio_batch_recovers_without_manual_state_reset(pair, tmp_path):
+    guard, exchange = pair
+    guard.state["bots"][NAMES[0]]["recovery"].update({
+        "reentry_batch": "old-pair-local-batch", "reentry_cohort": False,
+    })
+    # Replay the live incident: two completed exits, one stale batch, no BUY.
+    tick(guard)
+    guard = make_guard(tmp_path, exchange, load=True)
+    for _ in range(3):
+        tick(guard)
+    assert len(exchange.posts) == 2
+    assert all(b["recovery"]["phase"] == "ACTIVE" for b in guard.state["bots"].values())
+    assert sum(e == "recoverable_empty_reentry_cohort_reconciled"
+               for e, _ in guard.audit_events) == 0  # already persisted before restart
+
+
+@pytest.mark.parametrize("evidence", ["intent", "legacy", "pending_job", "different_mechanism", "cooldown"])
+def test_stale_batch_never_relabels_economic_or_ineligible_cohort(pair, evidence):
+    guard, exchange = pair
+    first = guard.state["bots"][NAMES[0]]["recovery"]
+    first["reentry_batch"] = "original"
+    if evidence == "intent":
+        first["reentry"] = {"status": "UNKNOWN", "job_id": "uncertain"}
+    elif evidence == "legacy":
+        first["reentry_filled"] = True
+    elif evidence == "pending_job":
+        guard.inventory_ledger.start_job(
+            job_id="pending", asset="BTC", scope=f"dca_reentry:{NAMES[0]}",
+            pair="BTC-USDT", requested_quantity=Decimal("0.001"), client_order_id="pending",
+        )
+    elif evidence == "different_mechanism":
+        first["mechanism"] = "portfolio_loss_breaker"
+    else:
+        first["phase"] = "COOLDOWN"
+    before = copy.deepcopy(guard.state)
+    assert guard._reconcile_empty_reentry_cohort() is None
+    assert guard.state == before
+    assert not exchange.posts
+
+
+def test_stale_empty_cohort_preserves_other_closed_gate(pair):
+    guard, exchange = pair
+    guard.state["bots"][NAMES[0]]["recovery"]["reentry_batch"] = "old"
+    technical = copy.deepcopy(TECHNICAL)
+    technical["ETH-USDT"]["buy_enabled"] = False
+    tick(guard, technical=technical)
+    assert not exchange.posts
+    assert all(b["recovery"]["phase"] == "REENTRY" for b in guard.state["bots"].values())
+
+
+def test_accounted_aborted_job_does_not_block_a_new_portfolio_cohort(pair):
+    guard, exchange = pair
+    tick(guard, order=[NAMES[0]])
+    bot = guard.state["bots"][NAMES[0]]
+    old_entry = copy.deepcopy(bot["recovery"]["reentry"])
+    old_entry["status"] = "ABORTED"
+    bot["reentry_history"] = [old_entry]
+    bot["recovery"]["reentry"] = {}
+    bot["recovery"]["reentry_batch"] = "obsolete"
+    guard.state["bots"][NAMES[1]]["recovery"].pop("reentry_batch", None)
+    assert guard._reconcile_empty_reentry_cohort()
+    assert len(exchange.posts) == 1  # regrouping has no economic side effects
+
+
+def test_aborted_job_with_unaccounted_fill_still_blocks_regrouping(pair):
+    guard, exchange = pair
+    tick(guard, order=[NAMES[0]])
+    bot = guard.state["bots"][NAMES[0]]
+    bot["reentry_history"] = [{**bot["recovery"]["reentry"], "status": "ABORTED"}]
+    bot["recovery"]["reentry"] = {}
+    bot["recovery"]["reentry_batch"] = "obsolete"
+    guard.state["bots"][NAMES[1]]["recovery"].pop("reentry_batch", None)
+    bot["emergency_adjustments"][0]["base_delta"] = "0"
+    assert guard._reconcile_empty_reentry_cohort() is None
+    assert len(exchange.posts) == 1
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_sequential_legs_wait_then_commit_once(pair, reverse):
     guard, exchange = pair
@@ -314,6 +391,22 @@ def scenario_document():
             "prices": {"BTCUSDT": "77000", "ETHUSDT": "2500"},
             "filters": {"BTCUSDT": {"lot_step": "0.00001", "min_notional": "5"},
                         "ETHUSDT": {"lot_step": "0.0001", "min_notional": "5"}}, "faults": {}}
+
+
+def test_http_stale_cohort_uses_signed_client_and_persistent_journal(tmp_path, monkeypatch):
+    monkeypatch.setenv("GUARD_SCENARIO_MODE", "true")
+    monkeypatch.setenv("GUARD_SCENARIO_ID", "stale-reentry-cohort")
+    with RiskScenarioServer(scenario_document()) as server:
+        client = BinanceEmergencyClient("scenario-key", "scenario-secret", server.base_url)
+        guard = make_guard(tmp_path, client)
+        guard.state["bots"][NAMES[0]]["recovery"]["reentry_batch"] = "obsolete-local-batch"
+        for _ in range(5):
+            tick(guard)
+            guard = make_guard(tmp_path, client, load=True)
+        assert all(b["recovery"]["phase"] == "ACTIVE" for b in guard.state["bots"].values())
+        orders = server.server.scenario_state.public()["orders"]
+        assert len(orders) == 2 and all(o["side"] == "BUY" for o in orders)
+        assert sum(len(b["emergency_adjustments"]) for b in guard.state["bots"].values()) == 2
 
 
 @pytest.mark.parametrize("crash", [False, True])

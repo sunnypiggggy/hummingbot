@@ -1,0 +1,3 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY live_guard/dca_reentry.py /app/dca_reentry.py

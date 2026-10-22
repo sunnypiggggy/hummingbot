@@ -182,6 +182,18 @@ class UnifiedInventoryLedger:
                     created_at REAL NOT NULL, updated_at REAL NOT NULL,
                     PRIMARY KEY(job_id, sequence)
                 );
+                CREATE TABLE IF NOT EXISTS economic_fills (
+                    account_fingerprint TEXT NOT NULL, pair TEXT NOT NULL,
+                    trade_id TEXT NOT NULL, job_id TEXT NOT NULL, scope TEXT NOT NULL,
+                    order_id TEXT NOT NULL, side TEXT NOT NULL, quantity TEXT NOT NULL,
+                    price TEXT NOT NULL, commission TEXT NOT NULL, commission_asset TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL, recorded_at REAL NOT NULL,
+                    PRIMARY KEY(account_fingerprint,pair,trade_id)
+                );
+                CREATE TABLE IF NOT EXISTS economic_consumption (
+                    scope TEXT NOT NULL, pair TEXT NOT NULL, trade_id TEXT NOT NULL,
+                    consumed_at REAL NOT NULL, PRIMARY KEY(scope,pair,trade_id)
+                );
                 CREATE TABLE IF NOT EXISTS events (
                     event_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
                     payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0,
@@ -796,6 +808,68 @@ class UnifiedInventoryLedger:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def pending_jobs(self, scope: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM liquidation_jobs WHERE scope=? AND status NOT IN ('COMPLETED','DUST') "
+                "ORDER BY created_at", (scope,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_economic_fills(self, job_id: str, response: Mapping[str, Any], *, side: str) -> None:
+        """Persist exchange trade facts independently of the exit verification result."""
+        fills = list(response.get("fills") or [])
+        executed = decimal(response.get("executedQty"))
+        if executed <= 0:
+            return
+        if not fills or any(fill.get("tradeId") is None for fill in fills):
+            raise ValueError("executed order requires authoritative trade IDs before accounting")
+        if sum((decimal(fill.get("qty")) for fill in fills), Decimal("0")) != executed:
+            raise ValueError("exchange fills do not cover executed quantity")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute("SELECT * FROM liquidation_jobs WHERE job_id=?", (job_id,)).fetchone()
+            account = connection.execute("SELECT value FROM meta WHERE key='account_fingerprint'").fetchone()
+            if job is None or account is None:
+                raise ValueError("economic fill requires account binding and an owned job")
+            for fill in fills:
+                identity = (account["value"], job["pair"], str(fill["tradeId"]))
+                values = (job_id, job["scope"], str(response["orderId"]), side,
+                          str(decimal(fill["qty"])), str(decimal(fill["price"])),
+                          str(decimal(fill.get("commission"))), str(fill.get("commissionAsset", "")))
+                prior = connection.execute(
+                    "SELECT job_id,scope,order_id,side,quantity,price,commission,commission_asset "
+                    "FROM economic_fills WHERE account_fingerprint=? AND pair=? AND trade_id=?", identity,
+                ).fetchone()
+                if prior is not None and tuple(prior) != values:
+                    raise ValueError("conflicting economic trade identity; refusing double attribution")
+                connection.execute(
+                    "INSERT OR IGNORE INTO economic_fills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (*identity, *values, json.dumps(dict(fill), sort_keys=True), time.time()),
+                )
+
+    def publish_economic_fills(self, now: float) -> None:
+        """Export a transaction-consistent read contract, without WAL/SHM access."""
+        with self._connection() as connection:
+            facts = [dict(row) for row in connection.execute(
+                "SELECT f.account_fingerprint,f.pair,f.trade_id,f.scope,f.order_id,f.side,"
+                "f.quantity,f.price,f.commission,f.commission_asset,j.created_at AS executed_at "
+                "FROM economic_fills f JOIN liquidation_jobs j ON j.job_id=f.job_id"
+            )]
+        payload = {"schema": "inventory-economic-fills-v1", "generated_at": now, "fills": facts}
+        payload["sha256"] = canonical_sha256(payload)
+        _atomic_json(self.directory / "economic_fills_readonly.json", payload)
+
+    def economic_fills(self, scope: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT * FROM economic_fills WHERE scope=? ORDER BY recorded_at,trade_id", (scope,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_economic_fills(self, scope: str, fills: list[dict[str, Any]]) -> None:
+        with self._connection() as connection:
+            connection.executemany("INSERT OR IGNORE INTO economic_consumption VALUES(?,?,?,?)",
+                                   [(scope, row["pair"], row["trade_id"], time.time()) for row in fills])
+
     def finish_job(
         self, job_id: str, *, status: str, exchange_order_id: str = "",
         executed_quantity: Any = "0", quote_quantity: Any = "0",
@@ -815,6 +889,16 @@ class UnifiedInventoryLedger:
             if not all(bool(verification[key]) for key in required):
                 raise ValueError("completed liquidation job verification did not pass")
         with self._connection() as connection:
+            # A failed balance/order check must never erase an already persisted fill.
+            previous = connection.execute("SELECT * FROM liquidation_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if previous and status == "FAILED" and decimal(previous["executed_quantity"]) > 0:
+                status = "EXECUTED_PENDING_VERIFICATION"
+                exchange_order_id = previous["exchange_order_id"]
+                executed_quantity, quote_quantity = previous["executed_quantity"], previous["quote_quantity"]
+                fee_quote = previous["fee_quote"]
+                fee_details = json.loads(previous["fee_details"] or "[]")
+                if verification is None:
+                    verification = json.loads(previous["verification_json"] or "{}")
             connection.execute(
                 "UPDATE liquidation_jobs SET status=?,exchange_order_id=?,"
                 "executed_quantity=?,quote_quantity=?,fee_quote=?,fee_details=?,error=?,"

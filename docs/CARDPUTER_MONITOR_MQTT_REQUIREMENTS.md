@@ -2,6 +2,8 @@
 
 更新日期：2026-10-05，Asia/Shanghai。
 
+**当前进度：** OCI发布已上线；sh交易MQTT接收于2026-10-05约17:08 CST完成真实数据验收，四机器人摘要、详情及各73点曲线200并持续更新。无需新建 `cardputer-monitor` 容器。接收实现、测试与回滚见 [sh交易接收记录](../../serverdocker/cloud/docs/TRADING_MQTT_RECEIVER.md)，设备交互、接口和端口见 [Cardputer通信说明](../../shanghai/cardputer_adv/docs/SH_COMMUNICATION.md)。下文原先的分工记录保留为阶段历史，实机显示和按键仍待验收。
+
 本文交给负责实现与部署的 Agent。用户已决定：由 OCI 的现有 `dca-live-report` 容器直接向 `sh.sunnypiggy.top:8883` 发布交易遥测，云端接收后继续通过 HTTPS 向 Cardputer 提供数据。**本方案不新增 OCI 的 `cardputer-monitor` 容器**；该名称指交易监控功能及可复用的本地模块。
 
 现有独立采集器保留 HTTPS CLI。**2026-10-05 10:39（Asia/Shanghai）报告内 MQTT 发布的 v2 版已上线并实际收到两份连续真实快照**：四行状态/收益 FRESH、4h/24h/7d/累计窗口和 12h 收益/价格曲线符合协议，消息约 38 KiB；四条价格曲线各 73 个可信非空点。v2 修复按开盘时间查询 K 线时，12h 左端少取一根已闭合 K 线的边界问题。云端交易接收落库、设备接口及实机显示仍由接收 Agent 验证，不能把订阅成功当作完整链路验收。OCI 运行目录、版本、回退及证据见 [Report MQTT 部署交接](CARDPUTER_REPORT_MQTT_DEPLOYMENT.md)。

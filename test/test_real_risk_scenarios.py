@@ -607,6 +607,7 @@ def test_stale_balance_after_fill_prevents_completed_job(monkeypatch, tmp_path):
             job_id="stale-job", asset="BTC", scope="test", pair="BTC-USDT",
             requested_quantity="0.001", client_order_id="stale-client",
         )
+        ledger.bind_account("scenario")
         before = exchange.account_balances()["BTC"]["total"]
         with ledger.lease("BTC", "stale-holder", ttl_seconds=45):
             response = execute_market_liquidation(

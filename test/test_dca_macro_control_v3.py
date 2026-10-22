@@ -336,6 +336,106 @@ class ExecutorV3Tests(unittest.TestCase):
             ):
                 executor.apply(second)
 
+    def test_approval_claim_replays_after_restart_before_result_is_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor, api, _ = self.make_executor(directory, execution_enabled=False)
+            payload = decision("approval-restart", "negative", effective_at=NOW)
+            with mock.patch.object(executor, "_reconcile_locked", side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    executor.apply(payload)
+            key = "telegram:callback-approval-restart"
+            claim = {
+                "decision_id": payload["decision_id"],
+                "proposal_sha256": payload["approval"]["proposal_sha256"],
+                "action": "approve",
+            }
+            interrupted = executor.store.read()
+            self.assertEqual({key: claim}, interrupted["approval_callbacks"])
+            self.assertIn(payload["decision_id"], interrupted["leases"])
+            self.assertNotIn(payload["decision_id"], interrupted["decisions"])
+            self.assertFalse(api.updates)
+
+            restarted, restarted_api, _ = self.make_executor(directory, execution_enabled=False)
+            result = restarted.apply(payload)
+            self.assertEqual("shadow", result["status"])
+            self.assertEqual({key: claim}, restarted.store.read()["approval_callbacks"])
+            saved_state = restarted.store.state_path.read_bytes()
+            saved_audit = restarted.store.audit_path.read_bytes()
+            self.assertEqual(result, restarted.apply(payload))
+            self.assertEqual(saved_state, restarted.store.state_path.read_bytes())
+            self.assertEqual(saved_audit, restarted.store.audit_path.read_bytes())
+            self.assertFalse(restarted_api.updates)
+
+    def test_revocation_claim_replays_after_restart_before_result_is_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor, api, _ = self.make_executor(directory, execution_enabled=False)
+            payload = decision("revocation-restart", "negative", effective_at=NOW)
+            executor.apply(payload)
+            revocation = {
+                **payload["approval"], "action": "revoke", "telegram_callback_query_id": "revoke-callback",
+            }
+            with mock.patch.object(executor, "_reconcile_locked", side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    executor.revoke(payload["decision_id"], revocation)
+            expected = {
+                "telegram:callback-revocation-restart": {
+                    "decision_id": payload["decision_id"],
+                    "proposal_sha256": payload["approval"]["proposal_sha256"], "action": "approve",
+                },
+                "telegram:revoke-callback": {
+                    "decision_id": payload["decision_id"],
+                    "proposal_sha256": payload["approval"]["proposal_sha256"], "action": "revoke",
+                },
+            }
+            interrupted = executor.store.read()
+            self.assertEqual(expected, interrupted["approval_callbacks"])
+            self.assertEqual("revoked", interrupted["leases"][payload["decision_id"]]["status"])
+            self.assertNotIn("revocation", interrupted["leases"][payload["decision_id"]])
+            self.assertFalse(api.updates)
+
+            restarted, restarted_api, _ = self.make_executor(directory, execution_enabled=False)
+            result = restarted.revoke(payload["decision_id"], revocation)
+            self.assertEqual("revoked", result["status"])
+            self.assertEqual(expected, restarted.store.read()["approval_callbacks"])
+            saved_state = restarted.store.state_path.read_bytes()
+            saved_audit = restarted.store.audit_path.read_bytes()
+            self.assertEqual(result, restarted.revoke(payload["decision_id"], revocation))
+            self.assertEqual(saved_state, restarted.store.state_path.read_bytes())
+            self.assertEqual(saved_audit, restarted.store.audit_path.read_bytes())
+            self.assertFalse(restarted_api.updates)
+
+    def test_reused_approval_and_revocation_claims_cannot_change_persisted_state(self):
+        for reuse in ("approve_as_revoke", "revoke_for_approve", "revoke_for_revoke"):
+            with self.subTest(reuse=reuse), tempfile.TemporaryDirectory() as directory:
+                executor, api, _ = self.make_executor(directory, execution_enabled=False)
+                first = decision("first-claim", "negative", effective_at=NOW)
+                executor.apply(first)
+                if reuse == "approve_as_revoke":
+                    target = first
+                    reused = {**first["approval"], "action": "revoke"}
+                else:
+                    revoked = {
+                        **first["approval"], "action": "revoke", "telegram_callback_query_id": "revoke-callback",
+                    }
+                    executor.revoke(first["decision_id"], revoked)
+                    target = decision("second-claim", "positive", effective_at=NOW)
+                    if reuse == "revoke_for_revoke":
+                        executor.apply(target)
+                    reused = {
+                        **target["approval"], "action": "revoke", "telegram_callback_query_id": "revoke-callback",
+                    }
+                saved_state = executor.store.state_path.read_bytes()
+                saved_audit = executor.store.audit_path.read_bytes()
+                with self.assertRaisesRegex(DecisionRejected, "^approval interaction was reused$"):
+                    if reuse == "revoke_for_approve":
+                        target["approval"]["telegram_callback_query_id"] = reused["telegram_callback_query_id"]
+                        executor.apply(target)
+                    else:
+                        executor.revoke(target["decision_id"], reused)
+                self.assertEqual(saved_state, executor.store.state_path.read_bytes())
+                self.assertEqual(saved_audit, executor.store.audit_path.read_bytes())
+                self.assertFalse(api.updates)
+
     def test_overlapping_lease_expiry_restores_only_expired_side(self):
         with tempfile.TemporaryDirectory() as directory:
             executor, api, telemetry = self.make_executor(directory)

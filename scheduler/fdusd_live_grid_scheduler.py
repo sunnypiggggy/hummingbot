@@ -111,6 +111,24 @@ class Scheduler:
             return default
 
     @staticmethod
+    def _parameter_evidence_receipt(
+        receipt: dict, parameter_sha: str, *, required: bool = True,
+    ) -> tuple[bool, str]:
+        """Return delivery status and digest without modifying the receipt."""
+        unsigned_receipt = dict(receipt)
+        receipt_hash = str(unsigned_receipt.pop("delivery_receipt_sha256", ""))
+        evidence_delivered = not required or (
+            receipt.get("schema") == "telegram-evidence-delivery-receipt-v1"
+            and receipt.get("identity_sha256") == parameter_sha
+            and receipt.get("parameter_sha256") == parameter_sha
+            and receipt.get("report_request") == "grid_360d"
+            and int(receipt.get("expected_photo_count", 0)) == 6
+            and len(receipt.get("photo_sha256", [])) == 6
+            and receipt_hash == canonical_sha256(unsigned_receipt)
+        )
+        return evidence_delivered, receipt_hash
+
+    @staticmethod
     def atomic_json(path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -235,16 +253,8 @@ class Scheduler:
         receipt = self.read_json(
             self.evidence_receipt_root / f"{selection_hash}.json", {}
         ) or {}
-        unsigned_receipt = dict(receipt)
-        receipt_hash = str(unsigned_receipt.pop("delivery_receipt_sha256", ""))
-        evidence_delivered = (
-            receipt.get("schema") == "telegram-evidence-delivery-receipt-v1"
-            and receipt.get("identity_sha256") == selection_hash
-            and receipt.get("parameter_sha256") == selection_hash
-            and receipt.get("report_request") == "grid_360d"
-            and int(receipt.get("expected_photo_count", 0)) == 6
-            and len(receipt.get("photo_sha256", [])) == 6
-            and receipt_hash == canonical_sha256(unsigned_receipt)
+        evidence_delivered, receipt_hash = self._parameter_evidence_receipt(
+            receipt, selection_hash,
         )
         if not evidence_delivered:
             if state.get("pending_parameter_sha256") != selection_hash:
@@ -400,19 +410,8 @@ class Scheduler:
             receipt = self.read_json(
                 self.evidence_receipt_root / f"{parameter_sha}.json", {}
             ) or {}
-            unsigned_receipt = dict(receipt)
-            receipt_hash = str(unsigned_receipt.pop("delivery_receipt_sha256", ""))
-            evidence_delivered = (
-                not self.pair_parameter_schema_v2_enabled
-                or (
-                    receipt.get("schema") == "telegram-evidence-delivery-receipt-v1"
-                    and receipt.get("identity_sha256") == parameter_sha
-                    and receipt.get("parameter_sha256") == parameter_sha
-                    and receipt.get("report_request") == "grid_360d"
-                    and int(receipt.get("expected_photo_count", 0)) == 6
-                    and len(receipt.get("photo_sha256", [])) == 6
-                    and receipt_hash == canonical_sha256(unsigned_receipt)
-                )
+            evidence_delivered, receipt_hash = self._parameter_evidence_receipt(
+                receipt, parameter_sha, required=self.pair_parameter_schema_v2_enabled,
             )
             if not evidence_delivered:
                 saved = self.read_json(self.state_path, {}) or {}

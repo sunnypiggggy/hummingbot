@@ -1,0 +1,9 @@
+services:
+  dca-live-guard:
+    image: hummingbot/dca-live-guard:reentry-cohort-20261021-v1
+  grid-live-fdusd-scheduler:
+    image: hummingbot/grid-live-fdusd-scheduler:reentry-refresh-20261021-v1
+    environment:
+      BINANCE_STOCKS_DATABASE_CREATE_ENABLED: null
+      BINANCE_STOCKS_PAPER_PAUSED: null
+      STOCKS_PAPER_TELEGRAM_TRADING_ENABLED: ${SCHEDULER_PRESERVED_PAPER_TELEGRAM:-false}

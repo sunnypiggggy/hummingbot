@@ -1,0 +1,3 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY scripts/walk_forward_portfolio_grid_live.py /app/walk_forward_portfolio_grid_live.py

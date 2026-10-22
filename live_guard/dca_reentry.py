@@ -47,6 +47,91 @@ WAIT_REASONS = {
 
 
 class DcaReentryMixin:
+    def _aborted_reentry_job_accounted(self, bot_name, job):
+        """An aborted, terminal and fully journaled old BUY is not a new intent."""
+        bot = self.state["bots"][bot_name]
+        if not any(h.get("job_id") == job["job_id"] and h.get("status") == "ABORTED"
+                   for h in bot.get("reentry_history", [])):
+            return False
+        attempts = self.inventory_ledger.attempts(job["job_id"])
+        if not attempts or any(a.get("status") not in TERMINAL_STATUSES for a in attempts):
+            return False
+        for attempt in attempts:
+            response = json.loads(attempt.get("response_json") or "{}")
+            if (response.get("status") not in TERMINAL_STATUSES
+                    or response.get("side") != "BUY"
+                    or response.get("symbol") != job["pair"].replace("-", "")
+                    or response.get("clientOrderId") != attempt["client_order_id"]):
+                return False
+            if Decimal(str(response.get("executedQty", "0"))) == 0:
+                continue
+            fills = response.get("fills", [])
+            trade_ids = [str(f.get("tradeId", f.get("id", ""))) for f in fills]
+            if (not all(trade_ids) or len(set(trade_ids)) != len(trade_ids)
+                    or sum((Decimal(str(f["qty"])) for f in fills), Decimal("0"))
+                    != Decimal(str(response["executedQty"]))):
+                return False
+            rows = [row for row in bot.get("emergency_adjustments", [])
+                    if row.get("pair") == job["pair"] and row.get("side") == "BUY"
+                    and str(row.get("order_id")) == str(response.get("orderId"))]
+            if len(rows) != 1:
+                return False
+            if set(map(str, rows[0].get("trade_ids", []))) != set(trade_ids):
+                return False
+            metrics = self._emergency_fill_metrics(job["pair"], "BUY", response)
+            if any(Decimal(str(rows[0].get(key, "NaN"))) != Decimal(str(value))
+                   for key, value in {
+                       "executed_qty": response["executedQty"],
+                       "cummulative_quote_qty": response["cummulativeQuoteQty"],
+                       "base_delta": metrics["base_delta"],
+                       "quote_cashflow": metrics["quote_cashflow"],
+                       "fee_quote": metrics["fee_quote"],
+                   }.items()):
+                return False
+        return True
+
+    def _reconcile_empty_reentry_cohort(self):
+        """Regroup stale markers only before any leg has an economic intent."""
+        names = [spec.bot_name for spec in LIVE_PAIRS.values()]
+        peers = [self.state["bots"].get(name, {}).get("recovery", {}) for name in names]
+        if not all(p.get("phase") == REENTRY and p.get("scope") == "portfolio"
+                   for p in peers):
+            return None
+        if len({p.get("mechanism") for p in peers}) != 1:
+            return None
+        if len({p.get("reentry_batch") for p in peers}) <= 1:
+            return None
+        if any(p.get(key) for p in peers for key in (
+            "reentry", "reentry_filled", "legacy_reentry_pending", "reentry_abort_pending",
+        )):
+            return None
+        ledger = getattr(self, "inventory_ledger", None)
+        if ledger is None or any(
+            not self._aborted_reentry_job_accounted(name, job)
+            for name in names for job in ledger.pending_jobs(f"dca_reentry:{name}")
+        ):
+            return None
+        before = deepcopy(self.state)
+        previous = {name: peers[i].get("reentry_batch") for i, name in enumerate(names)}
+        batch = canonical_sha256({
+            "purpose": "empty_portfolio_reentry_cohort_v1",
+            "bots": {name: {key: peers[i].get(key) for key in (
+                "triggered_at", "mechanism", "scope", "exit_completed_at",
+            )} for i, name in enumerate(names)},
+            "previous_batches": previous,
+        })
+        for peer in peers:
+            peer["reentry_batch"] = batch
+            peer["reentry_cohort"] = True
+        try:
+            self._save()
+        except Exception:
+            self.state = before
+            raise
+        self._audit("recoverable_empty_reentry_cohort_reconciled",
+                    bots=names, previous_batches=previous, batch=batch)
+        return batch
+
     def _ensure_reentry_batch(self, bot_name):
         state = self.state["bots"][bot_name]["recovery"]
         if state.get("reentry_batch"):
@@ -88,6 +173,10 @@ class DcaReentryMixin:
     def _reentry_permitted(self, state, macro, technical, portfolio_all_gates):
         cohort = state.get("scope") == "portfolio" or state.get("reentry_cohort")
         if cohort:
+            batch = self._reconcile_empty_reentry_cohort()
+            if batch:
+                state["reentry_batch"] = batch
+                state["reentry_cohort"] = True
             peers = [self.state["bots"].get(spec.bot_name, {}) for spec in LIVE_PAIRS.values()]
             if any(peer.get("tripped") or peer.get("recovery", {}).get("phase") != REENTRY
                    for peer in peers):

@@ -4,6 +4,7 @@ import sys
 import time
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "live_guard"), str(ROOT / "scripts")]
@@ -29,6 +30,8 @@ def make_guard(root, exchange, *, load=False):
     guard._lot_filter = lambda pair: (Decimal("0.00001" if pair.startswith("BTC") else "0.0001"), Decimal("5"))
     guard._executor_counts = lambda path: {"open_orders": 0, "active_buy_executors": 0}
     guard.audit_events = []
+    guard.runtime_errors = SimpleNamespace(failure=lambda *a, **k: None,
+                                          recovered=lambda *a, **k: None)
     guard._audit = lambda event, **kw: guard.audit_events.append((event, kw))
     if load:
         guard.state = json.loads(guard.state_path.read_text())

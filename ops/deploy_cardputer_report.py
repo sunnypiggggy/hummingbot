@@ -23,7 +23,8 @@ import paramiko
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_FILES = (
     "Dockerfile.dca-live-report-mqtt", "ops/compose.cardputer-report-mqtt.yml",
-    "live_guard/dca_live_report.py", "live_guard/trading_status.py", "live_guard/risk_history.py",
+    "live_guard/dca_live_report.py", "live_guard/report_cards.py",
+    "live_guard/trading_status.py", "live_guard/risk_history.py",
     "management_bot/__init__.py", "management_bot/clients.py", "management_bot/risk_display.py",
     "cardputer_monitor/__init__.py", "cardputer_monitor/collector.py",
     "cardputer_monitor/history.py", "cardputer_monitor/mqtt_reporter.py",
@@ -362,7 +363,9 @@ def verify_runtime(client, baseline, manifest, artifact):
         raise RuntimeError("Loaded report ports/network changed")
     files = {name: sha for name, sha in manifest["source_sha256"].items()
              if name.endswith(".py")}
-    names = {name: ("/app/dca_live_report.py" if name == "live_guard/dca_live_report.py" else "/app/" + name)
+    names = {name: ("/app/" + Path(name).name if name in {
+                 "live_guard/dca_live_report.py", "live_guard/report_cards.py",
+             } else "/app/" + name)
              for name in files}
     program = ("import hashlib,json,pathlib;paths=" + repr(names)
                + ";print(json.dumps({p:hashlib.sha256(pathlib.Path(f).read_bytes()).hexdigest() for p,f in paths.items()}))")

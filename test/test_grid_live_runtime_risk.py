@@ -831,6 +831,63 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
         self.assertEqual({"ETH-FDUSD"}, {pair for _, pair in submitted})
         self.assertEqual(ACTIVE, strategy.pair_recovery["ETH-FDUSD"]["phase"])
 
+    def test_completed_reentry_requests_only_its_pair_grid_immediately(self):
+        strategy = self.strategy()
+        strategy.config.risk_auto_reentry_enabled = True
+        pair = "BTC-FDUSD"
+        strategy.pair_recovery[pair] = normalize_state({
+            **active_state(), "phase": REENTRY, "mechanism": "v22_weekly_buy_gate",
+            "scope": "technical", "triggered_at": 900,
+        })
+        strategy.ledgers[pair].halted = True
+        strategy._reenter_pair = lambda *_: True
+        strategy._advance_risk_recovery(
+            {pair: Decimal("80000"), "ETH-FDUSD": Decimal("2500")}, []
+        )
+        self.assertEqual(ACTIVE, strategy.pair_recovery[pair]["phase"])
+        self.assertEqual("REFRESH_REQUESTED", strategy.order_build_status[pair]["state"])
+        self.assertEqual("risk_reentry_complete", strategy.order_build_status[pair]["reason"])
+        self.assertNotEqual("REFRESH_REQUESTED", strategy.order_build_status["ETH-FDUSD"]["state"])
+
+    def test_legacy_completed_reentry_snapshot_rebuilds_without_buying_inventory(self):
+        strategy = self.strategy()
+        pair = "ETH-FDUSD"
+        strategy.order_build_status[pair].update({
+            "state": "EXPECTED_EMPTY", "reason": "v22_weekly_buy_gate:REENTRY",
+        })
+        strategy.buy = lambda *_: self.fail("reconciliation must not buy inventory")
+        self.assertTrue(strategy._check_order_liveness_and_rebuild(
+            {pair: Decimal("2500"), "BTC-FDUSD": Decimal("80000")}, []
+        ))
+        self.assertEqual("REFRESH_REQUESTED", strategy.order_build_status[pair]["state"])
+
+    def test_legacy_empty_snapshot_does_not_rebuild_under_active_risk(self):
+        strategy = self.strategy()
+        pair = "ETH-FDUSD"
+        strategy.order_build_status[pair].update({
+            "state": "EXPECTED_EMPTY", "reason": "v22_weekly_buy_gate:REENTRY",
+        })
+        strategy.ledgers[pair].halted = True
+        self.assertFalse(strategy._check_order_liveness_and_rebuild(
+            {pair: Decimal("2500"), "BTC-FDUSD": Decimal("80000")}, []
+        ))
+        self.assertEqual("EXPECTED_EMPTY", strategy.order_build_status[pair]["state"])
+
+    def test_portfolio_reentry_queues_both_pair_refreshes(self):
+        strategy = self.strategy()
+        strategy.config.risk_auto_reentry_enabled = True
+        strategy.portfolio_recovery = normalize_state({
+            **active_state(), "phase": REENTRY, "mechanism": "portfolio_drawdown_breaker",
+            "scope": "portfolio", "triggered_at": 900,
+        })
+        strategy._reenter_pair = lambda *_: True
+        strategy._advance_risk_recovery(
+            {"BTC-FDUSD": Decimal("80000"), "ETH-FDUSD": Decimal("2500")}, []
+        )
+        self.assertEqual(ACTIVE, strategy.portfolio_recovery["phase"])
+        self.assertTrue(all(s["state"] == "REFRESH_REQUESTED"
+                            for s in strategy.order_build_status.values()))
+
     def test_synchronous_market_fill_before_order_registration_never_resubmits(self):
         strategy = self.strategy()
         pair = "ETH-FDUSD"
@@ -922,7 +979,7 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
                 },
             }), encoding="utf-8")
             database = Path(directory) / "grid.sqlite"
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute(
                     'CREATE TABLE "Order" '
                     '(id TEXT, last_status TEXT, exchange_order_id TEXT)'
@@ -937,7 +994,7 @@ class GridLiveRuntimeRiskTest(unittest.TestCase):
             strategy.buy = lambda *_args: submitted.append("durable-reentry") or "durable-reentry"
             self.assertFalse(strategy._reenter_pair(pair, price))
             strategy._forget_order("durable-reentry")
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute(
                     'INSERT INTO "Order" VALUES(?,?,?)',
                     ("durable-reentry", "COMPLETED", "exchange-order"),

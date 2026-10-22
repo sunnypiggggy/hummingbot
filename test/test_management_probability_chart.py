@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,57 @@ def test_sparse_audit_import_and_idempotence(tmp_path):
     assert len(points)==2
     assert points[0]['break_before']==1
     assert len(collect(root,out,1788670802)['pairs']['BTC-FDUSD']['points'])==2
+
+
+def test_historical_signal_valid_at_observation_survives_current_week_expiry(tmp_path):
+    root, out = tmp_path/'source', tmp_path/'out'
+    now = 1788670800
+    historical = source(root, now=now-3600)
+    historical['cutover_phase'] = 'ACTIVE'
+    for row in historical['pairs'].values():
+        row['week_end'] = now-1800
+    (root/'risk_audit.jsonl').write_text(json.dumps({
+        'timestamp': now-3599, 'gate': historical,
+    })+'\n')
+    source(root, now=now)
+    result = collect(root, out, now+1)
+    for pair in ('BTC-FDUSD', 'ETH-FDUSD'):
+        assert result['pairs'][pair]['current_available'] is True
+        assert [row['signal_ts'] for row in result['pairs'][pair]['points']] == [now-3600, now]
+
+
+def test_multiple_model_identities_at_one_signal_time_remain_ambiguous(tmp_path):
+    root, out = tmp_path/'source', tmp_path/'out'
+    gate = source(root)
+    collect(root, out, 1788670801)
+    gate['model_sha256'] = 'c'*64
+    (root/'xgboost_risk_gate.json').write_text(json.dumps(gate))
+    result = collect(root, out, 1788670802)
+    for pair in ('BTC-FDUSD', 'ETH-FDUSD'):
+        assert result['pairs'][pair]['current_available'] is True
+        assert result['pairs'][pair]['points'] == []
+    with closing(sqlite3.connect(out/'model_probability_history.sqlite')) as db:
+        assert db.execute('SELECT count(*) FROM signals').fetchone()[0] == 4
+
+
+def test_signal_write_failure_rolls_back_market_and_sampling_changes(tmp_path):
+    root, out = tmp_path/'source', tmp_path/'out'
+    now = 1788670800
+    source(root)
+    collect(root, out, now+1)
+    database = out/'model_probability_history.sqlite'
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("""CREATE TRIGGER reject_sampling BEFORE INSERT ON sampling
+                      BEGIN SELECT RAISE(ABORT, 'synthetic sampling failure'); END""")
+        before = db.execute('SELECT * FROM sampling ORDER BY pair').fetchall()
+    source(root, now=now+900)
+    with pytest.raises(sqlite3.IntegrityError, match='synthetic sampling failure'):
+        collect(root, out, now+901, price_reader=lambda pair, stamp: [{'timestamp': stamp, 'close': 123}])
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute('SELECT count(*) FROM prices').fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM price_poll').fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM signals').fetchone()[0] == 2
+        assert db.execute('SELECT * FROM sampling ORDER BY pair').fetchall() == before
 
 
 @pytest.mark.parametrize('count', [0, 1, 2])

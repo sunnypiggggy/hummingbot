@@ -479,10 +479,8 @@ async def _create_or_queue(
     return await _create_managed_executor(executor_config, controller_id, request)
 
 
-@router.post("/order-executors")
-async def create_order_executor(payload: OrderExecutorRequest, request: Request) -> Dict[str, Any]:
-    """Create a real OrderExecutor lifecycle backed by the local Paper venue."""
-    config = build_order_executor_config(
+def _order_config(payload: OrderExecutorRequest) -> Dict[str, Any]:
+    return build_order_executor_config(
         executor_id=payload.id,
         symbol=payload.symbol,
         side=payload.side,
@@ -491,6 +489,26 @@ async def create_order_executor(payload: OrderExecutorRequest, request: Request)
         price=payload.price,
         source_owner=payload.source_owner,
     )
+
+
+def _position_config(payload: PositionExecutorRequest) -> Dict[str, Any]:
+    return build_position_executor_config(
+        executor_id=payload.id,
+        symbol=payload.symbol,
+        amount=payload.amount,
+        entry_order_type=payload.entry_order_type,
+        entry_price=payload.entry_price,
+        stop_loss=payload.stop_loss,
+        time_limit=payload.time_limit,
+        take_profit=payload.take_profit,
+        trailing_activation=payload.trailing_activation,
+        trailing_delta=payload.trailing_delta,
+    )
+
+
+async def _create_typed_executor(
+    config: Dict[str, Any], payload: OrderExecutorRequest | PositionExecutorRequest, request: Request
+) -> Dict[str, Any]:
     try:
         result = await _create_or_queue(
             executor_config=config, payload=payload, controller_id=payload.controller_id,
@@ -509,67 +527,29 @@ async def create_order_executor(payload: OrderExecutorRequest, request: Request)
     return result
 
 
+@router.post("/order-executors")
+async def create_order_executor(payload: OrderExecutorRequest, request: Request) -> Dict[str, Any]:
+    """Create a real OrderExecutor lifecycle backed by the local Paper venue."""
+    config = _order_config(payload)
+    return await _create_typed_executor(config, payload, request)
+
+
 @router.post("/order-executors/preview")
 async def preview_order_executor(payload: OrderExecutorRequest, request: Request) -> Dict[str, Any]:
-    config = build_order_executor_config(
-        executor_id=payload.id,
-        symbol=payload.symbol,
-        side=payload.side,
-        amount=payload.amount,
-        order_type=payload.order_type,
-        price=payload.price,
-        source_owner=payload.source_owner,
-    )
+    config = _order_config(payload)
     return await _preview_managed_executor(config, payload.controller_id, request)
 
 
 @router.post("/position-executors")
 async def create_position_executor(payload: PositionExecutorRequest, request: Request) -> Dict[str, Any]:
     """Create a long PositionExecutor with real barrier and time-exit processing."""
-    config = build_position_executor_config(
-        executor_id=payload.id,
-        symbol=payload.symbol,
-        amount=payload.amount,
-        entry_order_type=payload.entry_order_type,
-        entry_price=payload.entry_price,
-        stop_loss=payload.stop_loss,
-        time_limit=payload.time_limit,
-        take_profit=payload.take_profit,
-        trailing_activation=payload.trailing_activation,
-        trailing_delta=payload.trailing_delta,
-    )
-    try:
-        result = await _create_or_queue(
-            executor_config=config, payload=payload, controller_id=payload.controller_id,
-            activation_policy=payload.activation_policy, quote_budget=payload.quote_budget, request=request,
-        )
-    except LedgerConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except (LedgerLimitExceeded, ValueError, InvalidOperation) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    result["execution_scope"] = "paper" if request.app.state.stocks_settings.mode == "PAPER" else "live"
-    result["binance_economic_request"] = False if request.app.state.stocks_settings.mode == "PAPER" else None
-    return result
+    config = _position_config(payload)
+    return await _create_typed_executor(config, payload, request)
 
 
 @router.post("/position-executors/preview")
 async def preview_position_executor(payload: PositionExecutorRequest, request: Request) -> Dict[str, Any]:
-    config = build_position_executor_config(
-        executor_id=payload.id,
-        symbol=payload.symbol,
-        amount=payload.amount,
-        entry_order_type=payload.entry_order_type,
-        entry_price=payload.entry_price,
-        stop_loss=payload.stop_loss,
-        time_limit=payload.time_limit,
-        take_profit=payload.take_profit,
-        trailing_activation=payload.trailing_activation,
-        trailing_delta=payload.trailing_delta,
-    )
+    config = _position_config(payload)
     return await _preview_managed_executor(config, payload.controller_id, request)
 
 

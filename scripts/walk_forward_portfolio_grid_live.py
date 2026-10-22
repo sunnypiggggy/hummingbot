@@ -1635,6 +1635,15 @@ class LivePortfolioGrid(StrategyV2Base):
                     "first_empty_at": None,
                 })
                 continue
+            if pair_active and expected <= 0 and actual == 0 and (
+                str(status.get("reason", "")).endswith(":REENTRY")
+                or str(status.get("reason", "")).endswith(":COOLDOWN")
+            ):
+                # Inventory was already bought back. Repair pre-fix snapshots
+                # via normal order reconciliation, never another market BUY.
+                self._request_pair_order_refresh(pair, reason="risk_reentry_order_refresh")
+                rebuilt = True
+                continue
             if not pair_active or expected <= 0:
                 status["consecutive_empty_cycles"] = 0
                 status["first_empty_at"] = None
@@ -2375,6 +2384,7 @@ class LivePortfolioGrid(StrategyV2Base):
                     )
                     self.ledgers[pair].halted = False
                     self.ledgers[pair].episode_equity_baseline = self.ledgers[pair].equity(prices[pair])
+                    self._request_pair_order_refresh(pair, reason="risk_reentry_complete")
                     self._record_runtime_event(
                         "risk_reentry_complete", pair=pair,
                         recovery=self.pair_recovery[pair],
@@ -2420,6 +2430,7 @@ class LivePortfolioGrid(StrategyV2Base):
                         ledger.peak_equity = ledger.equity(prices[pair])
                         ledger.episode_equity_baseline = ledger.equity(prices[pair])
                         self.pair_recovery[pair] = active_state()
+                        self._request_pair_order_refresh(pair, reason="risk_reentry_complete")
         return portfolio_blocked
 
     def _reenter_pair(self, pair: str, price: Decimal) -> bool:

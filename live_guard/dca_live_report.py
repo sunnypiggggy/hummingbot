@@ -15,10 +15,9 @@ import signal
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
-from zoneinfo import ZoneInfo
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -57,14 +56,24 @@ except ModuleNotFoundError:  # Repository import; container copies it to /app.
     from scripts.dca_live_common import LIVE_PAIRS, STRATEGY_BUDGET_QUOTE, side_budget, adjustment_timestamp_seconds, base_fee_correction
 
 
+try:
+    import report_cards
+    from report_cards import (
+        MAX_DATA_AGE_SECONDS, MAX_GUARD_STATUS_AGE_SECONDS, SHANGHAI,
+        dca_report_infrastructure_status, dust_usdt_text, inventory_exposure_quote,
+    )
+except ModuleNotFoundError:
+    from live_guard import report_cards
+    from live_guard.report_cards import (
+        MAX_DATA_AGE_SECONDS, MAX_GUARD_STATUS_AGE_SECONDS, SHANGHAI,
+        dca_report_infrastructure_status, dust_usdt_text, inventory_exposure_quote,
+    )
+
 BINANCE_API = OFFICIAL_BINANCE_API
 SCALE = Decimal("1000000")
 WINDOW_DAYS = 7
 MAX_PUBLIC_FILLS = 2_000
-MAX_DATA_AGE_SECONDS = 900
-MAX_GUARD_STATUS_AGE_SECONDS = 90
 CHART_SIZE = (1280, 1000)
-SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _low_priority_report_worker() -> None:
@@ -88,75 +97,8 @@ def timestamp_seconds(value: Any) -> float:
     return timestamp
 
 
-def dust_usdt_text(dust: Mapping[str, Any]) -> str:
-    """Return a display-only dust value without exposing base-asset quantity."""
-    try:
-        value = float(dust.get("estimated_notional"))
-    except (TypeError, ValueError):
-        return "共享账户 Dust：无可信美元估值"
-    return f"共享账户 Dust：约 {value:.4f} USDT"
-
-
-def dca_report_infrastructure_status(
-    *, bot: Mapping[str, Any], guard: Mapping[str, Any],
-    inventory_status: Mapping[str, Any], v22_contract: Mapping[str, Any],
-    macro_contract: Mapping[str, Any], now_ts: float,
-) -> tuple[bool, str]:
-    """Evaluate source health without treating a quiet trade DB as stale.
-
-    A DCA SQLite file may not be written for hours when orders do not fill. Its
-    mtime remains report metadata, while Guard observations provide runtime
-    liveness and market candles provide valuation freshness.
-    """
-    monitor_error = str(guard.get("last_monitor_error") or "").strip()
-    if monitor_error:
-        return False, monitor_error
-    if not bot.get("database_available"):
-        return False, "sqlite_unavailable"
-    if not bot.get("market_data_healthy"):
-        return False, "market_data_stale_or_missing"
-    try:
-        market_age = float(bot.get("market_data_age_seconds"))
-    except (TypeError, ValueError):
-        return False, "market_data_age_unavailable"
-    if market_age > MAX_DATA_AGE_SECONDS:
-        return False, "market_data_stale"
-    try:
-        guard_age = max(0.0, now_ts - float(guard.get("last_success_at")))
-    except (TypeError, ValueError):
-        return False, "guard_observation_unavailable"
-    if guard_age > MAX_GUARD_STATUS_AGE_SECONDS:
-        return False, "guard_observation_stale"
-    if inventory_status.get("sources_healthy") is not True:
-        return False, "inventory_sources_unhealthy"
-    if not v22_contract.get("healthy"):
-        return False, str(v22_contract.get("reason") or "v22_contract_unhealthy")
-    if not macro_contract.get("healthy"):
-        return False, str(macro_contract.get("reason") or "macro_contract_unhealthy")
-    return True, "all_sources_fresh"
-
-
 def decimal_value(value: Any) -> Decimal:
     return Decimal(int(value or 0)) / SCALE
-
-
-def inventory_exposure_quote(
-    owner_value: Any, mark_price: Any, remaining_value: Any = None,
-) -> tuple[float | None, float | None]:
-    """Value human-decimal inventory contract fields in quote currency."""
-    try:
-        owner = Decimal(str(owner_value))
-        mark = Decimal(str(mark_price))
-        remaining = owner if remaining_value is None else Decimal(str(remaining_value))
-        if not all(value.is_finite() for value in (owner, mark, remaining)):
-            return None, None
-        owned_quote = owner * mark
-        remaining_quote = remaining * mark
-        if not owned_quote.is_finite() or not remaining_quote.is_finite():
-            return None, None
-        return float(owned_quote), float(remaining_quote)
-    except (InvalidOperation, OverflowError, TypeError, ValueError):
-        return None, None
 
 
 def normalize_side(value: Any) -> str:
@@ -258,21 +200,12 @@ def calculate_pair_report(
     market_healthy = market_age is not None and market_age <= MAX_DATA_AGE_SECONDS
     mark = Decimal(latest_candle["close"]) if latest_candle else None
     ordered_rows = sorted(rows, key=lambda item: timestamp_seconds(item[4]))
-    before_rows = [
-        row for row in ordered_rows if timestamp_seconds(row[4]) < window_start_ts
-    ]
     window_rows = [
         row
         for row in ordered_rows
         if window_start_ts <= timestamp_seconds(row[4]) <= now_ts
     ]
     emergency_adjustments = list(emergency_adjustments or [])
-    before_adjustments = [
-        item
-        for item in emergency_adjustments
-        if adjustment_timestamp_seconds(item["recorded_at"])
-        < window_start_ts
-    ]
     window_adjustments = [
         item
         for item in emergency_adjustments
@@ -281,11 +214,7 @@ def calculate_pair_report(
         <= now_ts
     ]
     all_metrics = row_metrics(ordered_rows)
-    before_metrics = row_metrics(before_rows)
-    seven_day_metrics = row_metrics(window_rows)
     apply_emergency_adjustments(all_metrics, emergency_adjustments)
-    apply_emergency_adjustments(before_metrics, before_adjustments)
-    apply_emergency_adjustments(seven_day_metrics, window_adjustments)
 
     all_time_mtm = (
         all_metrics["cashflow_quote"]
@@ -599,6 +528,52 @@ def render_chart(report: dict[str, Any], output: Path) -> None:
     image.save(output, "PNG", optimize=True)
 
 
+def read_economic_adjustments(path: Path, bot_name: str, pair: str, database: Path, legacy: list) -> list:
+    """Read shared fill facts without opening the ledger for writes or migration."""
+    export = path.parent / "economic_fills_readonly.json"
+    if not path.is_file() and not export.is_file():
+        return list(legacy)
+    if export.is_file():
+        payload = json.loads(export.read_text(encoding="utf-8"))
+        expected = payload.pop("sha256", "")
+        actual = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+        if payload.get("schema") != "inventory-economic-fills-v1" or expected != actual:
+            raise ValueError("economic fill export integrity check failed")
+        if not 0 <= time.time() - float(payload.get("generated_at", 0)) <= 180:
+            raise ValueError("economic fill export is stale")
+        facts = [row for row in payload["fills"] if row["scope"] == f"dca:{bot_name}" and row["pair"] == pair]
+    else:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10) as connection:
+            connection.row_factory = sqlite3.Row
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='economic_fills'").fetchone():
+                return list(legacy)
+            facts = connection.execute(
+                "SELECT f.*,j.created_at AS executed_at FROM economic_fills f JOIN liquidation_jobs j ON j.job_id=f.job_id "
+                "WHERE f.scope=? AND f.pair=?", (f"dca:{bot_name}", pair),
+            ).fetchall()
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(TradeFill)")}
+        normal_ids = {str(row[0]) for row in connection.execute("SELECT exchange_trade_id FROM TradeFill WHERE symbol=?", (pair,))} if "exchange_trade_id" in columns else set()
+    legacy_orders = {str(row.get("order_id", "")) for row in legacy}
+    result = list(legacy)
+    for fill in facts:
+        if fill["trade_id"] in normal_ids or fill["order_id"] in legacy_orders:
+            continue
+        quantity, price, fee = (Decimal(fill[key]) for key in ("quantity", "price", "commission"))
+        base, quote = pair.split("-", 1)
+        if fee and fill["commission_asset"] not in {base, quote}:
+            raise ValueError("third-asset fee valuation unavailable")
+        result.append({
+            "recorded_at": datetime.fromtimestamp(fill["executed_at"], timezone.utc).isoformat(),
+            "side": fill["side"], "order_id": fill["order_id"], "trade_id": fill["trade_id"],
+            "base_delta": str((quantity if fill["side"] == "BUY" else -quantity) - (fee if fill["commission_asset"] == base else 0)),
+            "quote_cashflow": str(quantity * price * (-1 if fill["side"] == "BUY" else 1)),
+            "fee_quote": str(fee if fill["commission_asset"] == quote else 0),
+            "accounting_source": "shared_economic_trade_fact",
+        })
+    return result
+
+
 class DcaLiveReportCollector:
     def __init__(
         self,
@@ -610,7 +585,13 @@ class DcaLiveReportCollector:
         self.bots_path = bots_path
         self.output_dir = output_dir
         self.guard_state_path = output_dir / "guard_state.json"
+        self.inventory_status_path = Path(os.getenv(
+            "ACCOUNT_INVENTORY_LEDGER_PATH", "/workspace/account-inventory"
+        )) / "account_inventory_status.json"
         self.candle_reader = candle_reader or self._binance_candles
+
+    def _economic_adjustments(self, bot_name: str, pair: str, database: Path, legacy: list) -> list:
+        return read_economic_adjustments(self.inventory_status_path.parent / "account_inventory.sqlite", bot_name, pair, database, legacy)
 
     def _database(self, bot_name: str) -> Path | None:
         exact = self.bots_path / "instances" / bot_name / "data" / f"{bot_name}.sqlite"
@@ -707,9 +688,9 @@ class DcaLiveReportCollector:
                         0.0, time.time() - database.stat().st_mtime
                     ),
                     now=now,
-                    emergency_adjustments=guard_state.get("bots", {})
-                    .get(spec.bot_name, {})
-                    .get("emergency_adjustments", []),
+                    emergency_adjustments=self._economic_adjustments(
+                        spec.bot_name, pair, database, bot_state.get("emergency_adjustments", [])
+                    ),
                     managed_base=managed_base,
                     managed_base_cost_quote=side_budget(),
                 )
@@ -1091,7 +1072,7 @@ class UnifiedTelegramReporting:
                     "active": True,
                     "source": source,
                     "component": str(component),
-                    "bot": bot,
+                    "bot": details.get("bot") or bot,
                     "pair": details.get("pair") or pair,
                     "summary": str(raw.get("summary") or "未知运行错误"),
                     "severity": str(raw.get("severity") or "warning"),
@@ -1102,6 +1083,11 @@ class UnifiedTelegramReporting:
                     "action": str(raw.get("action") or "automatic_retry"),
                     "reason": details.get("reason"),
                     "residual_orders": details.get("residual_orders", []),
+                    "reconciliation_checks": details.get("checks"),
+                    "release_condition": details.get("release_condition") or (
+                        "订单、成交、余额及活动执行器核验通过后按原冷却恢复；其他风控门仍须放行"
+                        if str(component).startswith("exit_reconciliation:") else None
+                    ),
                 })
         payload = {
             "schema": "management-current-runtime-errors-v1",
@@ -1145,37 +1131,11 @@ class UnifiedTelegramReporting:
     def _reported_cutover_phase(
         cutover: Mapping[str, Any], contract: Mapping[str, Any], now: datetime,
     ) -> str | None:
-        if contract.get("fold_handover_active") is True:
-            return "FOLD_HANDOVER_STABLE"
-        phase = str(cutover.get("phase") or "")
-        boundary = int(cutover.get("fold_boundary") or 0)
-        if (
-            cutover.get("schema") == "ethbtc-forced-exit-cutover-status-v1"
-            and phase == "PREWARMED_PENDING_ACTIVATION"
-            and now.timestamp() < boundary
-        ):
-            return "PREWARMING_CURRENT_MODEL_ACTIVE"
-        return contract.get("cutover_phase")
+        return report_cards.reported_cutover_phase(cutover, contract, now)
 
     @staticmethod
     def _breaker_rows(mechanisms: Mapping[str, Any], recovery: Mapping[str, Any]) -> list[dict[str, Any]]:
-        active_mechanism = str(recovery.get("mechanism") or "")
-        phase = str(recovery.get("phase") or "ACTIVE").upper()
-        rows = []
-        for mechanism in (
-            "strategy_loss_breaker", "strategy_drawdown_breaker",
-            "portfolio_loss_breaker", "portfolio_drawdown_breaker",
-            "position_protection",
-        ):
-            blocked = active_mechanism == mechanism and phase != "ACTIVE"
-            rows.append(gate_row(
-                mechanism, enabled=bool(mechanisms.get(mechanism, True)),
-                state=phase if blocked else "ALLOW",
-                buy_enabled=not blocked, sell_enabled=not blocked,
-                reason=str(recovery.get("reason") or active_mechanism) if blocked else "not_triggered",
-                source="risk_recovery",
-            ))
-        return rows
+        return report_cards.breaker_rows(mechanisms, recovery)
 
     def _dca_cards(self, report: Mapping[str, Any], now: datetime) -> list[dict[str, Any]]:
         guard = self._load(self.dca_state / "guard_state.json")
@@ -1185,223 +1145,14 @@ class UnifiedTelegramReporting:
         )
         inventory_status = self._load(self.inventory_status_path)
         cutover = self._load(self.grid_state / "v22_cutover_status.json")
-        output = []
-        for bot in report.get("bots", []):
-            pair = str(bot["trading_pair"])
-            state = guard.get("bots", {}).get(bot["bot_name"], {})
-            recovery = state.get("recovery", {})
-            executor_counts = state.get("latest", {}).get("executor_counts", {})
-            aggregate = guard.get("gate_aggregate", {}).get("bots", {}).get(bot["bot_name"], {})
-            v22_contract = guard.get("gate_aggregate", {}).get("v22", {})
-            macro_contract = guard.get("gate_aggregate", {}).get("macro", {})
-            capital = guard.get("gate_aggregate", {}).get("capital", {})
-            technical_row = v22_contract.get("pairs", {}).get(pair, {})
-            all_time = bot.get("profit", {}).get("all_time_mtm_quote")
-            initial_equity = float(STRATEGY_BUDGET_QUOTE)
-            equity = None if all_time is None else initial_equity + float(all_time)
-            history = self.outbox.profit_history("dca", pair, days=370)
-            historic_peak = max([
-                initial_equity,
-                *(row["equity"] for row in history if row["equity"] is not None),
-            ])
-            peak = max(historic_peak, float(state.get("peak_equity", historic_peak)),
-                       equity or historic_peak)
-            drawdown = None if equity is None or peak <= 0 else (peak - equity) / peak * 100
-            technical = guard.get("v22_observation", {}).get("event_ids", {}).get(pair, "")
-            # A quiet strategy can legitimately have no SQLite writes for
-            # hours. The visible age and valuation gate therefore use market
-            # freshness, not the age of the last persisted trade.
-            data_age = bot.get("market_data_age_seconds")
-            warnings = list(report.get("warnings", []))
-            dust = self._inventory_dust(pair.split("-", 1)[0])
-            if dust:
-                warnings.append(dust_usdt_text(dust))
-            if not bot.get("database_available"):
-                warnings.append(f"{bot['bot_name']}: SQLite无可信数据")
-            if not bot.get("market_data_healthy"):
-                warnings.append(f"{pair}: Binance行情过期或缺失")
-            if data_age is not None and data_age > MAX_DATA_AGE_SECONDS:
-                warnings.append(f"{pair}: 数据年龄{data_age:.0f}秒")
-            runtime_robot = inventory_status.get("runtime", {}).get("robots", {}).get(
-                bot["bot_name"], {}
-            )
-            process_running = bool(runtime_robot.get("running", False))
-            v22_healthy = bool(v22_contract.get("healthy"))
-            macro_healthy = bool(macro_contract.get("healthy"))
-            infra_healthy, infra_reason = dca_report_infrastructure_status(
-                bot=bot, guard=guard, inventory_status=inventory_status,
-                v22_contract=v22_contract, macro_contract=macro_contract,
-                now_ts=now.timestamp(),
-            )
-            mechanisms = guard.get("mechanisms", {})
-            phase = str(recovery.get("phase", "ACTIVE"))
-            gates = [
-                gate_row(
-                    "v22_weekly_buy_gate",
-                    enabled=bool(mechanisms.get("v22_weekly_buy_gate", True)),
-                    state=("UNAVAILABLE" if not v22_healthy else str(
-                        technical_row.get("model_signal") or (
-                            "RISK_ON" if aggregate.get("v22_buy_enabled") else "RISK_OFF"
-                        )
-                    )),
-                    buy_enabled=(aggregate.get("v22_buy_enabled") if v22_healthy else False),
-                    sell_enabled=True,
-                    health="HEALTHY" if v22_healthy else "FAILED",
-                    reason=str(technical_row.get("reason") or v22_contract.get("reason") or "unknown"),
-                    source="shared_v22_contract",
-                ),
-                gate_row(
-                    "fomc_gate", enabled=bool(mechanisms.get("fomc_gate", True)),
-                    state="ALLOW" if macro_healthy and macro_contract.get("buy_enabled")
-                    and macro_contract.get("sell_enabled") else "BLOCK",
-                    buy_enabled=bool(macro_contract.get("buy_enabled")) if macro_healthy else False,
-                    sell_enabled=bool(macro_contract.get("sell_enabled")) if macro_healthy else False,
-                    health="HEALTHY" if macro_healthy else "FAILED",
-                    reason=str(macro_contract.get("reason") or "unknown"), source="macro_contract",
-                ),
-                *self._breaker_rows(mechanisms, recovery),
-                gate_row(
-                    "infrastructure_integrity_breaker",
-                    state="ALLOW" if infra_healthy else "BLOCK",
-                    buy_enabled=infra_healthy, sell_enabled=infra_healthy,
-                    health="HEALTHY" if infra_healthy else "FAILED",
-                    reason=infra_reason, source="dca_guard",
-                ),
-                gate_row(
-                    "capital_budget_gate",
-                    state="OK" if capital.get("buy_ready") else "ALERT_ONLY",
-                    # Advisory only: expose the observation without changing
-                    # the final controller permissions or normal-trading flag.
-                    buy_enabled=True, sell_enabled=True, health="HEALTHY",
-                    reason=str(capital.get("reason") or "unknown"), source="quote_budget",
-                ),
-                gate_row(
-                    "strategy_mode_gate",
-                    state=("LONG_ONLY" if aggregate.get("long_only_enabled") else "BILATERAL"),
-                    # Long-only changes ordinary executor creation, not the
-                    # controller's permission to close a BUY with a SELL.
-                    buy_enabled=True, sell_enabled=True, health="HEALTHY",
-                    reason=(
-                        "ordinary_sell_creation_disabled_protective_exits_allowed"
-                        if aggregate.get("long_only_enabled")
-                        else "ordinary_buy_and_sell_creation_enabled"
-                    ),
-                    source="dca_controller",
-                ),
-                self._inventory_row(pair.split("-", 1)[0]),
-                gate_row(
-                    "recovery_phase_gate", state=phase,
-                    buy_enabled=phase == "ACTIVE", sell_enabled=phase == "ACTIVE",
-                    reason=str(recovery.get("reason") or phase), source="risk_recovery",
-                ),
-                gate_row(
-                    "controller_application_gate",
-                    state="APPLIED" if aggregate.get("controller_applied") else "MISMATCH",
-                    buy_enabled=bool(aggregate.get("controller_applied")),
-                    sell_enabled=bool(aggregate.get("controller_applied")),
-                    health="HEALTHY" if aggregate.get("controller_applied") else "FAILED",
-                    reason=str(aggregate.get("controller_update_error") or
-                               aggregate.get("controller_update_status") or "unknown"),
-                    source="dca_controller",
-                ),
-            ]
-            trading_status = evaluate_status(
-                process_running=process_running, phase=phase, gates=gates,
-                generated_at=now.astimezone(SHANGHAI).isoformat(), strategy="dca",
-                bot=bot["bot_name"], pair=pair,
-                runtime_generation=v22_contract.get("runtime_generation"),
-                release_sha256=v22_contract.get("release_sha256"),
-                model_week=technical_row.get("model_week"),
-                cutover_phase=self._reported_cutover_phase(cutover, v22_contract, now),
-            )
-            trading_status["recovery"] = {key: recovery[key] for key in (
-                "mechanism", "phase", "cooldown_until", "healthy_cycles",
-                "exit_completed_at", "reentry_block_reason",
-            ) if key in recovery}
-            base_asset = pair.split("-", 1)[0]
-            asset_status = inventory_status.get("assets", {}).get(base_asset, {})
-            owner_key = f"dca:{bot['bot_name']}"
-            owner_value = asset_status.get("owners", {}).get(owner_key)
-            mark_price = bot.get("mark_price")
-            owned_notional = None
-            tradable_risk = None
-            if owner_value is not None and mark_price is not None:
-                # The Guard persists the exchange-filter result in recovery;
-                # without it, reporting the full owner as exposure is safer
-                # than incorrectly declaring the position dust.
-                remaining = recovery.get("remaining_base", {}).get(pair, owner_value)
-                owned_notional, tradable_risk = inventory_exposure_quote(
-                    owner_value, mark_price, remaining,
-                )
-                if recovery.get("exit_verification", {}).get(
-                    "residual_below_exchange_minimum"
-                ) is True:
-                    tradable_risk = 0.0
-            risk_exit_trades = len([
-                row for row in state.get("emergency_adjustments", [])
-                if str(row.get("pair")) == pair and str(row.get("side", "")).upper() == "SELL"
-            ])
-            item = {
-                "strategy": "dca", "bot": bot["bot_name"], "pair": pair,
-                "quote_asset": "USDT", "generated_at_bjt": now.astimezone(SHANGHAI).isoformat(),
-                "data_age_seconds": data_age,
-                "data_sources": ["Hummingbot SQLite TradeFill", "Binance 15m OHLCV",
-                                 "dca-live-guard state"],
-                "profit": dict(bot.get("profit", {})), "equity": equity,
-                "peak_equity": peak, "drawdown_pct": drawdown,
-                "owned_base": owner_value,
-                "strategy_net_base_delta": bot.get("position", {}).get("net_base"),
-                "owned_inventory_mtm_quote": owned_notional,
-                "tradable_risk_exposure_quote": tradable_risk,
-                "risk_exit_trades": risk_exit_trades,
-                "ordinary_trade_count": max(
-                    0, int(bot.get("trades", {}).get("all_time_buys") or 0)
-                    + int(bot.get("trades", {}).get("all_time_sells") or 0)
-                    - risk_exit_trades,
-                ),
-                "fees_quote": bot.get("profit", {}).get("all_time_fees_quote"),
-                "buys": bot.get("trades", {}).get("all_time_buys"),
-                "sells": bot.get("trades", {}).get("all_time_sells"),
-                "phase": phase,
-                "exit_execution": {
-                    "takeover_stage": recovery.get("executor_takeover_stage"),
-                    "remaining_base": recovery.get("remaining_base", {}).get(pair),
-                    "verification": recovery.get("exit_verification"),
-                    "last_fill": recovery.get("last_exit_fill"),
-                },
-                "active_runtime": {
-                    "orders": executor_counts.get("open_orders"),
-                    "buy_executors": executor_counts.get("active_buy_executors"),
-                    "sell_executors": executor_counts.get("active_sell_executors"),
-                },
-                "v22_gate": (
-                    "放行" if aggregate.get("v22_buy_enabled") is True else
-                    "关闭" if aggregate.get("v22_buy_enabled") is False else
-                    "event:" + str(technical)[:8] if technical else "无可信数据"
-                ),
-                "fomc_gate": (
-                    f"BUY={'开' if aggregate.get('fomc_buy_enabled') else '关'} / "
-                    f"SELL={'开' if aggregate.get('fomc_sell_enabled') else '关'}"
-                    if aggregate else "无可信数据"
-                ),
-                "warnings": warnings,
-                "unattributed_dust": dust,
-                "runtime_health": {
-                    "current_error": v22_observation.get("last_error"),
-                    "last_recovered_error": v22_observation.get("last_recovered_error"),
-                    "last_recovered_at": v22_observation.get("last_recovered_at"),
-                    "source_error_total": int(v22_observation.get("source_error_total", 0)),
-                    "integrity_error_total": int(v22_observation.get("integrity_error_total", 0)),
-                    "read_retry_attempts": int(dca_read_telemetry.get("retry_attempts", 0)),
-                    "pool_replacements": int(dca_read_telemetry.get("pool_replacements", 0)),
-                    "longest_read_recovery_seconds": float(
-                        dca_read_telemetry.get("longest_recovery_seconds", 0.0)
-                    ),
-                },
-                "trading_status": trading_status,
-            }
-            output.append(item)
-        return output
+        return report_cards.build_dca_cards(
+            report, now, guard=guard, v22_observation=v22_observation,
+            dca_read_telemetry=dca_read_telemetry, inventory_status=inventory_status,
+            cutover=cutover,
+            profit_history=lambda *args, **kwargs: self.outbox.profit_history(*args, **kwargs),
+            inventory_dust=self._inventory_dust, inventory_row=self._inventory_row,
+            breaker_rows=self._breaker_rows, reported_cutover_phase=self._reported_cutover_phase,
+        )
 
     def _grid_trade_counts(self, database: str, pair: str) -> tuple[int | None, int | None, float | None]:
         if not database or not Path(database).is_file():
@@ -1469,7 +1220,6 @@ class UnifiedTelegramReporting:
         latest = bot.get("latest", {})
         gate = state.get("xgboost_risk_gate", {})
         cutover = self._load(self.grid_state / "v22_cutover_status.json")
-        output = []
         runtime_candidates = sorted(
             self.bots_path.glob(f"instances/{bot_name}*/data/live_grid_runtime_state.json"),
             key=lambda path: path.stat().st_mtime, reverse=True,
@@ -1480,250 +1230,17 @@ class UnifiedTelegramReporting:
         runtime_buy_ids = {str(value) for value in runtime.get("buy_order_ids", [])}
         runtime_sell_ids = {str(value) for value in runtime.get("sell_order_ids", [])}
         active_pair_parameters = runtime.get("active_pair_parameters", {})
-        for pair in ("BTC-FDUSD", "ETH-FDUSD"):
-            values = latest.get("pairs", {}).get(pair, {})
-            pnl = float(values["pnl"]) if values.get("pnl") is not None else None
-            equity = None if pnl is None else 200 + pnl
-            history = self.outbox.profit_history("grid", pair, days=370)
-            historic_peak = max([200.0, *(row["equity"] for row in history if row["equity"] is not None)])
-            peak = max(historic_peak, equity or historic_peak)
-            drawdown = None if equity is None else (peak - equity) / peak * 100
-            buys, sells, fees = self._grid_trade_counts(str(latest.get("database", "")), pair)
-            data_age = (max(0, time.time() - float(latest.get("updated_at", 0)))
-                        if latest else None)
-            warnings = [] if latest else ["Grid Guard快照无可信数据"]
-            dust = self._inventory_dust(pair.split("-", 1)[0])
-            if dust:
-                warnings.append(dust_usdt_text(dust))
-            if data_age is not None and data_age > MAX_DATA_AGE_SECONDS:
-                warnings.append(f"{pair}: Grid快照年龄{data_age:.0f}秒")
-            pair_recovery = runtime.get("pair_recovery", {}).get(pair, {})
-            portfolio_recovery = runtime.get("portfolio_recovery", {})
-            recovery = (
-                portfolio_recovery
-                if str(portfolio_recovery.get("phase", "ACTIVE")) != "ACTIVE"
-                else pair_recovery
-            )
-            phase = str(recovery.get("phase") or "ACTIVE")
-            pair_order_ids = {
-                str(value)
-                for value in runtime.get("ledgers", {}).get(pair, {}).get("open_order_ids", [])
-            }
-            pair_params = active_pair_parameters.get(pair, {})
-            effective_buy_layers = len(pair_order_ids & runtime_buy_ids)
-            effective_sell_layers = len(pair_order_ids & runtime_sell_ids)
-            order_build = state.get("effective_order_status", {}).get(
-                pair, runtime.get("order_build_status", {}).get(pair, {})
-            )
-            order_build_state = str(order_build.get("state") or "UNKNOWN").upper()
-            order_build_healthy = order_build_state in {
-                "HEALTHY", "EXPECTED_EMPTY", "INTENTIONAL_IDLE",
-                "REFRESH_REQUESTED", "CANCEL_PENDING", "REBUILDING",
-                "HEALTHY_DEFERRED", "MAKER_WAIT",
-            }
-            deferred_layers = list(order_build.get("maker_deferred_layers") or [])
-            mechanisms = state.get("mechanisms", {})
-            technical_contract = gate.get("pairs", {}).get(pair, {})
-            runtime_technical = runtime.get("technical_buy_gate", {}).get(
-                "pairs", {}
-            ).get(pair, {})
-            runtime_macro = runtime.get("macro_gate", {})
-            v22_healthy = bool(
-                gate.get("source_healthy") and runtime_technical.get("healthy", True)
-            )
-            macro_healthy = bool(runtime_macro.get("healthy", not macro.get("pause_new_orders")))
-            process_running = bool(runtime and data_age is not None and data_age <= 90)
-            data_healthy = bool(data_age is not None and data_age <= MAX_DATA_AGE_SECONDS)
-            infra_healthy = bool(
-                process_running and data_healthy and v22_healthy and macro_healthy
-                and not state.get("last_monitor_error")
-            )
-            v22_buy = bool(runtime_technical.get(
-                "buy_enabled", technical_contract.get("buy_enabled", False)
-            )) if v22_healthy else False
-            macro_allow = bool(not runtime_macro.get(
-                "paused", macro.get("pause_new_orders", False)
-            )) if macro_healthy else False
-            controller_applied = bool(
-                runtime_technical
-                and v22_buy == bool(technical_contract.get("buy_enabled"))
-                and macro_allow == (not bool(macro.get("pause_new_orders")))
-            )
-            gates = [
-                gate_row(
-                    "v22_weekly_buy_gate",
-                    enabled=bool(mechanisms.get("v22_weekly_buy_gate", True)),
-                    state=("UNAVAILABLE" if not v22_healthy else str(
-                        technical_contract.get("model_signal") or (
-                            "RISK_OFF" if technical_contract.get("risk_off_active") else
-                            "RISK_ON"
-                        )
-                    )),
-                    buy_enabled=v22_buy, sell_enabled=True,
-                    health="HEALTHY" if v22_healthy else "FAILED",
-                    reason=str(technical_contract.get("reason") or gate.get("reason") or "unknown"),
-                    source="shared_v22_contract",
-                ),
-                gate_row(
-                    "fomc_gate", enabled=bool(mechanisms.get("fomc_gate", True)),
-                    state="ALLOW" if macro_allow else "BLOCK",
-                    buy_enabled=macro_allow, sell_enabled=macro_allow,
-                    health="HEALTHY" if macro_healthy else "FAILED",
-                    reason=str(runtime_macro.get("reason") or "macro_gate"), source="grid_runtime",
-                ),
-                *self._breaker_rows(mechanisms, recovery),
-                gate_row(
-                    "infrastructure_integrity_breaker",
-                    state="ALLOW" if infra_healthy else "BLOCK",
-                    buy_enabled=infra_healthy, sell_enabled=infra_healthy,
-                    health="HEALTHY" if infra_healthy else "FAILED",
-                    reason="all_sources_fresh" if infra_healthy else str(
-                        state.get("last_monitor_error") or gate.get("reason") or "runtime_unhealthy"
-                    ), source="grid_guard",
-                ),
-                gate_row("capital_budget_gate", applicable=False, reason="not_applicable_to_grid"),
-                self._inventory_row(pair.split("-", 1)[0]),
-                gate_row(
-                    "order_execution_gate",
-                    state=order_build_state,
-                    buy_enabled=True, sell_enabled=True,
-                    health=(
-                        "DEGRADED" if order_build_state == "MAKER_WAIT"
-                        else "HEALTHY" if order_build_healthy else "FAILED"
-                    ),
-                    reason=str(order_build.get("reason") or "runtime_order_status_unavailable"),
-                    source="grid_runtime",
-                ),
-                gate_row(
-                    "recovery_phase_gate", state=phase,
-                    buy_enabled=phase == "ACTIVE", sell_enabled=phase == "ACTIVE",
-                    reason=str(recovery.get("reason") or phase), source="grid_runtime",
-                ),
-                gate_row(
-                    "controller_application_gate",
-                    state="APPLIED" if controller_applied else "MISMATCH",
-                    buy_enabled=controller_applied, sell_enabled=controller_applied,
-                    health="HEALTHY" if controller_applied else "FAILED",
-                    reason="runtime_consumed_current_gates" if controller_applied
-                    else "runtime_gate_state_mismatch", source="grid_runtime",
-                ),
-            ]
-            trading_status = evaluate_status(
-                process_running=process_running, phase=phase, gates=gates,
-                generated_at=now.astimezone(SHANGHAI).isoformat(), strategy="grid",
-                bot=bot_name, pair=pair,
-                runtime_generation=gate.get("runtime_generation"),
-                release_sha256=gate.get("release_sha256"),
-                model_week=technical_contract.get("model_week"),
-                cutover_phase=self._reported_cutover_phase(cutover, gate, now),
-            )
-            trading_status["recovery"] = {key: recovery[key] for key in (
-                "mechanism", "phase", "cooldown_until", "healthy_cycles",
-                "exit_completed_at", "reentry_block_reason",
-            ) if key in recovery}
-            item = {
-                "strategy": "grid", "bot": bot_name, "pair": pair,
-                "quote_asset": "FDUSD", "generated_at_bjt": now.astimezone(SHANGHAI).isoformat(),
-                "data_age_seconds": data_age,
-                "data_sources": ["Hummingbot SQLite TradeFill",
-                                 "grid-live-guard snapshot", "v22 shared contract"],
-                "profit": {"all_time_mtm_quote": pnl}, "equity": equity,
-                "peak_equity": peak, "drawdown_pct": drawdown,
-                "owned_base": values.get("owned_base"),
-                "strategy_net_base_delta": values.get("net_base"),
-                "cash_balance_quote": values.get("quote_balance"),
-                "owned_inventory_mtm_quote": (
-                    float(values.get("owned_base", 0)) * float(values.get("mark", 0))
-                    if values.get("owned_base") is not None and values.get("mark") is not None
-                    else None
-                ),
-                "equity_source": values.get("equity_source"),
-                "reconciliation_status": (
-                    "RECONCILED" if values.get("owned_base") is not None else
-                    "EQUITY_UNRECONCILED"
-                ),
-                "fees_quote": values.get("fees_quote", fees),
-                "buys": buys, "sells": sells,
-                "phase": phase,
-                "active_runtime": {
-                    "orders": len(pair_order_ids),
-                    "expected_buy_layers": order_build.get("expected_buy_layers"),
-                    "expected_sell_layers": order_build.get("expected_sell_layers"),
-                    "actual_buy_layers": order_build.get(
-                        "actual_buy_layers", effective_buy_layers
-                    ),
-                    "actual_sell_layers": order_build.get(
-                        "actual_sell_layers", effective_sell_layers
-                    ),
-                    "order_build_state": order_build_state,
-                    "order_build_reason": order_build.get("reason"),
-                    "maker_deferred_layers": len(deferred_layers),
-                    "maker_rejection_count": order_build.get("maker_rejection_count", 0),
-                    "maker_topology_refresh_count": order_build.get(
-                        "maker_topology_refresh_count", 0
-                    ),
-                    "maker_longest_recovery_seconds": order_build.get(
-                        "maker_longest_recovery_seconds", 0
-                    ),
-                },
-                "order_build_status": order_build,
-                "runtime_code": {
-                    "loaded_source_sha256": runtime.get("loaded_source_sha256"),
-                    "disk_source_sha256": runtime.get("disk_source_sha256"),
-                    "loaded_at": runtime.get("loaded_at"),
-                    "current": bool(
-                        runtime.get("loaded_source_sha256")
-                        and runtime.get("loaded_source_sha256")
-                        == runtime.get("disk_source_sha256")
-                    ),
-                },
-                "grid_parameters": {
-                    "profile": pair_params.get("profile"),
-                    "grid_range": pair_params.get("grid_range"),
-                    "grid_levels": pair_params.get("grid_levels"),
-                    "take_profit": pair_params.get("take_profit"),
-                    "minimum_order_quote": pair_params.get("minimum_order_quote"),
-                    "effective_buy_layers": effective_buy_layers,
-                    "effective_sell_layers": effective_sell_layers,
-                    "parameter_version": runtime.get("active_parameter_version"),
-                    "parameter_sha256": runtime.get("active_parameter_sha256"),
-                },
-                "v22_gate": (
-                    "不可用" if not v22_healthy else
-                    "Risk-Off" if gate.get("pairs", {}).get(pair, {}).get("risk_off_active")
-                    else "Risk-On"
-                ),
-                "fomc_gate": "暂停" if macro.get("pause_new_orders") else "放行",
-                "warnings": warnings,
-                "unattributed_dust": dust,
-                "runtime_transport": transport_summary,
-                "runtime_health": {
-                    "current_error": v22_observation.get("last_error"),
-                    "last_recovered_error": v22_observation.get("last_recovered_error"),
-                    "last_recovered_at": v22_observation.get("last_recovered_at"),
-                    "source_error_total": int(v22_observation.get("source_error_total", 0)),
-                    "integrity_error_total": int(v22_observation.get("integrity_error_total", 0)),
-                    "read_retry_attempts": sum(
-                        int(row.get("retry_attempts", 0))
-                        for row in grid_read_telemetry.values()
-                        if isinstance(row, Mapping)
-                    ),
-                    "pool_replacements": sum(
-                        int(row.get("pool_replacements", 0))
-                        for row in grid_read_telemetry.values()
-                        if isinstance(row, Mapping)
-                    ),
-                    "longest_read_recovery_seconds": max(
-                        (float(row.get("longest_recovery_seconds", 0.0))
-                         for row in grid_read_telemetry.values()
-                         if isinstance(row, Mapping)),
-                        default=0.0,
-                    ),
-                },
-                "trading_status": trading_status,
-            }
-            output.append(item)
-        return output
+        return report_cards.build_grid_cards(
+            now, state=state, v22_observation=v22_observation,
+            grid_read_telemetry=grid_read_telemetry, macro=macro, bot_name=bot_name,
+            latest=latest, gate=gate, cutover=cutover, runtime=runtime,
+            transport_summary=transport_summary, runtime_buy_ids=runtime_buy_ids,
+            runtime_sell_ids=runtime_sell_ids, active_pair_parameters=active_pair_parameters,
+            profit_history=lambda *args, **kwargs: self.outbox.profit_history(*args, **kwargs),
+            trade_counts=self._grid_trade_counts, inventory_dust=self._inventory_dust,
+            inventory_row=self._inventory_row, clock=time.time,
+            breaker_rows=self._breaker_rows, reported_cutover_phase=self._reported_cutover_phase,
+        )
 
     def update_snapshots(self, report: Mapping[str, Any], now: datetime) -> list[dict[str, Any]]:
         robots = [*self._grid_cards(now), *self._dca_cards(report, now)]

@@ -78,9 +78,11 @@ except ModuleNotFoundError:
     )
 
 try:
-    from live_guard.dca_live_guard import BinanceEmergencyClient, DockerEmergencyClient
-except ImportError:  # Docker image layout
-    from dca_live_guard import BinanceEmergencyClient, DockerEmergencyClient
+    from emergency_clients import BinanceEmergencyClient, DockerEmergencyClient
+    from emergency_accounting import emergency_fill_metrics
+except ModuleNotFoundError:
+    from live_guard.emergency_clients import BinanceEmergencyClient, DockerEmergencyClient
+    from live_guard.emergency_accounting import emergency_fill_metrics
 
 
 LOG = logging.getLogger("grid-live-guard")
@@ -778,6 +780,19 @@ class Guard:
             raise RuntimeError("shared inventory active order count is invalid") from exc
         if active_order_count < 0:
             raise RuntimeError("shared inventory active order count is invalid")
+        # Order observation is independent of sell authorization. A real
+        # ownership deficit must block readiness, not freeze exchange evidence.
+        evidence = {
+            "schema": "grid-exchange-orders-v1",
+            "account_fingerprint": inventory["account_fingerprint"],
+            "generated_at": time.time(), "pairs": exchange_order_evidence,
+        }
+        for instance in (getattr(self, "bots_path", Path("/workspace/bots")) / "instances").glob(f"{PORTFOLIOS['FDUSD'].bot_name}*"):
+            target = instance / "data" / "grid_exchange_order_snapshot.json"
+            if target.parent.is_dir():
+                temporary = target.with_suffix(".tmp")
+                temporary.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
+                temporary.replace(target)
         ownership_coverage = {}
         for pair in pairs:
             asset = pair.split("-")[0]
@@ -797,19 +812,6 @@ class Guard:
             }
         if not all(item["covered"] for item in ownership_coverage.values()):
             raise RuntimeError("Grid managed inventory exceeds the emergency account balance")
-        # Publish only a fully checked, account-bound read-only snapshot. A failed
-        # check leaves the last evidence to age out, never asserts an empty set.
-        evidence = {
-            "schema": "grid-exchange-orders-v1",
-            "account_fingerprint": inventory["account_fingerprint"],
-            "generated_at": time.time(), "pairs": exchange_order_evidence,
-        }
-        for instance in (getattr(self, "bots_path", Path("/workspace/bots")) / "instances").glob(f"{PORTFOLIOS['FDUSD'].bot_name}*"):
-            target = instance / "data" / "grid_exchange_order_snapshot.json"
-            if target.parent.is_dir():
-                temporary = target.with_suffix(".tmp")
-                temporary.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
-                temporary.replace(target)
         return {
             "account_read": True,
             "spot_trading": True,
@@ -1205,34 +1207,7 @@ class Guard:
 
     @staticmethod
     def _emergency_fill_metrics(pair: str, side: str, response: dict) -> Dict[str, Any]:
-        executed = Decimal(str(response.get("executedQty", "0")))
-        quote = Decimal(str(response.get("cummulativeQuoteQty", "0")))
-        if executed <= 0:
-            raise RuntimeError(f"emergency order reported no executed quantity: {response}")
-        base_asset, quote_asset = pair.split("-", 1)
-        base_delta = executed if side == "BUY" else -executed
-        quote_cashflow = -quote if side == "BUY" else quote
-        fee_quote = Decimal("0")
-        fee_details = []
-        for fill in response.get("fills", []):
-            commission = Decimal(str(fill.get("commission", "0")))
-            asset = str(fill.get("commissionAsset", ""))
-            fill_price = Decimal(str(fill.get("price", "0")))
-            fee_details.append({
-                "asset": asset, "commission": str(commission),
-                "fill_price": str(fill_price),
-            })
-            if asset == quote_asset:
-                fee_quote += commission
-            elif asset == base_asset:
-                base_delta -= commission
-                fee_quote += commission * fill_price
-        return {
-            "base_delta": str(base_delta),
-            "quote_cashflow": str(quote_cashflow),
-            "fee_quote": str(fee_quote),
-            "fee_details": fee_details,
-        }
+        return emergency_fill_metrics(pair, side, response)
 
     def _idempotent_market_order(
         self, pair: str, side: str, amount: Decimal, client_order_id: str,

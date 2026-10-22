@@ -3,12 +3,14 @@ import json
 import sqlite3
 import tempfile
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase
 
 import yaml
 
+from management_bot import parameter_display
 from management_bot.approvals import ApprovalStore
 from management_bot.clients import ContractReader, OperationsReportReader, ServiceError
 from management_bot.config import Settings
@@ -1145,6 +1147,74 @@ class TelegramFlowTests(TestCase):
             self.assertNotIn("Release", combined)
             self.assertNotIn("模型哈希", combined)
             bot.store.close()
+
+
+class ParameterDisplayTests(TestCase):
+    def test_candidate_page_uses_the_supplied_clock_without_changing_evidence(self):
+        now = 1792555200.75
+        catalog = {"models": {"candidate": [{
+            "release_sha256": "e" * 64, "status": "BLOCKED", "model_week": 40,
+            "effective_start": "2026-10-21T00:00:00Z",
+            "effective_end": "2026-10-28T00:00:00Z",
+            "review_deadline": str(now + 3661),
+            "checks": {"hashes": True, "evidence": False, "unknown": None},
+            "exact_evidence_count": 5,
+        }]}}
+        original = deepcopy(catalog)
+        self.assertEqual(parameter_display.candidate_model(catalog, now=now), (
+            "🆕 v22 候选模型\n"
+            "状态：检查失败\n"
+            "目标模型周：第40周\n"
+            "有效期（北京时间）：2026-10-21 08:00 至 2026-10-28 08:00\n"
+            "自动审批倒计时：1小时1分钟\n"
+            "硬门槛：1/3项通过\n"
+            "失败原因：回测证据完整性、候选完整性检查\n"
+            "360天证据：4/4张已验证\n\n"
+            "本页只读；批准或拒绝请进入模型审批。",
+            [[("前往模型审批", "a:eeeeeeeeeeeeeeee:view")],
+             [("⬅️ 模型与参数", "m:models"), ("🏠 主菜单", "m:home")]],
+        ))
+        expired, _ = parameter_display.candidate_model(catalog, now=now + 7200)
+        self.assertIn("自动审批倒计时：0小时0分钟", expired)
+        self.assertEqual(catalog, original)
+
+    def test_missing_grid_and_risk_parameters_preserve_unknown_values(self):
+        self.assertEqual(parameter_display.grid_parameters({}, "BTC"), (
+            "🟦 Grid BTC-FDUSD 当前生效参数\n"
+            "落地状态：未知\n参数版本：-\n\n"
+            "单对资金：- FDUSD\n单侧资金：- FDUSD\n"
+            "Grid总范围：无可信数据\nGrid层数：-\n止盈：无可信数据\n"
+            "移动阈值：无可信数据\n移动冷却：-\n挂单刷新：-\n"
+            "最小订单：- FDUSD\nMaker费用：0.0000%",
+            [[("BTC-FDUSD", "p:grid:BTC"), ("ETH-FDUSD", "p:grid:ETH")],
+             [("⬅️ 模型与参数", "m:models"), ("🏠 主菜单", "m:home")]],
+        ))
+        self.assertEqual(parameter_display.risk_parameters({}, "grid", "BTC"), (
+            "🛡 GRID BTC-FDUSD 风控门参数\n交易结论：交易受限\n"
+            "最终权限：BUY=不适用 / SELL=不适用\n",
+            [[("Grid BTC", "p:risk:grid:BTC"), ("Grid ETH", "p:risk:grid:ETH")],
+             [("DCA BTC", "p:risk:dca:BTC"), ("DCA ETH", "p:risk:dca:ETH")],
+             [("⬅️ 模型与参数", "m:models"), ("🏠 主菜单", "m:home")]],
+        ))
+
+    def test_history_limit_keeps_exact_evidence_buttons_bound_to_selected_entry(self):
+        catalog = {"models": {"history": [{"exact_evidence_count": 4}] * 4}}
+        text, rows = parameter_display.model_history_detail(catalog, 2)
+        self.assertEqual(text,
+                         "🕒 历史模型 3\n模型周：第-周\n"
+                         "签名有效期（北京时间）：无可信记录 至 无可信记录\n"
+                         "实际上线：无可信记录\n实际下线：无可信记录\n替换原因：无可信记录")
+        self.assertEqual(rows, [
+            [("Grid BTC 360天", "p:img:history:2:grid:BTC"),
+             ("Grid ETH 360天", "p:img:history:2:grid:ETH")],
+            [("DCA BTC 360天", "p:img:history:2:dca:BTC"),
+             ("DCA ETH 360天", "p:img:history:2:dca:ETH")],
+            [("⬅️ 历史模型", "p:model_history"), ("🏠 主菜单", "m:home")],
+        ])
+        for index in (-1, 3):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(ValueError, "历史模型不存在或列表已更新"):
+                    parameter_display.model_history_detail(catalog, index)
 
 
 class TelegramTransportTests(TestCase):

@@ -138,11 +138,14 @@ def execute_market_liquidation(
         if order is None and stored.get("status") in TERMINAL_STATUSES:
             order = stored
         if order is None:
+            if attempt.get("status") != "PLANNED":
+                raise ExecutionPending(f"existing order {attempt_id} is not queryable; no resubmission")
             if not ledger.renew_lease(
                 lease_asset, lease_holder, ttl_seconds=lease_ttl_seconds
             ):
                 raise RuntimeError(f"inventory lease lost before order {attempt_id}")
             try:
+                ledger.finish_attempt(job_id=job_id, sequence=sequence, status="SUBMITTING")
                 order = exchange.market_order(pair, side, residual, attempt_id)
             except Exception as exc:
                 # A timeout can happen after Binance accepted and filled the
@@ -169,6 +172,10 @@ def execute_market_liquidation(
             status=status if status in TERMINAL_STATUSES else "PENDING",
             response=order,
         )
+        if _decimal(order.get("executedQty")) > 0 and all(
+            fill.get("tradeId") is not None for fill in order.get("fills", [])
+        ) and order.get("fills"):
+            ledger.record_economic_fills(job_id, order, side=side)
         if status not in TERMINAL_STATUSES:
             raise ExecutionPending(
                 f"existing market order {attempt_id} remains {status}; no residual submitted"

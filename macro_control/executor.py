@@ -251,19 +251,27 @@ class MacroExecutor:
             )
         except ValueError as exc:
             raise DecisionRejected(str(exc)) from exc
+        self._claim_approval_callback(
+            state, approval, decision_id=decision.decision_id, action=action
+        )
+        return approval
+
+    @staticmethod
+    def _claim_approval_callback(
+        state: dict, approval: ApprovalProof, *, decision_id: str, action: str
+    ) -> None:
         replay_key = approval.replay_key
         if not replay_key:
             raise DecisionRejected("approval replay identifier is required")
         existing = state["approval_callbacks"].get(replay_key)
         claim = {
-            "decision_id": decision.decision_id,
+            "decision_id": decision_id,
             "proposal_sha256": approval.proposal_sha256,
             "action": action,
         }
         if existing and existing != claim:
             raise DecisionRejected("approval interaction was reused")
         state["approval_callbacks"][replay_key] = claim
-        return approval
 
     @staticmethod
     def _desired_gates(leases: list[dict]) -> dict[str, bool]:
@@ -721,18 +729,9 @@ class MacroExecutor:
                 )
             except (KeyError, ValueError) as exc:
                 raise DecisionRejected(str(exc)) from exc
-            replay_key = approval.replay_key
-            if not replay_key:
-                raise DecisionRejected("approval replay identifier is required")
-            claim = {
-                "decision_id": decision_id,
-                "proposal_sha256": approval.proposal_sha256,
-                "action": "revoke",
-            }
-            used = state["approval_callbacks"].get(replay_key)
-            if used and used != claim:
-                raise DecisionRejected("approval interaction was reused")
-            state["approval_callbacks"][replay_key] = claim
+            self._claim_approval_callback(
+                state, approval, decision_id=decision_id, action="revoke"
+            )
             lease["revoked_at"] = now.isoformat()
             lease["status"] = "revoked"
             lease["revocation_approval"] = approval.to_dict()
