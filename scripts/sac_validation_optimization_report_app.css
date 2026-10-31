@@ -1,0 +1,13 @@
+.report-page:has(.sac-optimization-report) { --data-app-layout-intent: authored-report; --data-app-content-width: 1200px; }
+.sac-optimization-report { gap: 28px; min-width: 0; }
+.sac-optimization-report .report-hero h1 { font-size: 36px; line-height: 1.28; max-width: 28em; }
+.sac-optimization-report .rich-narrative-content { max-width: 100%; line-height: 1.7; }
+.sac-optimization-report [data-component-kind="table"] { min-width: 0; }
+.sac-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px; }
+.sac-exploration { display: flex; flex-direction: column; min-width: 0; gap: 18px; }
+.sac-positive { color: #087f5b; font-weight: 650; font-variant-numeric: tabular-nums; }
+.sac-negative { color: #c02e36; font-weight: 650; font-variant-numeric: tabular-nums; }
+.sac-note .rich-narrative-content { color: var(--secondary); font-size: 12px; }
+.sac-button { border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text); padding: 7px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+@media (prefers-color-scheme: dark) { .sac-positive { color: #41c4a3; } .sac-negative { color: #fb8187; } }
+@media (max-width: 700px) { .sac-optimization-report { gap: 24px; } .sac-optimization-report .report-hero h1 { font-size: 28px; } .sac-controls { gap: 12px; } }

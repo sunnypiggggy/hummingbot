@@ -1,0 +1,9 @@
+.report-page{--data-app-layout-intent:authored-report;--data-app-content-width:1320px}
+.history-report{max-width:var(--data-app-content-width);margin-inline:auto;min-width:0}
+.history-report .history-controls{display:flex;align-items:flex-end;flex-wrap:wrap;gap:14px;margin-block:22px 16px;min-width:0}
+.history-report .history-note{font-size:14px;line-height:1.7;color:var(--text-secondary,#555);margin-block:12px 22px}
+.history-report .history-positive{color:var(--positive-text,#087f5b);font-weight:600}
+.history-report .history-negative{color:var(--negative-text,#be123c);font-weight:600}
+.history-report .table-wrap{max-width:100%;overflow-x:auto}
+.history-report .dashboard-component{min-width:0}
+@media(max-width:640px){.history-report .history-controls{gap:10px}.history-report .history-note{font-size:13px}.history-report h1{overflow-wrap:anywhere}}

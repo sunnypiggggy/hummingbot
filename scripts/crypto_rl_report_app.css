@@ -1,0 +1,14 @@
+.report-page:has(.crypto-rl-report) {
+  --data-app-layout-intent: authored-report;
+  --data-app-content-width: 1200px;
+}
+.crypto-rl-report { gap: 32px; }
+.crypto-rl-report .report-hero h1 { max-width: 25em; font-size: 42px; line-height: 1.25; letter-spacing: -0.02em; }
+.crypto-rl-report .crypto-rl-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 20px; padding-block: 12px; border-block: 1px solid var(--border); }
+.crypto-rl-report .rich-narrative-content { max-width: 100%; line-height: 1.7; }
+.crypto-rl-report [data-component-kind="table"] { min-width: 0; }
+@media (max-width: 700px) {
+  .crypto-rl-report { gap: 26px; }
+  .crypto-rl-report .report-hero h1 { font-size: 30px; }
+  .crypto-rl-report .crypto-rl-controls { gap: 12px; }
+}

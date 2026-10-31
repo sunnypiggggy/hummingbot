@@ -19,6 +19,7 @@ COPY live_guard/account_inventory.py /app/account_inventory.py
 COPY live_guard/emergency_execution.py /app/emergency_execution.py
 COPY live_guard/emergency_clients.py /app/emergency_clients.py
 COPY live_guard/emergency_accounting.py /app/emergency_accounting.py
+COPY live_guard/grid_fill_reconciliation.py /app/grid_fill_reconciliation.py
 COPY live_guard/runtime_endpoints.py /app/runtime_endpoints.py
 COPY live_guard/dca_live_report.py /app/dca_live_report.py
 COPY live_guard/report_cards.py /app/report_cards.py

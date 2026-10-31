@@ -360,7 +360,8 @@ def build_grid_cards(
     now: datetime, *, state: Mapping[str, Any], v22_observation: Mapping[str, Any],
     grid_read_telemetry: Mapping[str, Any], macro: Mapping[str, Any], bot_name: str,
     latest: Mapping[str, Any], gate: Mapping[str, Any], cutover: Mapping[str, Any],
-    runtime: Mapping[str, Any], transport_summary: Mapping[str, Any],
+    runtime: Mapping[str, Any], inventory_status: Mapping[str, Any],
+    transport_summary: Mapping[str, Any],
     runtime_buy_ids: set[str], runtime_sell_ids: set[str],
     active_pair_parameters: Mapping[str, Any], profit_history: Callable[..., list],
     trade_counts: Callable[..., tuple], inventory_dust: Callable[[str], dict | None],
@@ -378,7 +379,8 @@ def build_grid_cards(
         peak = max(historic_peak, equity or historic_peak)
         drawdown = None if equity is None else (peak - equity) / peak * 100
         buys, sells, fees = trade_counts(str(latest.get("database", "")), pair)
-        data_age = (max(0, clock() - float(latest.get("updated_at", 0)))
+        observed_at = clock()
+        data_age = (max(0, observed_at - float(latest.get("updated_at", 0)))
                     if latest else None)
         warnings = [] if latest else ["Grid Guard快照无可信数据"]
         dust = inventory_dust(pair.split("-", 1)[0])
@@ -421,10 +423,21 @@ def build_grid_cards(
             gate.get("source_healthy") and runtime_technical.get("healthy", True)
         )
         macro_healthy = bool(runtime_macro.get("healthy", not macro.get("pause_new_orders")))
-        process_running = bool(runtime and data_age is not None and data_age <= 90)
+        # A fresh Guard observation cannot prove the strategy process is alive.
+        # Keep snapshot-based risk gates separate from process display evidence.
+        snapshot_fresh = bool(runtime and data_age is not None and data_age <= 90)
+        runtime_robot = inventory_status.get("runtime", {}).get("robots", {}).get(bot_name, {})
+        try:
+            process_age = observed_at - float(inventory_status.get("generated_at"))
+        except (TypeError, ValueError, OverflowError):
+            process_age = None
+        process_running = bool(
+            process_age is not None and -5 <= process_age <= MAX_GUARD_STATUS_AGE_SECONDS
+            and runtime_robot.get("running") is True
+        )
         data_healthy = bool(data_age is not None and data_age <= MAX_DATA_AGE_SECONDS)
         infra_healthy = bool(
-            process_running and data_healthy and v22_healthy and macro_healthy
+            snapshot_fresh and data_healthy and v22_healthy and macro_healthy
             and not state.get("last_monitor_error")
         )
         v22_buy = bool(runtime_technical.get(
@@ -437,6 +450,14 @@ def build_grid_cards(
             runtime_technical
             and v22_buy == bool(technical_contract.get("buy_enabled"))
             and macro_allow == (not bool(macro.get("pause_new_orders")))
+        )
+        # A stopped producer cannot consume a newer contract. Keep its actual
+        # permission decisions closed while distinguishing this from a live fault.
+        controller_waiting = bool(
+            not controller_applied
+            and runtime_technical
+            and process_age is not None and -5 <= process_age <= MAX_GUARD_STATUS_AGE_SECONDS
+            and runtime_robot.get("running") is False
         )
         gates = [
             gate_row(
@@ -490,10 +511,13 @@ def build_grid_cards(
             ),
             gate_row(
                 "controller_application_gate",
-                state="APPLIED" if controller_applied else "MISMATCH",
+                state=("APPLIED" if controller_applied else
+                       "WAITING" if controller_waiting else "MISMATCH"),
                 buy_enabled=controller_applied, sell_enabled=controller_applied,
-                health="HEALTHY" if controller_applied else "FAILED",
+                health=("HEALTHY" if controller_applied else
+                        "DEGRADED" if controller_waiting else "FAILED"),
                 reason="runtime_consumed_current_gates" if controller_applied
+                else "机器人已停止，当前交易权限尚未应用；恢复前需重新核验" if controller_waiting
                 else "runtime_gate_state_mismatch", source="grid_runtime",
             ),
         ]

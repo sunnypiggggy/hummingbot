@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_FILES = (
     "Dockerfile.dca-live-report-mqtt", "ops/compose.cardputer-report-mqtt.yml",
     "live_guard/dca_live_report.py", "live_guard/report_cards.py",
+    "live_guard/model_probability_history.py",
     "live_guard/trading_status.py", "live_guard/risk_history.py",
     "management_bot/__init__.py", "management_bot/clients.py", "management_bot/risk_display.py",
     "cardputer_monitor/__init__.py", "cardputer_monitor/collector.py",
@@ -365,6 +366,7 @@ def verify_runtime(client, baseline, manifest, artifact):
              if name.endswith(".py")}
     names = {name: ("/app/" + Path(name).name if name in {
                  "live_guard/dca_live_report.py", "live_guard/report_cards.py",
+                 "live_guard/model_probability_history.py",
              } else "/app/" + name)
              for name in files}
     program = ("import hashlib,json,pathlib;paths=" + repr(names)
@@ -373,13 +375,12 @@ def verify_runtime(client, baseline, manifest, artifact):
     if loaded != files:
         raise RuntimeError("Loaded report modules do not match the tested source manifest")
     preserved = {name: item["sha256"] for name, item in baseline["source_files"].items()
-                 if name in ("live_guard/model_probability_history.py", "live_guard/telegram_notifications.py",
-                             "live_guard/risk_history.py")}
+                 if name in ("live_guard/telegram_notifications.py", "live_guard/risk_history.py")}
     program = ("import hashlib,json,pathlib;paths=" + repr(list(preserved))
                + ";print(json.dumps({p:hashlib.sha256((pathlib.Path('/app')/pathlib.Path(p).name).read_bytes()).hexdigest() for p in paths}))")
     actual = json.loads(run(client, "docker exec dca-live-report python -c " + shlex.quote(program)))
     if actual != preserved:
-        raise RuntimeError("Report's existing risk/notification/probability code changed")
+        raise RuntimeError("Report's existing risk/notification code changed")
     logs = run(client, "docker logs --tail 30 dca-live-report")
     cycles = []
     for line in logs.splitlines():

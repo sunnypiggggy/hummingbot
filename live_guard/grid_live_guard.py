@@ -43,6 +43,10 @@ from risk_recovery import (
     classify_integrity_failure,
 )
 try:
+    from grid_fill_reconciliation import flatten_candidates, read_grid_accounting_view
+except ModuleNotFoundError:
+    from live_guard.grid_fill_reconciliation import flatten_candidates, read_grid_accounting_view
+try:
     from account_inventory import (
         SCHEMA as INVENTORY_STATUS_SCHEMA,
         UnifiedInventoryLedger,
@@ -682,17 +686,67 @@ class Guard:
         }:
             return
         failed = audit_event.endswith("action_failed")
+        notification_state = None
+        notification_key = ""
+        notification_record = None
+        reason = str(details.get("reason") or details.get("error") or audit_event)
+        correlation_id = str(details.get("reason") or audit_event)
+        notification_details: Dict[str, Any] = {}
+        match = re.fullmatch(
+            r"recoverable (PORTFOLIO|BTC-FDUSD|ETH-FDUSD) exit remained incomplete for ([0-9]+(?:\.[0-9]+)?)s",
+            reason,
+        )
+        if match:
+            bot_name = str(details.get("bot", ""))
+            state = getattr(self, "state", {})
+            bot = state.get("bots", {}).get(bot_name, {})
+            snapshot = details.get("snapshot") or bot.get("latest") or {}
+            recovery = snapshot.get("recovery_episodes", {}).get(match[1], {})
+            try:
+                triggered_at = Decimal(str(recovery.get("triggered_at")))
+                if not triggered_at.is_finite() or triggered_at <= 0:
+                    raise ValueError("invalid notification episode")
+            except (ValueError, TypeError, ArithmeticError):
+                triggered_at = None
+            if triggered_at is not None:
+                episode = {
+                    "bot": bot_name, "scope": match[1],
+                    "triggered_at": format(triggered_at.normalize(), "f"),
+                    "mechanism": str(recovery.get("mechanism") or "unknown"),
+                }
+                error = sanitize_runtime_error(str(details.get("error") or ""))
+                ownership = re.search(r"Grid owned (BTC|ETH) \S+ exceeds exchange total", error)
+                fault = "complete" if not failed else (
+                    f"ownership_exceeds_exchange:{ownership[1]}" if ownership
+                    else "error:" + canonical_sha256(error)
+                )
+                episode_id = canonical_sha256(episode)
+                signature = canonical_sha256({"episode": episode_id, "fault": fault, "failed": failed})
+                notification_state = state.setdefault("breaker_notification_state", {})
+                notification_key = f"{bot_name}:{match[1]}"
+                previous = notification_state.get(notification_key, {})
+                if previous.get("signature") == signature:
+                    return
+                sequence = int(previous.get("sequence", 0)) + 1 if previous.get("episode_id") == episode_id else 1
+                correlation_id = f"grid-breaker:{episode_id}:{sequence}"
+                # Keep changing elapsed time in audit evidence, not notification identity.
+                reason = f"recoverable {match[1]} exit remained incomplete"
+                notification_details = {"recovery_episode": episode, "failure_type": fault,
+                                        "exit_age_seconds": float(match[2])}
+                notification_record = {"episode_id": episode_id, "signature": signature, "sequence": sequence}
         append_event(self.notification_path, build_event(
             source="grid-live-guard", strategy="grid",
             bot=str(details.get("bot", "")), pair="BTC-FDUSD,ETH-FDUSD",
             mechanism="infrastructure_integrity_breaker",
             transition="ACTION_FAILED" if failed else "LATCHED",
-            reason=str(details.get("reason") or details.get("error") or audit_event),
+            reason=reason,
             severity="critical", phase_to="LATCHED",
             action="manual_recovery_required" if not failed else "fail_closed_retry",
             requires_manual_action=not failed,
-            correlation_id=str(details.get("reason") or audit_event),
+            correlation_id=correlation_id, details=notification_details,
         ))
+        if notification_state is not None:
+            notification_state[notification_key] = notification_record
 
     def verify_shadow_exchange_ready(self, pairs: list[str]) -> dict:
         if self.emergency_exchange is None:
@@ -1161,6 +1215,19 @@ class Guard:
         runtime_ledgers = runtime.get("ledgers", {})
         if set(runtime_ledgers) != set(portfolio.pairs):
             raise RuntimeError("Grid runtime ledger pair set mismatch")
+        accounting_receipt = {"status": "unchanged"}
+        if flatten_candidates(runtime):
+            if self.emergency_docker is None:
+                raise RuntimeError("Grid flatten accounting requires stopped-writer evidence")
+            running = self.emergency_docker.matching_containers(portfolio.bot_name)
+            stopped_observed_at = time.time()
+            accounting_runtime, accounting_receipt = read_grid_accounting_view(
+                runtime, database, stopped=not running, runtime_path=runtime_path,
+            )
+            accounting_receipt["stopped_observed_at"] = stopped_observed_at
+            if accounting_receipt["status"] == "unverifiable":
+                raise RuntimeError("Grid flatten accounting unverifiable: " + accounting_receipt["reason"])
+            runtime_ledgers = accounting_runtime["ledgers"]
         for pair in portfolio.pairs:
             mark = self.price(pair)
             raw = runtime_ledgers[pair]
@@ -1203,6 +1270,15 @@ class Guard:
             "database_event_at": database.stat().st_mtime,
             "runtime_state": str(runtime_path),
             "runtime_state_sha256": canonical_sha256(runtime),
+            "flatten_fill_reconciliation": accounting_receipt,
+            "recovery_episodes": {
+                name: {field: recovery[field] for field in ("triggered_at", "mechanism", "scope")
+                       if field in recovery}
+                for name, recovery in {
+                    "PORTFOLIO": runtime.get("portfolio_recovery"),
+                    **runtime.get("pair_recovery", {}),
+                }.items() if isinstance(recovery, dict)
+            },
         }
 
     @staticmethod
@@ -1625,6 +1701,7 @@ class Guard:
                 "post_stop_snapshot": post_stop,
                 "reconciled_snapshot": reconciled,
             })
+            bot.pop("last_action_error", None)
             self.audit("grid_circuit_breaker_complete", bot=portfolio.bot_name,
                        reason=reason, snapshot=snapshot, post_stop=post_stop,
                        reconciled=reconciled, stop=stop, flatten=flatten)
@@ -1636,6 +1713,91 @@ class Guard:
         finally:
             self.save()
 
+    @staticmethod
+    def _manual_reset_stop(bot_name: str, bot: dict, runtime: dict) -> dict:
+        """Validate a latch-only reset without treating it as strategy recovery."""
+        def reject(reason: str):
+            raise RuntimeError(f"Grid manual guard reset invalid: {reason}")
+
+        if not isinstance(runtime, dict):
+            reject("runtime malformed")
+        if type(runtime.get("schema_version")) is not int or runtime["schema_version"] != 13:
+            reject("runtime schema mismatch")
+        receipt = bot.get("manual_guard_reset")
+        if not isinstance(receipt, dict):
+            reject("receipt missing or malformed")
+        if (
+            receipt.get("schema") != "grid-guard-latch-reset-v1"
+            or receipt.get("scope") != "grid_guard_latch_only"
+            or bot_name != "grid-live-fdusd-400"
+            or receipt.get("bot") != bot_name
+        ):
+            reject("schema, scope or bot mismatch")
+        if any(bot.get(field) is not False for field in (
+            "tripped", "action_complete", "stop_complete",
+        )):
+            reject("current breaker flags were not reset")
+        for field, pattern in (
+            ("reset_id", r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}"),
+            ("event_id", r"[0-9a-f]{64}"),
+        ):
+            value = receipt.get(field)
+            if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+                reject(f"{field} missing or malformed")
+        for field in ("event_sha256", "preflight_sha256", "runtime_sha256"):
+            if not isinstance(receipt.get(field), str) or re.fullmatch(
+                r"[0-9a-f]{64}", receipt[field],
+            ) is None:
+                reject(f"{field} missing or malformed")
+        prior = receipt.get("prior")
+        if not isinstance(prior, dict) or any(prior.get(field) is not True for field in (
+            "tripped", "action_complete", "stop_complete",
+        )):
+            reject("prior breaker completion missing")
+        stop = prior.get("stop")
+        if not isinstance(stop, dict) or any(stop.get(field) is not True for field in (
+            "verified_no_active_orders", "verified_no_live_instances",
+        )):
+            reject("prior stop verification missing")
+        if not isinstance(prior.get("reason"), str) or not prior["reason"].strip() or not isinstance(
+            prior.get("flatten"), dict,
+        ):
+            reject("prior action evidence missing")
+        recovery = runtime.get("portfolio_recovery")
+        episode = receipt.get("runtime_episode")
+        fields = ("triggered_at", "mechanism", "scope")
+        if (
+            not isinstance(recovery, dict) or recovery.get("phase") != EXITING
+            or not isinstance(episode, dict) or set(episode) != set(fields)
+            or episode != {field: recovery.get(field) for field in fields}
+            or not isinstance(episode.get("mechanism"), str) or not episode["mechanism"].strip()
+            or episode.get("scope") != "portfolio"
+        ):
+            reject("runtime episode mismatch")
+        timestamps = {}
+        for field, value in (
+            ("performed_at", receipt.get("performed_at")),
+            ("tripped_at", prior.get("tripped_at")),
+            ("triggered_at", episode.get("triggered_at")),
+        ):
+            try:
+                if isinstance(value, bool) or value is None:
+                    raise ValueError("invalid timestamp")
+                timestamp = Decimal(str(value))
+                if not timestamp.is_finite() or timestamp <= 0:
+                    raise ValueError("invalid timestamp")
+            except (ValueError, TypeError, ArithmeticError):
+                reject(f"{field} missing or malformed")
+            timestamps[field] = timestamp
+        if not (
+            timestamps["triggered_at"] <= timestamps["tripped_at"] <= timestamps["performed_at"]
+            <= Decimal(str(time.time())) + 5
+        ):
+            reject("reset chronology mismatch")
+        if canonical_sha256(runtime) != receipt["runtime_sha256"]:
+            reject("runtime hash mismatch")
+        return stop
+
     def cycle(self):
         self._refresh_emergency_readiness()
         if self.manifest_path.exists():
@@ -1646,11 +1808,59 @@ class Guard:
         snapshots = {}
         for key in self.portfolio_keys:
             portfolio = PORTFOLIOS[key]
-            docker_running = bool(
-                self.emergency_docker
-                and self.emergency_docker.matching_containers(portfolio.bot_name)
+            docker_instances = (
+                self.emergency_docker.matching_containers(portfolio.bot_name)
+                if self.emergency_docker is not None else None
             )
+            docker_running = bool(docker_instances)
             if portfolio.bot_name not in status and not docker_running:
+                bot = self.state["bots"].get(portfolio.bot_name, {})
+                stop = bot.get("stop")
+                reset_runtime_sha256 = None
+                if "manual_guard_reset" in bot and bot.get("tripped") is not True:
+                    if docker_instances != [] or self.emergency_docker is None:
+                        raise RuntimeError("Grid manual guard reset invalid: stopped writer not proven")
+                    database = self.database(portfolio.bot_name)
+                    if database is None:
+                        raise RuntimeError("Grid manual guard reset invalid: runtime database missing")
+                    runtime = json.loads((database.parent / "live_grid_runtime_state.json").read_text(
+                        encoding="utf-8",
+                    ))
+                    stop = self._manual_reset_stop(portfolio.bot_name, bot, runtime)
+                    reset_runtime_sha256 = bot["manual_guard_reset"]["runtime_sha256"]
+                if (
+                    docker_instances == []
+                    and self.emergency_docker is not None
+                    and (reset_runtime_sha256 is not None or (
+                        bot.get("tripped") is True
+                        and bot.get("action_complete") is True
+                        and bot.get("stop_complete") is True
+                    ))
+                    and isinstance(stop, dict)
+                    and stop.get("verified_no_active_orders") is True
+                    and stop.get("verified_no_live_instances") is True
+                ):
+                    # Revalue the stopped bot without advancing strategy
+                    # recovery or including it in active portfolio risk checks.
+                    snapshot = self.snapshot(key)
+                    if snapshot is None:
+                        raise RuntimeError(f"Missing SQLite for stopped bot {portfolio.bot_name}")
+                    if reset_runtime_sha256 is not None and snapshot.get(
+                        "runtime_state_sha256",
+                    ) != reset_runtime_sha256:
+                        raise RuntimeError("Grid manual guard reset invalid: runtime changed during valuation")
+                    budget = budget_for_quote(key)
+                    equity = budget.capital_limit + Decimal(snapshot["pnl"])
+                    peak, drawdown = peak_drawdown(
+                        equity,
+                        Decimal(str(bot.get("peak_equity", budget.capital_limit))),
+                        budget.capital_limit,
+                    )
+                    snapshot.update({
+                        "equity": str(equity), "peak_equity": str(peak),
+                        "drawdown_pct": str(drawdown),
+                    })
+                    bot["latest"] = snapshot
                 continue
             snapshot = self.snapshot(key)
             if snapshot is None:

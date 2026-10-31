@@ -1,0 +1,13 @@
+.report-page:has(.btceth-seed-stability-report) { --data-app-layout-intent: authored-report; --data-app-content-width: 1200px; }
+.btceth-seed-stability-report { gap: 28px; min-width: 0; }
+.btceth-seed-stability-report .report-hero h1 { font-size: 36px; line-height: 1.28; max-width: 28em; }
+.btceth-seed-stability-report .rich-narrative-content { max-width: 100%; line-height: 1.7; }
+.btceth-seed-stability-report [data-component-kind="table"] { min-width: 0; }
+.seed-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px; }
+.seed-exploration { display: flex; flex-direction: column; min-width: 0; gap: 18px; }
+.seed-positive { color: #087f5b; font-weight: 650; font-variant-numeric: tabular-nums; }
+.seed-negative { color: #c02e36; font-weight: 650; font-variant-numeric: tabular-nums; }
+.seed-note .rich-narrative-content { color: var(--secondary); font-size: 12px; }
+.seed-button { border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text); padding: 7px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+@media (prefers-color-scheme: dark) { .seed-positive { color: #41c4a3; } .seed-negative { color: #fb8187; } }
+@media (max-width: 700px) { .btceth-seed-stability-report { gap: 24px; } .btceth-seed-stability-report .report-hero h1 { font-size: 28px; } .seed-controls { gap: 12px; } }

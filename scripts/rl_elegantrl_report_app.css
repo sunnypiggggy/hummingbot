@@ -1,0 +1,15 @@
+.report-page:has(.rl-elegantrl-report) {
+  --data-app-layout-intent: authored-report;
+  --data-app-content-width: 1240px;
+}
+.rl-elegantrl-report { gap: 32px; }
+.rl-elegantrl-report .report-hero h1 { max-width: 25em; font-size: 42px; line-height: 1.25; letter-spacing: -0.02em; }
+.rl-elegantrl-report .rl-elegantrl-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 20px; padding-block: 12px; border-block: 1px solid var(--border); }
+.rl-elegantrl-report .rl-elegantrl-detail-control { display: flex; flex-wrap: wrap; gap: 12px; min-width: 0; max-width: 100%; }
+.rl-elegantrl-report .rich-narrative-content { max-width: 100%; line-height: 1.7; }
+.rl-elegantrl-report [data-component-kind="table"] { min-width: 0; }
+@media (max-width: 700px) {
+  .rl-elegantrl-report { gap: 26px; }
+  .rl-elegantrl-report .report-hero h1 { font-size: 30px; }
+  .rl-elegantrl-report .rl-elegantrl-controls { gap: 12px; }
+}

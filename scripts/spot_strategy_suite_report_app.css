@@ -1,0 +1,45 @@
+.report-page:has(.spot-suite-report) {
+  --data-app-layout-intent: authored-report;
+  --data-app-content-width: 1200px;
+}
+
+.spot-suite-report {
+  gap: 32px;
+}
+
+.spot-suite-report .report-hero h1 {
+  max-width: 24em;
+  font-size: 42px;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
+.spot-suite-report .spot-suite-controls {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  padding-block: 12px;
+  border-block: 1px solid var(--border);
+}
+
+.spot-suite-report .rich-narrative-content {
+  max-width: 100%;
+  line-height: 1.7;
+}
+
+.spot-suite-report [data-component-kind="table"] {
+  min-width: 0;
+}
+
+@media (max-width: 700px) {
+  .spot-suite-report {
+    gap: 26px;
+  }
+  .spot-suite-report .report-hero h1 {
+    font-size: 30px;
+  }
+  .spot-suite-report .spot-suite-controls {
+    gap: 12px;
+  }
+}

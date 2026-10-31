@@ -1,0 +1,16 @@
+.report-page:has(.single-pair-rl-report) { --data-app-layout-intent: authored-report; --data-app-content-width: 1200px; }
+.single-pair-rl-report { gap: 28px; min-width: 0; }
+.single-pair-rl-report .report-hero h1 { font-size: 36px; line-height: 1.28; max-width: 28em; }
+.single-pair-rl-report .rich-narrative-content { max-width: 100%; line-height: 1.7; }
+.single-pair-rl-report [data-component-kind="table"] { min-width: 0; }
+.single-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px; }
+.single-curves { display: flex; flex-direction: column; min-width: 0; gap: 18px; }
+.single-choice-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.single-choice-list button,.single-line-button { border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text); padding: 7px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+.single-choice-list button[aria-pressed="true"],.single-line-button[aria-pressed="true"] { background: #2563eb; border-color: #2563eb; color: #fff; }
+.single-account-name { display: inline-block; min-width: 170px; font-weight: 600; }
+.single-positive { color: #087f5b; font-weight: 650; font-variant-numeric: tabular-nums; }
+.single-negative { color: #c02e36; font-weight: 650; font-variant-numeric: tabular-nums; }
+.single-fine-print .rich-narrative-content { color: var(--secondary); font-size: 12px; }
+@media (prefers-color-scheme: dark) { .single-positive { color: #41c4a3; } .single-negative { color: #fb8187; } }
+@media (max-width: 700px) { .single-pair-rl-report { gap: 24px; } .single-pair-rl-report .report-hero h1 { font-size: 28px; } .single-controls { gap: 12px; } }

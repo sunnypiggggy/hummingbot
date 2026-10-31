@@ -33,6 +33,10 @@ from dca_live_common import (
 )
 from grid_xgboost_risk_gate import load_runtime_xgboost_gate
 try:
+    from grid_fill_reconciliation import flatten_candidates, read_grid_accounting_view
+except ModuleNotFoundError:
+    from live_guard.grid_fill_reconciliation import flatten_candidates, read_grid_accounting_view
+try:
     from dca_reentry import DcaReentryMixin
 except ModuleNotFoundError:
     from live_guard.dca_reentry import DcaReentryMixin
@@ -566,16 +570,27 @@ class Guard(DcaReentryMixin):
             int(grid_runtime.get("schema_version", 0)) >= 12
             and set(runtime_ledgers) == {"BTC-FDUSD", "ETH-FDUSD"}
         )
-        ownership = ownership_from_documents(
-            reservations=reservations, grid_state=grid_state,
-            managed_inventory=managed, dca_state=self.state,
-            grid_runtime=grid_runtime,
-        )
         running = {}
+        running_observed_at = {}
         for name in ("grid-live-fdusd-400", *[spec.bot_name for spec in LIVE_PAIRS.values()]):
             running[name] = bool(
                 self.emergency_docker and self.emergency_docker.matching_containers(name)
             )
+            running_observed_at[name] = time.time()
+        grid_view = grid_runtime
+        accounting_receipt = {"status": "unchanged"}
+        if flatten_candidates(grid_runtime):
+            stopped = self.emergency_docker is not None and not running["grid-live-fdusd-400"]
+            grid_view, accounting_receipt = read_grid_accounting_view(
+                grid_runtime, grid_database, stopped=stopped, runtime_path=grid_runtime_path,
+            )
+            accounting_receipt["stopped_observed_at"] = running_observed_at["grid-live-fdusd-400"]
+            runtime_healthy = runtime_healthy and accounting_receipt["status"] != "unverifiable"
+        ownership = ownership_from_documents(
+            reservations=reservations, grid_state=grid_state,
+            managed_inventory=managed, dca_state=self.state,
+            grid_runtime=grid_view,
+        )
         now = time.time()
         grid_latest = next(iter(grid_state.get("bots", {}).values()), {}).get("latest", {})
         timestamps = [float(grid_latest.get("observed_at") or 0)]
@@ -600,6 +615,8 @@ class Guard(DcaReentryMixin):
                 "schema_version": grid_runtime.get("schema_version"),
                 "updated_at": grid_runtime.get("updated_at"),
                 "sha256": canonical_sha256(grid_runtime) if grid_runtime else None,
+                "view_sha256": canonical_sha256(grid_view) if grid_view else None,
+                "flatten_fill_reconciliation": accounting_receipt,
             },
             "reservations_generated_at": reservations.get("generated_at"),
             "managed_source_sha256": managed.get("source_preflight_sha256"),
@@ -2283,6 +2300,20 @@ class Guard(DcaReentryMixin):
     def _emergency_fill_metrics(pair: str, side: str, response: dict) -> Dict[str, Any]:
         return emergency_fill_metrics(pair, side, response)
 
+    @staticmethod
+    def _completed_exit_jobs(ledger: Any, bot_name: str, pair: str) -> list[dict]:
+        """Read upgrade-era completions without changing the shared ledger."""
+        connection = sqlite3.connect(ledger.database_path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM liquidation_jobs WHERE scope=? AND pair=? AND status='COMPLETED'",
+                (f"dca:{bot_name}", pair),
+            )]
+        finally:
+            connection.close()
+
     def _flatten(self, snapshot: Dict[str, Any], bot_name: str = "") -> Dict[str, Any]:
         pair = snapshot["pair"]
         step_size, minimum_notional = self._lot_filter(pair)
@@ -2307,9 +2338,31 @@ class Guard(DcaReentryMixin):
         if self.emergency_exchange is None:
             raise RuntimeError("independent Binance emergency client is unavailable")
         base_asset = pair.split("-", 1)[0]
-        digest = canonical_sha256({
+        bot = getattr(self, "state", {}).get("bots", {}).get(bot_name, {})
+        recovery = bot.get("recovery") or {}
+        recoverable = recovery.get("phase") == EXITING and not bot.get("tripped")
+        epoch = recovery.get("triggered_at") if recoverable else bot.get("tripped_at")
+        try:
+            # The bot-less, ledger-less call remains an offline compatibility
+            # entry point. Every deployed bot must have a durable exit epoch.
+            offline = not bot_name and getattr(self, "inventory_ledger", None) is None
+            epoch_value = Decimal(str(epoch)) if not offline else Decimal("0")
+            if not offline and (not epoch_value.is_finite() or epoch_value <= 0):
+                raise ValueError("invalid exit epoch")
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            raise RuntimeError("liquidation requires a valid risk episode timestamp") from exc
+        identity = {"bot": bot_name, "pair": pair, "amount": str(amount), "triggered_at": epoch}
+        if recoverable:
+            identity.update({
+                "purpose": "dca_recoverable_exit_v2",
+                "triggered_at": format(epoch_value.normalize(), "f"),
+                "amount": format(amount.normalize(), "f"),
+                "mechanism": recovery.get("mechanism"), "scope": recovery.get("scope"),
+            })
+        digest = canonical_sha256(identity)
+        legacy_digest = canonical_sha256({
             "bot": bot_name, "pair": pair, "amount": str(amount),
-            "triggered_at": getattr(self, "state", {}).get("bots", {}).get(bot_name, {}).get("tripped_at"),
+            "triggered_at": bot.get("tripped_at"),
         })
         client_order_id = f"inv-{digest[:24]}"
         ledger = getattr(self, "inventory_ledger", None)
@@ -2333,6 +2386,62 @@ class Guard(DcaReentryMixin):
                 amount = (outstanding / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
         with lease:
             if ledger:
+                if recoverable and job_id != legacy_digest:
+                    legacy = ledger.get_job(legacy_digest)
+                    candidates = {legacy_digest: legacy} if legacy is not None else {}
+                    for completed in self._completed_exit_jobs(ledger, bot_name, pair):
+                        if completed["job_id"] == job_id:
+                            continue  # The ordinary same-intent check below rejects replay.
+                        try:
+                            completed_attempts = ledger.attempts(completed["job_id"])
+                            old_times = [Decimal(str(row.get(key)))
+                                         for row in [completed, *completed_attempts]
+                                         for key in ("created_at", "updated_at")]
+                            clearly_old = bool(completed_attempts) and all(
+                                value.is_finite() and 0 < value < epoch_value for value in old_times
+                            ) and ledger.completed_job_verified(completed) and all(
+                                row.get("status") in {"FILLED", "CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+                                for row in completed_attempts
+                            )
+                            old_quantity = Decimal(str(completed["requested_quantity"]))
+                            if not old_quantity.is_finite() or old_quantity <= 0:
+                                raise ValueError("invalid historical liquidation quantity")
+                            same_quantity = old_quantity == amount
+                        except (ValueError, TypeError, ArithmeticError):
+                            clearly_old, same_quantity = False, False
+                        if not clearly_old or same_quantity:
+                            candidates[completed["job_id"]] = completed
+                    facts = ledger.economic_fills(f"dca:{bot_name}") if candidates else []
+                    for legacy in candidates.values():
+                        attempts = ledger.attempts(legacy["job_id"])
+                        try:
+                            timestamps = [Decimal(str(row.get(key)))
+                                          for row in [legacy, *attempts]
+                                          for key in ("created_at", "updated_at")]
+                            executed = Decimal(str(legacy.get("executed_quantity")))
+                            requested = Decimal(str(legacy.get("requested_quantity")))
+                            historical = bool(
+                                legacy.get("scope") == f"dca:{bot_name}"
+                                and legacy.get("pair") == pair and legacy.get("asset") == base_asset
+                                and ledger.completed_job_verified(legacy) and attempts
+                                and executed.is_finite() and requested.is_finite()
+                                and 0 <= executed <= requested and requested > 0
+                                and all(value.is_finite() and 0 < value < epoch_value for value in timestamps)
+                                and all(row.get("status") in {
+                                    "FILLED", "CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"
+                                } for row in attempts)
+                                and sum((Decimal(str(row.get("executed_quantity"))) for row in attempts), Decimal("0"))
+                                == Decimal(str(legacy.get("executed_quantity")))
+                                and sum((Decimal(fill["quantity"]) for fill in facts
+                                         if fill["job_id"] == legacy["job_id"] and fill["pair"] == pair and fill["side"] == "SELL"), Decimal("0"))
+                                == Decimal(str(legacy.get("executed_quantity")))
+                            )
+                        except (ValueError, TypeError, ArithmeticError):
+                            historical = False
+                        if not historical:
+                            raise RuntimeError(
+                                "legacy liquidation requires risk-episode reconciliation before any new sell"
+                            )
                 balances = self.emergency_exchange.account_balances()
                 total = balances.get(base_asset, {}).get("total", Decimal("0"))
                 free = balances.get(base_asset, {}).get("free", Decimal("0"))
@@ -2359,34 +2468,12 @@ class Guard(DcaReentryMixin):
                         raise RuntimeError(
                             f"completed DCA liquidation job {job_id} lacks verification"
                         )
-                    executed = Decimal(str(job.get("executed_quantity") or "0"))
-                    remaining = max(owned - executed, Decimal("0"))
-                    bot = self.state["bots"].setdefault(bot_name, {})
-                    adjustments = bot.setdefault("emergency_adjustments", [])
-                    if not any(
-                        str(row.get("client_order_id", "")) == client_order_id
-                        for row in adjustments
-                    ):
-                        adjustments.append({
-                            "recorded_at": datetime.now(timezone.utc).isoformat(),
-                            "pair": pair, "side": "SELL",
-                            "client_order_id": client_order_id,
-                            "order_id": str(job.get("exchange_order_id") or ""),
-                            "executed_qty": str(executed),
-                            "cummulative_quote_qty": str(job.get("quote_quantity") or "0"),
-                            "base_delta": str(-executed),
-                            "quote_cashflow": str(job.get("quote_quantity") or "0"),
-                            "fee_quote": str(job.get("fee_quote") or "0"),
-                            "recovered_from_shared_ledger": True,
-                        })
-                        self._save()
-                    return {
-                        "status": "filled", "side": "SELL", "amount": str(amount),
-                        "order_id": str(job.get("exchange_order_id") or ""),
-                        "executed_qty": str(executed), "remaining_base": str(remaining),
-                        "exit_complete": remaining * mark_price < minimum_notional,
-                        "client_order_id": client_order_id, "ownership": ownership,
-                    }
+                    # Current ownership already includes durable economic fills.
+                    # A historical completion is never a new fill to subtract
+                    # again, nor permission to submit another order on restart.
+                    raise RuntimeError(
+                        "completed liquidation requires reconciled ownership before any new sell"
+                    )
             try:
                 if ledger:
                     response = execute_market_liquidation(

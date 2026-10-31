@@ -1234,6 +1234,7 @@ class UnifiedTelegramReporting:
             now, state=state, v22_observation=v22_observation,
             grid_read_telemetry=grid_read_telemetry, macro=macro, bot_name=bot_name,
             latest=latest, gate=gate, cutover=cutover, runtime=runtime,
+            inventory_status=inventory_status,
             transport_summary=transport_summary, runtime_buy_ids=runtime_buy_ids,
             runtime_sell_ids=runtime_sell_ids, active_pair_parameters=active_pair_parameters,
             profit_history=lambda *args, **kwargs: self.outbox.profit_history(*args, **kwargs),
@@ -1382,7 +1383,6 @@ class UnifiedTelegramReporting:
                 dca=self._load(self.dca_state / "guard_state.json"),
                 inventory=self._load(self.inventory_status_path),
                 history_connection=self.outbox.connection, api_base=binance_api_base(),
-                now=now.timestamp(),
             )
         except Exception:
             logging.getLogger(__name__).warning("Read-only simple audit unavailable")
@@ -1392,14 +1392,23 @@ class UnifiedTelegramReporting:
         )
         due, slot = self.outbox.slot_due(now=now)
         profit_report_error = ""
+        profit_report_deferred_pairs = []
         if self.enabled and self.profit_enabled and due:
-            try:
-                self._queue_profit_report(robots, slot, now)
-                self.outbox.mark_slot(slot)
-            except Exception as exc:
-                # A presentation failure must not block risk-event ingestion,
-                # the persistent outbox, or parameter evidence delivery.
-                profit_report_error = f"{type(exc).__name__}: {exc}"
+            profit_report_deferred_pairs = [
+                str(bot["trading_pair"]) for bot in report.get("bots", [])
+                if bot.get("market_data_healthy") is not True
+            ]
+            # At a candle boundary the normal collector may briefly lack a
+            # fresh mark. Keep this slot due for the next existing cycle;
+            # missing historical window anchors must not delay delivery.
+            if not profit_report_deferred_pairs:
+                try:
+                    self._queue_profit_report(robots, slot, now)
+                    self.outbox.mark_slot(slot)
+                except Exception as exc:
+                    # A presentation failure must not block risk-event ingestion,
+                    # the persistent outbox, or parameter evidence delivery.
+                    profit_report_error = f"{type(exc).__name__}: {exc}"
         sources = [self.events, self.grid_state / "telegram_events.jsonl"]
         sources.append(Path("/workspace/stock-reports/telegram_events.jsonl"))
         sources.extend(self.bots_path.glob("instances/*/data/telegram_events.jsonl"))
@@ -1413,6 +1422,7 @@ class UnifiedTelegramReporting:
                 "parameter_catalog_sha256": parameter_catalog["catalog_sha256"],
                 "active_runtime_errors": len(current_errors["errors"]),
                 "evidence_receipts_written": evidence_receipts,
+                "profit_report_deferred_pairs": profit_report_deferred_pairs,
                 "profit_report_error": profit_report_error}
 
 

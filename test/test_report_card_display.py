@@ -23,7 +23,9 @@ def reporting(tmp_path):
     runtime_path.write_text("{}")
     trace, inventory_reads = [], []
     inventory = {
-        "sources_healthy": True, "runtime": {"robots": {DCA_BOT: {"running": True}}},
+        "generated_at": NOW.timestamp(), "sources_healthy": True, "runtime": {"robots": {
+            DCA_BOT: {"running": True}, GRID_BOT: {"running": True},
+        }},
         "assets": {"BTC": {"owners": {f"dca:{DCA_BOT}": ".01"}}, "ETH": {}},
     }
     guard = {
@@ -90,7 +92,8 @@ def reporting(tmp_path):
         "market_data_age_seconds": 10, "mark_price": "100000",
     }]}
     return SimpleNamespace(instance=instance, trace=trace, inventory=inventory,
-                           inventory_reads=inventory_reads, guard=guard, report=report)
+                           inventory_reads=inventory_reads, guard=guard, report=report,
+                           grid=grid, runtime=runtime)
 
 
 def test_dca_quiet_database_budget_alert_and_long_only_keep_protective_sell(reporting):
@@ -134,12 +137,68 @@ def test_grid_uses_per_pair_wall_clock_after_trade_read_before_dust(reporting, m
     assert cards[0]["trading_status"]["system_health"] == "DEGRADED"
     assert cards[0]["trading_status"]["final_permissions"] == {"buy_enabled": True, "sell_enabled": True}
     assert cards[1]["trading_status"]["trading_normal"] is True
+    assert all(card["trading_status"]["process_running"] is True for card in cards)
     assert [row for row in reporting.trace if row[0] != "load"] == [
         ("history", "grid", "BTC-FDUSD", 370), ("trade_counts", "BTC-FDUSD"),
         ("clock", 10), ("dust", "BTC"), ("inventory_gate", "BTC"),
         ("history", "grid", "ETH-FDUSD", 370), ("trade_counts", "ETH-FDUSD"),
         ("clock", 20), ("dust", "ETH"), ("inventory_gate", "ETH"),
     ]
+
+
+def test_grid_stopped_process_is_not_inferred_from_fresh_guard_and_leftover_runtime(reporting, monkeypatch):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    before = reporting.instance._grid_cards(NOW)
+    reporting.inventory["runtime"]["robots"][GRID_BOT]["running"] = False
+    stopped = reporting.instance._grid_cards(NOW)
+    for previous, current in zip(before, stopped):
+        assert current["trading_status"]["process_running"] is False
+        assert current["trading_status"]["trade_mode"] == "STOPPED"
+        assert current["trading_status"]["trading_normal"] is False
+        # Process evidence corrects display, while source risk gates retain
+        # their original decisions independently of container execution.
+        assert current["trading_status"]["gate_statuses"] == previous["trading_status"]["gate_statuses"]
+        assert current["trading_status"]["final_permissions"] == previous["trading_status"]["final_permissions"]
+        assert current["profit"] == previous["profit"]
+
+
+@pytest.mark.parametrize("observation", [None, {}, {"running": None}, {"running": "false"}, {"running": 1}])
+def test_grid_missing_or_invalid_process_observation_never_claims_running(reporting, monkeypatch, observation):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    if observation is None:
+        reporting.inventory["runtime"]["robots"].pop(GRID_BOT)
+    else:
+        reporting.inventory["runtime"]["robots"][GRID_BOT] = observation
+    cards = reporting.instance._grid_cards(NOW)
+    assert all(card["trading_status"]["process_running"] is False for card in cards)
+    assert all(card["trading_status"]["trading_normal"] is False for card in cards)
+
+
+def test_grid_running_process_keeps_original_stale_snapshot_gate(reporting, monkeypatch):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 120))
+    reporting.inventory["generated_at"] = NOW.timestamp() + 115
+    cards = reporting.instance._grid_cards(NOW)
+    for card in cards:
+        assert card["trading_status"]["process_running"] is True
+        assert card["trading_status"]["trading_normal"] is False
+        gates = {gate["mechanism"]: gate for gate in card["trading_status"]["gate_statuses"]}
+        assert gates["infrastructure_integrity_breaker"]["state"] == "BLOCK"
+        assert gates["infrastructure_integrity_breaker"]["buy_enabled"] is False
+        assert gates["infrastructure_integrity_breaker"]["sell_enabled"] is False
+
+
+@pytest.mark.parametrize("generated_at", [None, "invalid", float("nan"), float("inf"),
+                                         NOW.timestamp() - 91, NOW.timestamp() + 60])
+def test_grid_invalid_or_stale_process_evidence_does_not_claim_running(reporting, monkeypatch, generated_at):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    before = reporting.instance._grid_cards(NOW)
+    reporting.inventory["generated_at"] = generated_at
+    cards = reporting.instance._grid_cards(NOW)
+    for previous, current in zip(before, cards):
+        assert current["trading_status"]["process_running"] is False
+        assert current["trading_status"]["trading_normal"] is False
+        assert current["trading_status"]["gate_statuses"] == previous["trading_status"]["gate_statuses"]
+        assert current["trading_status"]["final_permissions"] == previous["trading_status"]["final_permissions"]
 
 
 @pytest.mark.parametrize("field,expected_reads", [("all_time", []), ("peak", [("history", "dca", "BTC-USDT", 370)])])
@@ -156,3 +215,133 @@ def test_invalid_dca_valuation_keeps_its_original_read_boundary(reporting, field
 def test_empty_dca_report_does_not_require_a_history_reader(reporting):
     del reporting.instance.outbox
     assert reporting.instance._dca_cards({"bots": []}, NOW) == []
+
+
+def grid_controller_mismatch(reporting):
+    reporting.grid["xgboost_risk_gate"]["pairs"]["BTC-FDUSD"].update(
+        buy_enabled=False, risk_off_active=True, model_signal="RISK_OFF",
+    )
+    reporting.runtime["portfolio_recovery"] = {
+        "phase": "EXITING", "mechanism": "portfolio_drawdown_breaker",
+        "scope": "portfolio", "triggered_at": NOW.timestamp() - 86400,
+    }
+
+
+def permission_decisions(status):
+    return {gate["mechanism"]: (gate["buy_enabled"], gate["sell_enabled"])
+            for gate in status["gate_statuses"]}
+
+
+def test_grid_fresh_stopped_mismatch_waits_without_releasing_any_permission(reporting, monkeypatch):
+    from cardputer_monitor.collector import sanitize_gates
+
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    grid_controller_mismatch(reporting)
+    running = reporting.instance._grid_cards(NOW)[0]
+    assert running["trading_status"]["system_health"] == "FAILED"
+    reporting.inventory["runtime"]["robots"][GRID_BOT]["running"] = False
+    original = deepcopy((reporting.grid, reporting.runtime, reporting.inventory))
+    stopped = reporting.instance._grid_cards(NOW)[0]
+    status = stopped["trading_status"]
+    gates = {gate["mechanism"]: gate for gate in status["gate_statuses"]}
+    controller = gates["controller_application_gate"]
+    assert (controller["state"], controller["health"]) == ("WAITING", "DEGRADED")
+    assert controller["enabled"] is True and controller["applicable"] is True
+    assert "机器人已停止" in controller["reason"]
+    assert controller["buy_enabled"] is False and controller["sell_enabled"] is False
+    assert status["system_health"] == "DEGRADED"
+    assert status["trade_mode"] == "STOPPED" and status["process_running"] is False
+    assert status["trading_normal"] is False and status["phase"] == "EXITING"
+    assert permission_decisions(status) == permission_decisions(running["trading_status"])
+    assert status["final_permissions"] == running["trading_status"]["final_permissions"] == {
+        "buy_enabled": False, "sell_enabled": False,
+    }
+    assert stopped["profit"] == running["profit"]
+    assert (reporting.grid, reporting.runtime, reporting.inventory) == original
+    public = next(gate for gate in sanitize_gates(status["gate_statuses"])
+                  if gate["mechanism"] == "controller_application_gate")
+    assert (public["state"], public["health"]) == ("WAITING", "DEGRADED")
+    assert public["buy_enabled"] is False and public["sell_enabled"] is False
+
+
+@pytest.mark.parametrize("observation", [None, {}, {"running": None}, {"running": "false"},
+                                        {"running": "true"}, {"running": 0}, {"running": 1},
+                                        {"running": True}])
+def test_grid_mismatch_requires_an_explicit_boolean_stopped_observation(reporting, monkeypatch, observation):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    grid_controller_mismatch(reporting)
+    if observation is None:
+        reporting.inventory["runtime"]["robots"].pop(GRID_BOT)
+    else:
+        reporting.inventory["runtime"]["robots"][GRID_BOT] = observation
+    status = reporting.instance._grid_cards(NOW)[0]["trading_status"]
+    controller = next(gate for gate in status["gate_statuses"]
+                      if gate["mechanism"] == "controller_application_gate")
+    assert (controller["state"], controller["health"]) == ("MISMATCH", "FAILED")
+    assert status["system_health"] == "FAILED"
+    assert status["final_permissions"] == {"buy_enabled": False, "sell_enabled": False}
+
+
+@pytest.mark.parametrize("age,waiting", [(-5, True), (90, True), (-5.001, False), (90.001, False)])
+def test_grid_stopped_controller_waiting_respects_exact_observation_age_boundary(reporting, monkeypatch, age, waiting):
+    observed = NOW.timestamp() + 10
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: observed))
+    grid_controller_mismatch(reporting)
+    reporting.inventory["runtime"]["robots"][GRID_BOT]["running"] = False
+    reporting.inventory["generated_at"] = observed - age
+    status = reporting.instance._grid_cards(NOW)[0]["trading_status"]
+    controller = next(gate for gate in status["gate_statuses"]
+                      if gate["mechanism"] == "controller_application_gate")
+    assert controller["state"] == ("WAITING" if waiting else "MISMATCH")
+    assert status["system_health"] == ("DEGRADED" if waiting else "FAILED")
+    assert status["trade_mode"] == "STOPPED"
+
+
+@pytest.mark.parametrize("generated_at", [None, "invalid", float("nan"), float("inf")])
+def test_grid_stopped_mismatch_with_invalid_source_time_remains_failed(reporting, monkeypatch, generated_at):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    grid_controller_mismatch(reporting)
+    reporting.inventory["runtime"]["robots"][GRID_BOT]["running"] = False
+    reporting.inventory["generated_at"] = generated_at
+    status = reporting.instance._grid_cards(NOW)[0]["trading_status"]
+    controller = next(gate for gate in status["gate_statuses"]
+                      if gate["mechanism"] == "controller_application_gate")
+    assert (controller["state"], controller["health"]) == ("MISMATCH", "FAILED")
+    assert status["system_health"] == "FAILED"
+
+
+@pytest.mark.parametrize("fault", ["inventory", "stale_snapshot", "monitor", "execution", "v22_source"])
+def test_grid_stopped_waiting_never_hides_an_independent_failed_gate(reporting, monkeypatch, fault):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    grid_controller_mismatch(reporting)
+    if fault == "inventory":
+        reporting.inventory["sources_healthy"] = False
+    elif fault == "stale_snapshot":
+        reporting.grid["bots"][GRID_BOT]["latest"]["updated_at"] = NOW.timestamp() - 100
+    elif fault == "monitor":
+        reporting.grid["last_monitor_error"] = "test-only monitor error"
+    elif fault == "execution":
+        reporting.runtime["order_build_status"]["BTC-FDUSD"]["state"] = "FAILED"
+    else:
+        reporting.grid["xgboost_risk_gate"]["source_healthy"] = False
+    running = reporting.instance._grid_cards(NOW)[0]["trading_status"]
+    reporting.inventory["runtime"]["robots"][GRID_BOT]["running"] = False
+    status = reporting.instance._grid_cards(NOW)[0]["trading_status"]
+    assert status["system_health"] == "FAILED" and status["trade_mode"] == "STOPPED"
+    assert any(gate["health"] == "FAILED" and gate["mechanism"] != "controller_application_gate"
+               for gate in status["gate_statuses"])
+    assert permission_decisions(status) == permission_decisions(running)
+    assert status["final_permissions"] == running["final_permissions"]
+
+
+def test_grid_stopped_without_a_frozen_controller_record_remains_failed(reporting, monkeypatch):
+    monkeypatch.setattr(dca_live_report, "time", SimpleNamespace(time=lambda: NOW.timestamp() + 10))
+    grid_controller_mismatch(reporting)
+    reporting.runtime["technical_buy_gate"]["pairs"].pop("BTC-FDUSD")
+    reporting.inventory["runtime"]["robots"][GRID_BOT]["running"] = False
+    status = reporting.instance._grid_cards(NOW)[0]["trading_status"]
+    controller = next(gate for gate in status["gate_statuses"]
+                      if gate["mechanism"] == "controller_application_gate")
+    assert (controller["state"], controller["health"]) == ("MISMATCH", "FAILED")
+    assert status["system_health"] == "FAILED" and status["trade_mode"] == "STOPPED"
+    assert status["final_permissions"] == {"buy_enabled": False, "sell_enabled": False}

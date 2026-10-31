@@ -64,6 +64,8 @@
 
 ## 本地环境与验证
 
+V100 研究任务的默认资源策略见 [agent.md](agent.md)：在已授权的训练与回测范围内，尽可能使用全部可用 GPU 和 CPU 并行计算，保持研究口径、已有进度与生产边界不变，并连续衔接后续验证和核验阶段。
+
 Windows 工作区使用 PowerShell，OCI 使用 Linux shell；路径、引号和变量展开必须按执行环境处理。不要将 PowerShell 路径列表拼接给另一种 shell 做删除或移动。
 
 测试命令从仓库根目录执行，先确认 Python 环境。基础运行依赖见[环境定义](setup/environment.yml)与[项目配置](pyproject.toml)；独立服务使用各自依赖，例如[管理 Bot](management_bot/requirements.txt)、[Guard](live_guard/requirements.txt)、[scheduler](scheduler/requirements.txt)。涉及 Hummingbot/Cython 的测试可能需要已编译环境，不能把缺依赖导致的收集失败报告为测试通过。
